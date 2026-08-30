@@ -1,0 +1,11 @@
+{
+  "name": "LUC Icons",
+  "iconDefinitions": {
+    "_luc": {
+      "iconPath": "./luc.svg"
+    }
+  },
+  "fileExtensions": {
+    "luc": "_luc"
+  }
+}

@@ -1,0 +1,5252 @@
+/*
+** ============================================================================
+**  LUC 0.1  --  an independent, register-based scripting language
+**
+**  build (no window):  gcc -O2 -std=c99 -o luc main.c -lm
+**  build (window):     gcc -O2 -std=c99 -DLUC_WINDOW -o luc main.c -lm \
+**                          -lSDL2 -lSDL2_ttf -lSDL2_image
+**  linux/pkg-config:   gcc -O2 -std=c99 -DLUC_WINDOW -o luc main.c -lm \
+**                          $(pkg-config --cflags --libs sdl2 SDL2_ttf SDL2_image)
+**
+**  optional: -DLUC_NO_TTF    build without SDL2_ttf   (embedded bitmap font)
+**            -DLUC_NO_IMAGE  build without SDL2_image (BMP only)
+** ============================================================================
+*/
+
+#define _POSIX_C_SOURCE 200809L
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <math.h>
+#include <ctype.h>
+#include <setjmp.h>
+#include <time.h>
+#include <stdint.h>
+#include <stddef.h>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <sys/time.h>
+#  include <unistd.h>
+#endif
+#ifdef LUC_WINDOW
+#  define SDL_MAIN_HANDLED
+#  include <SDL2/SDL.h>
+#  ifndef LUC_NO_TTF
+#    include <SDL2/SDL_ttf.h>
+#  endif
+#  ifndef LUC_NO_IMAGE
+#    include <SDL2/SDL_image.h>
+#  endif
+#endif
+
+
+#define LUC_VERSION   "LUC 0.1"
+#define LUC_MAXREG    200
+#define LUC_MAXUPVAL  60
+#define LUC_MAXCI     220
+#define LUC_MAXSTACK  1000000
+#define LUC_YIELDCODE (-1)
+
+/* ==========================================================================
+** 0. platform helpers
+** ========================================================================== */
+
+static double luc_now(void){
+#if defined(_WIN32)
+    static LARGE_INTEGER f; static int init=0; LARGE_INTEGER c;
+    if(!init){ QueryPerformanceFrequency(&f); init=1; }
+    QueryPerformanceCounter(&c);
+    return (double)c.QuadPart/(double)f.QuadPart;
+#else
+    struct timeval tv; gettimeofday(&tv,NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec*1e-6;
+#endif
+}
+static void luc_sleep(double s){
+    if(s<=0) return;
+#if defined(_WIN32)
+    Sleep((DWORD)(s*1000.0));
+#else
+    struct timespec ts;
+    ts.tv_sec  = (time_t)s;
+    ts.tv_nsec = (long)((s-(double)ts.tv_sec)*1e9);
+    nanosleep(&ts,NULL);
+#endif
+}
+
+static void *lmalloc(size_t n){
+    void *p = malloc(n?n:1);
+    if(!p){ fprintf(stderr,"luc: out of memory\n"); exit(1); }
+    return p;
+}
+static void *lrealloc(void *p,size_t n){
+    void *q = realloc(p,n?n:1);
+    if(!q){ fprintf(stderr,"luc: out of memory\n"); exit(1); }
+    return q;
+}
+static void *lcalloc(size_t n){ void*p=lmalloc(n); memset(p,0,n); return p; }
+
+/* ==========================================================================
+** 1. values & objects
+** ========================================================================== */
+
+typedef struct Obj      Obj;
+typedef struct Str      Str;
+typedef struct Table    Table;
+typedef struct Proto    Proto;
+typedef struct Closure  Closure;
+typedef struct CFunc    CFunc;
+typedef struct Buffer   Buffer;
+typedef struct FileH    FileH;
+typedef struct Upval    Upval;
+typedef struct LucState LucState;
+
+enum {
+    LT_NIL=0, LT_BOOL, LT_NUM, LT_STR, LT_TABLE, LT_LIST, LT_FUNC,
+    LT_CFUNC, LT_BUFFER, LT_CORO, LT_FILE, LT_PROTO, LT_UPVAL
+};
+
+typedef struct {
+    int t;
+    union { double n; int b; Obj *o; } u;
+} Value;
+
+struct Obj { unsigned char type, marked; Obj *next; };
+
+struct Str  { Obj o; Str *snext; int len; unsigned hash; char s[1]; };
+
+typedef struct { Value k, v; } Entry;
+struct Table {
+    Obj o;
+    Value *arr;  int alen, acap;      /* array part: indices 1..alen        */
+    Entry *ents; int ecap, ecount;    /* hash part: open addressing          */
+    unsigned tid, ver;               /* inline cache identity + version     */
+};
+
+typedef struct { unsigned char instack; unsigned char idx; } UpvalDesc;
+struct Proto {
+    Obj o;
+    uint32_t *code; int ncode, ccap;
+    int      *lines;
+    Value    *k;    int nk, kcap;
+    Proto   **p;    int np, pcap;
+    UpvalDesc upvals[LUC_MAXUPVAL];
+    int nparams, isvararg, maxstack, nup;
+    Str *name, *source;
+};
+
+struct Upval {
+    Obj o; LucState *L; int idx; int isclosed; Value closed; Upval *next;
+};
+#define UPVAL_PTR(u) ((u)->isclosed ? &(u)->closed : &(u)->L->stack[(u)->idx])
+
+struct Closure { Obj o; Proto *p; int nup; Upval **up; };
+
+typedef int (*CFn)(LucState *L,int base,int nargs,CFunc *self);
+struct CFunc { Obj o; CFn fn; const char *name; int nup; Value *up; };
+
+struct Buffer { Obj o; int len; unsigned char *b; };
+struct FileH  { Obj o; FILE *f; int closed, isstd, ispipe; };
+
+typedef struct CallInfo {
+    Closure *cl;
+    int func, base, nresults;
+    uint32_t *savedpc;
+} CallInfo;
+
+enum { CO_START=0, CO_SUSPENDED, CO_RUNNING, CO_NORMAL, CO_DEAD };
+
+struct LucState {
+    Obj o;
+    Value *stack; int stacksize, top;
+    CallInfo *ci; int nci, cicap;
+    Upval *openupv;
+    int status;
+    LucState *resumer;
+    int yield_A, yield_C;      /* where to place values on resume */
+    int yieldbase, nyield;     /* where the yielded values live   */
+    int npending;              /* args pre-pushed for first resume */
+    double waketime; int scheduled;
+    Str *cursource; int curline;
+};
+
+static Value NIL = { LT_NIL, {0} };
+static Value mknum(double d){ Value v; v.t=LT_NUM; v.u.n=d; return v; }
+static Value mkbool(int b){ Value v; v.t=LT_BOOL; v.u.b=(b!=0); return v; }
+static Value mkobj(int t,void*o){ Value v; v.t=t; v.u.o=(Obj*)o; return v; }
+
+#define AS_STR(v)   ((Str*)(v).u.o)
+#define AS_TAB(v)   ((Table*)(v).u.o)
+#define AS_CL(v)    ((Closure*)(v).u.o)
+#define AS_CF(v)    ((CFunc*)(v).u.o)
+#define AS_BUF(v)   ((Buffer*)(v).u.o)
+#define AS_CO(v)    ((LucState*)(v).u.o)
+#define AS_FILE(v)  ((FileH*)(v).u.o)
+
+static int truthy(Value v){ return !(v.t==LT_NIL || (v.t==LT_BOOL && !v.u.b)); }
+
+/* ==========================================================================
+** 2. global VM state, errors, GC
+** ========================================================================== */
+
+typedef struct ErrJmp { jmp_buf jb; struct ErrJmp *prev; } ErrJmp;
+
+typedef struct { LucState *co; double wake; } SchedEntry;
+
+static struct {
+    Obj  *objects;
+    Str **strtab; int strcap, nstr;
+    size_t nalloc, gcthresh;
+    int    gcoff;
+
+    Table *globals;
+    Table *stringlib, *listmeta, *bufferlib, *filelib;
+
+    LucState *mainco, *cur;
+
+    ErrJmp *errjmp;
+    Value   errval;
+
+    SchedEntry *sched; int nsched, schedcap;
+    Table *loaded;           /* module cache for require() */
+    unsigned tidcounter;     /* inline cache table identity */
+} V;
+
+static void luc_error(const char *fmt,...);
+static Str *str_new(const char *s,int len);
+static Str *str_fromc(const char *s){ return str_new(s,(int)strlen(s)); }
+static const char *type_name(Value v);
+static void gc_collect(void);
+
+static void luc_throw(Value err){
+    V.errval = err;
+    if(V.errjmp) longjmp(V.errjmp->jb,1);
+    fprintf(stderr,"luc: unprotected error: %s\n",
+            err.t==LT_STR?AS_STR(err)->s:type_name(err));
+    exit(1);
+}
+
+static void luc_error(const char *fmt,...){
+    char buf[1024]; char msg[1200]; va_list ap;
+    va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
+    if(V.cur && V.cur->cursource)
+        snprintf(msg,sizeof msg,"%s:%d: %s",V.cur->cursource->s,V.cur->curline,buf);
+    else
+        snprintf(msg,sizeof msg,"%s",buf);
+    luc_throw(mkobj(LT_STR,str_fromc(msg)));
+}
+
+/* --- object allocation ---------------------------------------------------*/
+static Obj *newobj(size_t sz,int type){
+    Obj *o = (Obj*)lcalloc(sz);
+    o->type=(unsigned char)type; o->marked=0;
+    o->next=V.objects; V.objects=o;
+    V.nalloc++;
+    return o;
+}
+
+/* --- interned strings ----------------------------------------------------*/
+static unsigned strhash(const char *s,int len){
+    unsigned h=2166136261u;
+    for(int i=0;i<len;i++){ h^=(unsigned char)s[i]; h*=16777619u; }
+    return h;
+}
+static void strtab_grow(void){
+    int nc = V.strcap*2, i;
+    Str **nt = (Str**)lcalloc(sizeof(Str*)*nc);
+    for(i=0;i<V.strcap;i++){
+        Str *s=V.strtab[i];
+        while(s){ Str *nx=s->snext; unsigned k=s->hash&(nc-1);
+                  s->snext=nt[k]; nt[k]=s; s=nx; }
+    }
+    free(V.strtab); V.strtab=nt; V.strcap=nc;
+}
+static Str *str_new(const char *s,int len){
+    unsigned h=strhash(s,len);
+    unsigned k=h&(unsigned)(V.strcap-1);
+    for(Str *p=V.strtab[k];p;p=p->snext)
+        if(p->len==len && memcmp(p->s,s,(size_t)len)==0) return p;
+    Str *ns=(Str*)lmalloc(sizeof(Str)+(size_t)len);
+    ns->o.type=LT_STR; ns->o.marked=0; ns->o.next=NULL;
+    ns->len=len; ns->hash=h;
+    if(len) memcpy(ns->s,s,(size_t)len);
+    ns->s[len]=0;
+    ns->snext=V.strtab[k]; V.strtab[k]=ns;
+    V.nstr++; V.nalloc++;
+    if(V.nstr > V.strcap) strtab_grow();
+    return ns;
+}
+
+/* --- constructors --------------------------------------------------------*/
+static Table *tab_new(int islist){
+    Table *t=(Table*)newobj(sizeof(Table), islist?LT_LIST:LT_TABLE);
+    t->tid=++V.tidcounter;
+    return t;
+}
+static Buffer *buf_new(int n){
+    Buffer *b=(Buffer*)newobj(sizeof(Buffer),LT_BUFFER);
+    b->len=n; b->b=(unsigned char*)lcalloc((size_t)(n>0?n:1));
+    return b;
+}
+static Proto *proto_new(void){
+    Proto *p=(Proto*)newobj(sizeof(Proto),LT_PROTO);
+    p->maxstack=2; return p;
+}
+static Closure *closure_new(Proto *p){
+    Closure *c=(Closure*)newobj(sizeof(Closure),LT_FUNC);
+    c->p=p; c->nup=p->nup;
+    c->up=(Upval**)lcalloc(sizeof(Upval*)*(size_t)(p->nup>0?p->nup:1));
+    return c;
+}
+static CFunc *cfunc_new(CFn fn,const char *name,int nup){
+    CFunc *c=(CFunc*)newobj(sizeof(CFunc),LT_CFUNC);
+    c->fn=fn; c->name=name; c->nup=nup;
+    c->up = nup? (Value*)lcalloc(sizeof(Value)*(size_t)nup) : NULL;
+    return c;
+}
+static FileH *file_new(FILE *f,int isstd){
+    FileH *h=(FileH*)newobj(sizeof(FileH),LT_FILE);
+    h->f=f; h->isstd=isstd; h->closed=0; return h;
+}
+static LucState *state_new(int stacksize){
+    LucState *L=(LucState*)newobj(sizeof(LucState),LT_CORO);
+    L->stacksize=stacksize;
+    L->stack=(Value*)lcalloc(sizeof(Value)*(size_t)stacksize);
+    L->cicap=16; L->ci=(CallInfo*)lcalloc(sizeof(CallInfo)*16);
+    L->status=CO_START;
+    return L;
+}
+static void ensure_stack(LucState *L,int need){
+    if(need <= L->stacksize) return;
+    if(need > LUC_MAXSTACK) luc_error("stack overflow");
+    int ns=L->stacksize*2; while(ns<need) ns*=2;
+    if(ns>LUC_MAXSTACK) ns=LUC_MAXSTACK;
+    L->stack=(Value*)lrealloc(L->stack,sizeof(Value)*(size_t)ns);
+    for(int i=L->stacksize;i<ns;i++) L->stack[i]=NIL;
+    L->stacksize=ns;
+}
+
+/* ==========================================================================
+** 3. tables
+** ========================================================================== */
+
+static unsigned val_hash(Value v){
+    switch(v.t){
+        case LT_NIL:  return 0;
+        case LT_BOOL: return v.u.b?1u:2u;
+        case LT_NUM: {
+            double d=v.u.n;
+            if(d==(double)(long long)d) return (unsigned)((long long)d)*2654435761u;
+            unsigned char *p=(unsigned char*)&d; return strhash((char*)p,(int)sizeof d);
+        }
+        case LT_STR:  return AS_STR(v)->hash;
+        default: { uintptr_t x=(uintptr_t)v.u.o; return (unsigned)(x>>3)*2654435761u; }
+    }
+}
+static int val_rawequal(Value a,Value b){
+    if(a.t!=b.t) return 0;
+    switch(a.t){
+        case LT_NIL:  return 1;
+        case LT_BOOL: return a.u.b==b.u.b;
+        case LT_NUM:  return a.u.n==b.u.n;
+        default:      return a.u.o==b.u.o;   /* strings are interned */
+    }
+}
+
+static void hash_grow(Table *t);
+
+static Entry *hash_find(Table *t,Value k){
+    if(t->ecap==0) return NULL;
+    unsigned i=val_hash(k)&(unsigned)(t->ecap-1);
+    for(;;){
+        Entry *e=&t->ents[i];
+        if(e->k.t==LT_NIL) return NULL;              /* empty slot: not found */
+        if(val_rawequal(e->k,k)) return e;
+        i=(i+1)&(unsigned)(t->ecap-1);
+    }
+}
+static void hash_set(Table *t,Value k,Value v){
+    Entry *e=hash_find(t,k);
+    if(e){ e->v=v; return; }
+    if(v.t==LT_NIL) return;
+    if(t->ecap==0 || (t->ecount+1)*4 >= t->ecap*3) hash_grow(t);
+    unsigned i=val_hash(k)&(unsigned)(t->ecap-1);
+    while(t->ents[i].k.t!=LT_NIL) i=(i+1)&(unsigned)(t->ecap-1);
+    t->ents[i].k=k; t->ents[i].v=v; t->ecount++;
+}
+static void hash_grow(Table *t){
+    int nc = t->ecap? t->ecap*2 : 8;
+    Entry *old=t->ents; int oc=t->ecap;
+    t->ents=(Entry*)lcalloc(sizeof(Entry)*(size_t)nc);
+    t->ecap=nc; t->ecount=0;
+    for(int i=0;i<oc;i++)
+        if(old[i].k.t!=LT_NIL && old[i].v.t!=LT_NIL) hash_set(t,old[i].k,old[i].v);
+    free(old);
+}
+
+static int arr_index(Value k,int *out){
+    if(k.t!=LT_NUM) return 0;
+    double d=k.u.n;
+    if(d!=floor(d) || d<1 || d>2147483000.0) return 0;
+    *out=(int)d; return 1;
+}
+static void arr_reserve(Table *t,int n){
+    if(n<=t->acap) return;
+    int nc=t->acap? t->acap*2 : 8; while(nc<n) nc*=2;
+    t->arr=(Value*)lrealloc(t->arr,sizeof(Value)*(size_t)nc);
+    for(int i=t->acap;i<nc;i++) t->arr[i]=NIL;
+    t->acap=nc;
+}
+
+static Value tab_get(Table *t,Value k){
+    int i;
+    if(arr_index(k,&i)){
+        if(i>=1 && i<=t->alen) return t->arr[i-1];
+    }
+    if(k.t==LT_NIL) return NIL;
+    Entry *e=hash_find(t,k);
+    return e? e->v : NIL;
+}
+static void tab_set(Table *t,Value k,Value v){
+    int i;
+    if(k.t==LT_NIL) luc_error("table index is nil");
+    if(k.t==LT_NUM && k.u.n!=k.u.n) luc_error("table index is NaN");
+    if(arr_index(k,&i)){
+        if(i>=1 && i<=t->alen){ t->arr[i-1]=v;
+            while(t->alen>0 && t->arr[t->alen-1].t==LT_NIL) t->alen--;
+            return; }
+        if(i==t->alen+1 && v.t!=LT_NIL){
+            arr_reserve(t,i); t->arr[i-1]=v; t->alen=i;
+            /* migrate following integer keys out of the hash part */
+            for(;;){
+                Value nk=mknum((double)(t->alen+1));
+                Entry *e=hash_find(t,nk);
+                if(!e || e->v.t==LT_NIL) break;
+                arr_reserve(t,t->alen+1);
+                t->arr[t->alen]=e->v; t->alen++; e->v=NIL;
+            }
+            return;
+        }
+    }
+    hash_set(t,k,v);
+}
+static int tab_len(Table *t){
+    int n=t->alen;
+    while(n>0 && t->arr[n-1].t==LT_NIL) n--;
+    return n;
+}
+/* list helpers */
+static void list_push(Table *t,Value v){
+    arr_reserve(t,t->alen+1); t->arr[t->alen++]=v;
+}
+static void list_insert(Table *t,int pos,Value v){
+    int n=t->alen;
+    if(pos<1) pos=1; if(pos>n+1) pos=n+1;
+    arr_reserve(t,n+1);
+    for(int i=n;i>=pos;i--) t->arr[i]=t->arr[i-1];
+    t->arr[pos-1]=v; t->alen=n+1;
+}
+static Value list_removeat(Table *t,int pos){
+    int n=t->alen;
+    if(n==0) return NIL;
+    if(pos<1||pos>n) return NIL;
+    Value v=t->arr[pos-1];
+    for(int i=pos-1;i<n-1;i++) t->arr[i]=t->arr[i+1];
+    t->arr[n-1]=NIL; t->alen=n-1;
+    return v;
+}
+
+/* iteration order: array part, then hash part */
+static int tab_next(Table *t,Value key,Value *ok,Value *ov){
+    int i, start=0;
+    if(key.t==LT_NIL) start=0;
+    else if(arr_index(key,&i) && i>=1 && i<=t->alen) start=i;
+    else {
+        Entry *e=hash_find(t,key);
+        if(!e) return 0;
+        start=t->alen+(int)(e-t->ents)+1;
+    }
+    for(i=start;i<t->alen;i++)
+        if(t->arr[i].t!=LT_NIL){ *ok=mknum((double)(i+1)); *ov=t->arr[i]; return 1; }
+    for(i=start-t->alen;i<t->ecap;i++){
+        if(i<0) i=0;
+        if(t->ents[i].k.t!=LT_NIL && t->ents[i].v.t!=LT_NIL){
+            *ok=t->ents[i].k; *ov=t->ents[i].v; return 1; }
+    }
+    return 0;
+}
+
+/* ==========================================================================
+** 4. garbage collector (mark & sweep)
+** ========================================================================== */
+
+static void mark_value(Value v);
+
+static void mark_obj(Obj *o){
+    if(!o || o->marked) return;
+    o->marked=1;
+    switch(o->type){
+        case LT_STR: break;
+        case LT_TABLE: case LT_LIST: {
+            Table *t=(Table*)o;
+            for(int i=0;i<t->alen;i++) mark_value(t->arr[i]);
+            for(int i=0;i<t->ecap;i++){ mark_value(t->ents[i].k); mark_value(t->ents[i].v); }
+            break; }
+        case LT_PROTO: {
+            Proto *p=(Proto*)o;
+            for(int i=0;i<p->nk;i++) mark_value(p->k[i]);
+            for(int i=0;i<p->np;i++) mark_obj((Obj*)p->p[i]);
+            if(p->name)  mark_obj((Obj*)p->name);
+            if(p->source)mark_obj((Obj*)p->source);
+            break; }
+        case LT_FUNC: {
+            Closure *c=(Closure*)o;
+            mark_obj((Obj*)c->p);
+            for(int i=0;i<c->nup;i++) mark_obj((Obj*)c->up[i]);
+            break; }
+        case LT_CFUNC: {
+            CFunc *c=(CFunc*)o;
+            for(int i=0;i<c->nup;i++) mark_value(c->up[i]);
+            break; }
+        case LT_UPVAL: {
+            Upval *u=(Upval*)o;
+            if(u->isclosed) mark_value(u->closed);
+            else mark_obj((Obj*)u->L);
+            break; }
+        case LT_CORO: {
+            LucState *L=(LucState*)o;
+            for(int i=0;i<L->stacksize;i++) mark_value(L->stack[i]);
+            for(int i=0;i<L->nci;i++) mark_obj((Obj*)L->ci[i].cl);
+            for(Upval *u=L->openupv;u;u=u->next) mark_obj((Obj*)u);
+            if(L->resumer) mark_obj((Obj*)L->resumer);
+            if(L->cursource) mark_obj((Obj*)L->cursource);
+            break; }
+        default: break;
+    }
+}
+static void mark_value(Value v){
+    if(v.t>=LT_STR && v.u.o) mark_obj(v.u.o);
+}
+
+static void free_obj(Obj *o){
+    switch(o->type){
+        case LT_TABLE: case LT_LIST: { Table*t=(Table*)o; free(t->arr); free(t->ents); break; }
+        case LT_PROTO: { Proto*p=(Proto*)o; free(p->code); free(p->lines); free(p->k); free(p->p); break; }
+        case LT_FUNC:  { Closure*c=(Closure*)o; free(c->up); break; }
+        case LT_CFUNC: { CFunc*c=(CFunc*)o; free(c->up); break; }
+        case LT_BUFFER:{ Buffer*b=(Buffer*)o; free(b->b); break; }
+        case LT_CORO:  { LucState*L=(LucState*)o; free(L->stack); free(L->ci); break; }
+        case LT_FILE:  { FileH*f=(FileH*)o; if(f->f && !f->isstd && !f->closed){ if(f->ispipe){
+#if defined(_WIN32)
+            _pclose(f->f);
+#else
+            pclose(f->f);
+#endif
+        } else fclose(f->f); } break; }
+        default: break;
+    }
+    free(o);
+}
+
+static void gc_collect(void){
+    if(V.gcoff) return;
+    /* --- mark roots --- */
+    mark_obj((Obj*)V.globals);
+    mark_obj((Obj*)V.stringlib); mark_obj((Obj*)V.listmeta);
+    mark_obj((Obj*)V.bufferlib); mark_obj((Obj*)V.filelib);
+    mark_obj((Obj*)V.mainco);
+    if(V.loaded) mark_obj((Obj*)V.loaded);
+    for(LucState *c=V.cur;c;c=c->resumer) mark_obj((Obj*)c);
+    for(int i=0;i<V.nsched;i++) mark_obj((Obj*)V.sched[i].co);
+    mark_value(V.errval);
+
+    /* --- sweep non-string objects --- */
+    Obj **pp=&V.objects;
+    while(*pp){
+        Obj *o=*pp;
+        if(o->marked){ o->marked=0; pp=&o->next; }
+        else { *pp=o->next; free_obj(o); V.nalloc--; }
+    }
+    /* --- sweep interned strings --- */
+    for(int i=0;i<V.strcap;i++){
+        Str **sp=&V.strtab[i];
+        while(*sp){
+            Str *s=*sp;
+            if(s->o.marked){ s->o.marked=0; sp=&s->snext; }
+            else { *sp=s->snext; free(s); V.nstr--; V.nalloc--; }
+        }
+    }
+    V.gcthresh = V.nalloc*2 + 4096;
+}
+
+/* ==========================================================================
+** 5. conversions / printing
+** ========================================================================== */
+
+static const char *type_name(Value v){
+    switch(v.t){
+        case LT_NIL:return "nil"; case LT_BOOL:return "boolean";
+        case LT_NUM:return "number"; case LT_STR:return "string";
+        case LT_TABLE:return "table"; case LT_LIST:return "list";
+        case LT_FUNC: case LT_CFUNC:return "function";
+        case LT_BUFFER:return "buffer"; case LT_CORO:return "thread";
+        case LT_FILE:return "file";
+    }
+    return "userdata";
+}
+static void num2str(double n,char *buf,size_t sz){
+    if(n!=n){ snprintf(buf,sz,"nan"); return; }
+    if(n==HUGE_VAL){ snprintf(buf,sz,"inf"); return; }
+    if(n==-HUGE_VAL){ snprintf(buf,sz,"-inf"); return; }
+    if(n==floor(n) && fabs(n)<1e15) snprintf(buf,sz,"%lld",(long long)n);
+    else snprintf(buf,sz,"%.17g",n);
+}
+static int str2num(const char *s,int len,double *out){
+    char tmp[128]; char *end;
+    if(len<=0||len>=(int)sizeof tmp) return 0;
+    memcpy(tmp,s,(size_t)len); tmp[len]=0;
+    char *p=tmp; while(*p&&isspace((unsigned char)*p)) p++;
+    if(!*p) return 0;
+    double d;
+    if((p[0]=='0')&&(p[1]=='x'||p[1]=='X')) d=(double)strtoll(p,&end,16);
+    else if(p[0]=='-'&&p[1]=='0'&&(p[2]=='x'||p[2]=='X')) d=-(double)strtoll(p+1,&end,16);
+    else d=strtod(p,&end);
+    if(end==p) return 0;
+    while(*end&&isspace((unsigned char)*end)) end++;
+    if(*end) return 0;
+    *out=d; return 1;
+}
+
+static Str *v2str(Value v,int depth);
+
+static Str *list_tostr(Table *t,int depth){
+    /* pretty-print lists: [1, 2, 3] */
+    size_t cap=64,len=0; char *b=(char*)lmalloc(cap);
+    #define PUT(str,n) do{ size_t _n=(size_t)(n); if(len+_n+1>cap){ while(len+_n+1>cap) cap*=2; b=(char*)lrealloc(b,cap);} memcpy(b+len,(str),_n); len+=_n; }while(0)
+    PUT("[",1);
+    for(int i=0;i<t->alen;i++){
+        if(i){ PUT(", ",2); }
+        Value e=t->arr[i];
+        if(e.t==LT_STR){ PUT("\"",1); PUT(AS_STR(e)->s,AS_STR(e)->len); PUT("\"",1); }
+        else { Str *s=v2str(e,depth+1); PUT(s->s,s->len); }
+    }
+    PUT("]",1); b[len]=0;
+    Str *r=str_new(b,(int)len); free(b);
+    #undef PUT
+    return r;
+}
+
+static Str *v2str(Value v,int depth){
+    char buf[80];
+    if(depth>6) return str_fromc("...");
+    switch(v.t){
+        case LT_NIL:  return str_fromc("nil");
+        case LT_BOOL: return str_fromc(v.u.b?"true":"false");
+        case LT_NUM:  num2str(v.u.n,buf,sizeof buf); return str_fromc(buf);
+        case LT_STR:  return AS_STR(v);
+        case LT_LIST: return list_tostr(AS_TAB(v),depth);
+        default:
+            snprintf(buf,sizeof buf,"%s: %p",type_name(v),(void*)v.u.o);
+            return str_fromc(buf);
+    }
+}
+static Str *tostr(Value v){ return v2str(v,0); }
+
+/* ==========================================================================
+** 6. LEXER
+** ========================================================================== */
+
+enum {
+    TK_EOF=256, TK_NAME, TK_NUMBER, TK_STRING,
+    TK_AND, TK_BREAK, TK_DO, TK_ELSE, TK_ELSEIF, TK_END, TK_FALSE, TK_FOR,
+    TK_FUNCTION, TK_IF, TK_IN, TK_LOCAL, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
+    TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE,
+    TK_CONCAT, TK_DOTS, TK_EQ, TK_NE, TK_LE, TK_GE
+};
+
+static const char *const kwnames[] = {
+    "and","break","do","else","elseif","end","false","for","function","if",
+    "in","local","nil","not","or","repeat","return","then","true","until","while"
+};
+
+typedef struct {
+    const char *p, *end;
+    int line;
+    Str *source;
+    /* current token */
+    int t; double num; Str *str; int tline;
+    /* lookahead */
+    int has_ahead; int at; double anum; Str *astr; int atline;
+} Lexer;
+
+static void lex_error(Lexer *lx,const char *msg){
+    char b[512];
+    snprintf(b,sizeof b,"%s:%d: %s",lx->source->s,lx->line,msg);
+    luc_throw(mkobj(LT_STR,str_fromc(b)));
+}
+
+static int lx_check_kw(const char *s,int len){
+    for(int i=0;i<21;i++)
+        if((int)strlen(kwnames[i])==len && memcmp(kwnames[i],s,(size_t)len)==0)
+            return TK_AND+i;
+    return TK_NAME;
+}
+
+/* long bracket:  [=[ ... ]=]  (level >= 1).  Plain [[ ]] is reserved for
+   list literals, so LUC long strings need at least one '='.               */
+static int lx_long_level(Lexer *lx,int incomment){
+    const char *p=lx->p;
+    if(*p!='[') return -1;
+    const char *q=p+1; int lvl=0;
+    while(q<lx->end && *q=='='){ lvl++; q++; }
+    if(q<lx->end && *q=='[' && (lvl>0 || incomment)) return lvl;
+    return -1;
+}
+static Str *lx_long_string(Lexer *lx,int lvl){
+    lx->p += 2+lvl;                       /* skip [===[ */
+    if(lx->p<lx->end && *lx->p=='\n'){ lx->line++; lx->p++; }
+    const char *start=lx->p;
+    for(;;){
+        if(lx->p>=lx->end) lex_error(lx,"unfinished long string");
+        if(*lx->p==']'){
+            const char *q=lx->p+1; int n=0;
+            while(q<lx->end && *q=='='){ n++; q++; }
+            if(n==lvl && q<lx->end && *q==']'){
+                Str *s=str_new(start,(int)(lx->p-start));
+                lx->p=q+1; return s;
+            }
+        }
+        if(*lx->p=='\n') lx->line++;
+        lx->p++;
+    }
+}
+
+static int lx_scan(Lexer *lx,double *num,Str **str){
+    for(;;){
+        if(lx->p>=lx->end) return TK_EOF;
+        char c=*lx->p;
+        if(c=='\n'){ lx->line++; lx->p++; continue; }
+        if(c==' '||c=='\t'||c=='\r'||c=='\f'||c=='\v'){ lx->p++; continue; }
+        if(c=='-'&&lx->p+1<lx->end&&lx->p[1]=='-'){
+            lx->p+=2;
+            if(lx->p<lx->end&&*lx->p=='['){
+                int lvl=lx_long_level(lx,1);
+                if(lvl>=0){ lx_long_string(lx,lvl); continue; }
+            }
+            while(lx->p<lx->end&&*lx->p!='\n') lx->p++;
+            continue;
+        }
+        break;
+    }
+    char c=*lx->p;
+    /* identifiers / keywords */
+    if(isalpha((unsigned char)c)||c=='_'){
+        const char *s=lx->p;
+        while(lx->p<lx->end&&(isalnum((unsigned char)*lx->p)||*lx->p=='_')) lx->p++;
+        int len=(int)(lx->p-s);
+        int t=lx_check_kw(s,len);
+        if(t==TK_NAME) *str=str_new(s,len);
+        return t;
+    }
+    /* numbers */
+    if(isdigit((unsigned char)c)||(c=='.'&&lx->p+1<lx->end&&isdigit((unsigned char)lx->p[1]))){
+        const char *s=lx->p;
+        if(c=='0'&&lx->p+1<lx->end&&(lx->p[1]=='x'||lx->p[1]=='X')){
+            lx->p+=2;
+            while(lx->p<lx->end&&isxdigit((unsigned char)*lx->p)) lx->p++;
+            *num=(double)strtoull(s+2,NULL,16);
+            return TK_NUMBER;
+        }
+        while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++;
+        if(lx->p<lx->end&&*lx->p=='.'){ lx->p++;
+            while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++; }
+        if(lx->p<lx->end&&(*lx->p=='e'||*lx->p=='E')){
+            lx->p++;
+            if(lx->p<lx->end&&(*lx->p=='+'||*lx->p=='-')) lx->p++;
+            while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++;
+        }
+        char tmp[64]; int len=(int)(lx->p-s);
+        if(len>=(int)sizeof tmp) lex_error(lx,"malformed number");
+        memcpy(tmp,s,(size_t)len); tmp[len]=0;
+        *num=strtod(tmp,NULL);
+        return TK_NUMBER;
+    }
+    /* short strings */
+    if(c=='"'||c=='\''){
+        char quote=c; lx->p++;
+        size_t cap=32,len=0; char *b=(char*)lmalloc(cap);
+        #define ADD(ch) do{ if(len+1>=cap){cap*=2;b=(char*)lrealloc(b,cap);} b[len++]=(char)(ch);}while(0)
+        while(lx->p<lx->end && *lx->p!=quote){
+            char ch=*lx->p;
+            if(ch=='\n') lex_error(lx,"unfinished string");
+            if(ch=='\\'){
+                lx->p++;
+                if(lx->p>=lx->end) lex_error(lx,"unfinished string");
+                char e=*lx->p++;
+                switch(e){
+                    case 'n': ADD('\n'); break;  case 't': ADD('\t'); break;
+                    case 'r': ADD('\r'); break;  case 'a': ADD('\a'); break;
+                    case 'b': ADD('\b'); break;  case 'f': ADD('\f'); break;
+                    case 'v': ADD('\v'); break;  case '\\':ADD('\\'); break;
+                    case '"': ADD('"');  break;  case '\'':ADD('\''); break;
+                    case '\n': ADD('\n'); lx->line++; break;
+                    case 'x': { int v0=0,i;
+                        for(i=0;i<2&&lx->p<lx->end&&isxdigit((unsigned char)*lx->p);i++){
+                            char h=*lx->p++;
+                            v0=v0*16+(isdigit((unsigned char)h)?h-'0':(tolower(h)-'a'+10));
+                        }
+                        ADD(v0); break; }
+                    case 'z': while(lx->p<lx->end&&isspace((unsigned char)*lx->p)){
+                                  if(*lx->p=='\n') lx->line++; lx->p++; }
+                              break;
+                    default:
+                        if(isdigit((unsigned char)e)){
+                            int v0=e-'0',i;
+                            for(i=0;i<2&&lx->p<lx->end&&isdigit((unsigned char)*lx->p);i++)
+                                v0=v0*10+(*lx->p++-'0');
+                            ADD(v0);
+                        } else lex_error(lx,"invalid escape sequence");
+                }
+            } else { ADD(ch); lx->p++; }
+        }
+        if(lx->p>=lx->end) lex_error(lx,"unfinished string");
+        lx->p++;
+        *str=str_new(b,(int)len); free(b);
+        #undef ADD
+        return TK_STRING;
+    }
+    /* long strings [=[ ]=] */
+    if(c=='['){
+        int lvl=lx_long_level(lx,0);
+        if(lvl>0){ *str=lx_long_string(lx,lvl); return TK_STRING; }
+    }
+    /* operators */
+    lx->p++;
+    switch(c){
+        case '=': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_EQ;} return '=';
+        case '~': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_NE;} lex_error(lx,"unexpected '~'"); break;
+        case '!': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_NE;} lex_error(lx,"unexpected '!'"); break;
+        case '<': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_LE;} return '<';
+        case '>': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_GE;} return '>';
+        case '.':
+            if(lx->p<lx->end&&*lx->p=='.'){
+                lx->p++;
+                if(lx->p<lx->end&&*lx->p=='.'){ lx->p++; return TK_DOTS; }
+                return TK_CONCAT;
+            }
+            return '.';
+        default: return (unsigned char)c;
+    }
+    return TK_EOF;
+}
+
+static void lx_next(Lexer *lx){
+    lx->tline=lx->line;
+    if(lx->has_ahead){
+        lx->t=lx->at; lx->num=lx->anum; lx->str=lx->astr; lx->tline=lx->atline;
+        lx->has_ahead=0; return;
+    }
+    lx->t=lx_scan(lx,&lx->num,&lx->str);
+    lx->tline=lx->line;
+}
+static int lx_peek(Lexer *lx){
+    if(!lx->has_ahead){
+        int sl=lx->line;
+        lx->at=lx_scan(lx,&lx->anum,&lx->astr);
+        lx->atline=lx->line; lx->has_ahead=1; (void)sl;
+    }
+    return lx->at;
+}
+
+/* ==========================================================================
+** 7. AST
+** ========================================================================== */
+
+typedef enum {
+    E_NIL,E_TRUE,E_FALSE,E_NUM,E_STR,E_VARARG,E_NAME,E_INDEX,
+    E_CALL,E_METHCALL,E_FUNC,E_TABLE,E_LIST,E_BIN,E_UN,E_AND,E_OR
+} EKind;
+
+typedef struct Expr Expr;
+typedef struct Stat Stat;
+typedef struct Block Block;
+typedef struct FuncBody FuncBody;
+
+typedef struct { Expr **e; int n,cap; } EList;
+typedef struct { Expr **k; Expr **v; int n,cap; } FieldList;
+
+struct Expr {
+    EKind k; int line, op;
+    double num; Str *str, *name;
+    Expr *a,*b;
+    EList args;
+    FieldList fields;
+    FuncBody *fb;
+};
+struct Block { Stat **s; int n,cap; };
+struct FuncBody { Str *name; Str **params; int nparams,isvararg,line; Block *body; };
+
+typedef enum {
+    S_LOCAL,S_ASSIGN,S_CALL,S_DO,S_WHILE,S_REPEAT,S_IF,
+    S_NUMFOR,S_GENFOR,S_LOCALFUNC,S_RETURN,S_BREAK
+} SKind;
+
+struct Stat {
+    SKind k; int line;
+    Str **names; int nnames;
+    EList lhs,rhs;
+    Block *body,*body2;
+    Expr *e1,*e2,*e3;
+    struct { Expr **cond; Block **blk; int n,cap; } clauses;
+    Block *elseblk;
+    FuncBody *fb;
+};
+
+/* AST nodes live until process exit (scripts are compiled once). */
+static void *anew(size_t n){ return lcalloc(n); }
+static Expr *new_expr(EKind k,int line){ Expr *e=(Expr*)anew(sizeof(Expr)); e->k=k; e->line=line; return e; }
+static void el_add(EList *l,Expr *e){
+    if(l->n==l->cap){ l->cap=l->cap?l->cap*2:4; l->e=(Expr**)lrealloc(l->e,sizeof(Expr*)*(size_t)l->cap); }
+    l->e[l->n++]=e;
+}
+static void fl_add(FieldList *l,Expr *k,Expr *v){
+    if(l->n==l->cap){ l->cap=l->cap?l->cap*2:4;
+        l->k=(Expr**)lrealloc(l->k,sizeof(Expr*)*(size_t)l->cap);
+        l->v=(Expr**)lrealloc(l->v,sizeof(Expr*)*(size_t)l->cap); }
+    l->k[l->n]=k; l->v[l->n]=v; l->n++;
+}
+static void blk_add(Block *b,Stat *s){
+    if(b->n==b->cap){ b->cap=b->cap?b->cap*2:8; b->s=(Stat**)lrealloc(b->s,sizeof(Stat*)*(size_t)b->cap); }
+    b->s[b->n++]=s;
+}
+
+/* ==========================================================================
+** 8. PARSER  (tokens -> AST)
+** ========================================================================== */
+
+typedef struct { Lexer lx; } Parser;
+
+static Block *parse_block(Parser *ps);
+static Expr  *parse_expr(Parser *ps);
+
+static void perr(Parser *ps,const char *fmt,...){
+    char b[512],m[600]; va_list ap;
+    va_start(ap,fmt); vsnprintf(b,sizeof b,fmt,ap); va_end(ap);
+    snprintf(m,sizeof m,"%s:%d: %s",ps->lx.source->s,ps->lx.tline,b);
+    luc_throw(mkobj(LT_STR,str_fromc(m)));
+}
+static const char *tok2str(int t,char *buf){
+    if(t<256){ buf[0]=(char)t; buf[1]=0; return buf; }
+    switch(t){
+        case TK_EOF:return "<eof>"; case TK_NAME:return "<name>";
+        case TK_NUMBER:return "<number>"; case TK_STRING:return "<string>";
+        case TK_CONCAT:return ".."; case TK_DOTS:return "...";
+        case TK_EQ:return "=="; case TK_NE:return "~=";
+        case TK_LE:return "<="; case TK_GE:return ">=";
+        default: return kwnames[t-TK_AND];
+    }
+}
+static void expect(Parser *ps,int t){
+    char b1[8],b2[8];
+    if(ps->lx.t!=t) perr(ps,"'%s' expected near '%s'",tok2str(t,b1),tok2str(ps->lx.t,b2));
+    lx_next(&ps->lx);
+}
+static int opt(Parser *ps,int t){ if(ps->lx.t==t){ lx_next(&ps->lx); return 1; } return 0; }
+static Str *expect_name(Parser *ps){
+    char b[8];
+    if(ps->lx.t!=TK_NAME) perr(ps,"<name> expected near '%s'",tok2str(ps->lx.t,b));
+    Str *s=ps->lx.str; lx_next(&ps->lx); return s;
+}
+
+/* --- optional type annotations: parsed and discarded ------------------- */
+static void parse_type(Parser *ps){
+    for(;;){
+        if(ps->lx.t=='{'){                 /* {number}, {[string]:number} */
+            int d=0;
+            do{ if(ps->lx.t=='{')d++; else if(ps->lx.t=='}')d--; lx_next(&ps->lx); }while(d>0&&ps->lx.t!=TK_EOF);
+        } else if(ps->lx.t=='('){          /* (number)->string */
+            int d=0;
+            do{ if(ps->lx.t=='(')d++; else if(ps->lx.t==')')d--; lx_next(&ps->lx); }while(d>0&&ps->lx.t!=TK_EOF);
+        } else if(ps->lx.t==TK_NAME||ps->lx.t==TK_NIL||ps->lx.t==TK_FUNCTION){
+            lx_next(&ps->lx);
+            while(ps->lx.t=='.'){ lx_next(&ps->lx); expect_name(ps); }
+        } else break;
+        if(ps->lx.t=='?') lx_next(&ps->lx);
+        if(ps->lx.t=='-'&&lx_peek(&ps->lx)=='>'){ lx_next(&ps->lx); lx_next(&ps->lx); continue; }
+        if(ps->lx.t=='|'){ lx_next(&ps->lx); continue; }
+        break;
+    }
+}
+static void opt_type(Parser *ps){ if(ps->lx.t==':'){ lx_next(&ps->lx); parse_type(ps); } }
+
+/* --- function body ------------------------------------------------------ */
+static FuncBody *parse_funcbody(Parser *ps,Str *name,int ismethod){
+    FuncBody *fb=(FuncBody*)anew(sizeof(FuncBody));
+    fb->name=name; fb->line=ps->lx.tline;
+    fb->params=(Str**)anew(sizeof(Str*)*64);
+    if(ismethod) fb->params[fb->nparams++]=str_fromc("self");
+    expect(ps,'(');
+    if(ps->lx.t!=')'){
+        do{
+            if(ps->lx.t==TK_DOTS){ lx_next(&ps->lx); fb->isvararg=1; break; }
+            if(fb->nparams>=60) perr(ps,"too many parameters");
+            fb->params[fb->nparams++]=expect_name(ps);
+            opt_type(ps);
+        } while(opt(ps,','));
+    }
+    expect(ps,')');
+    opt_type(ps);                       /* return type annotation */
+    fb->body=parse_block(ps);
+    expect(ps,TK_END);
+    return fb;
+}
+
+/* --- expressions -------------------------------------------------------- */
+static void parse_args(Parser *ps,Expr *call){
+    if(ps->lx.t==TK_STRING){
+        Expr *s=new_expr(E_STR,ps->lx.tline); s->str=ps->lx.str;
+        lx_next(&ps->lx); el_add(&call->args,s); return;
+    }
+    if(ps->lx.t=='{'||ps->lx.t=='['){ el_add(&call->args,parse_expr(ps)); return; }
+    expect(ps,'(');
+    if(ps->lx.t!=')') do{ el_add(&call->args,parse_expr(ps)); }while(opt(ps,','));
+    expect(ps,')');
+}
+
+static Expr *parse_primary(Parser *ps){
+    int line=ps->lx.tline;
+    if(ps->lx.t=='('){
+        lx_next(&ps->lx);
+        Expr *e=parse_expr(ps);
+        expect(ps,')');
+        /* parenthesised expressions are truncated to one value */
+        if(e->k==E_CALL||e->k==E_METHCALL||e->k==E_VARARG){
+            Expr *p=new_expr(E_UN,line); p->op='('; p->a=e; return p;
+        }
+        return e;
+    }
+    if(ps->lx.t==TK_NAME){
+        Expr *e=new_expr(E_NAME,line); e->name=ps->lx.str; lx_next(&ps->lx); return e;
+    }
+    char b[8];
+    perr(ps,"unexpected symbol near '%s'",tok2str(ps->lx.t,b));
+    return NULL;
+}
+
+static Expr *parse_suffixed(Parser *ps){
+    Expr *e=parse_primary(ps);
+    for(;;){
+        int line=ps->lx.tline;
+        switch(ps->lx.t){
+            case '.': {
+                lx_next(&ps->lx);
+                Str *n=expect_name(ps);
+                Expr *ix=new_expr(E_INDEX,line);
+                ix->a=e; ix->b=new_expr(E_STR,line); ix->b->str=n;
+                e=ix; break; }
+            case '[': {
+                lx_next(&ps->lx);
+                Expr *k=parse_expr(ps);
+                expect(ps,']');
+                Expr *ix=new_expr(E_INDEX,line); ix->a=e; ix->b=k; e=ix; break; }
+            case ':': {
+                lx_next(&ps->lx);
+                Str *n=expect_name(ps);
+                Expr *c=new_expr(E_METHCALL,line); c->a=e; c->name=n;
+                parse_args(ps,c); e=c; break; }
+            case '(': case TK_STRING: case '{': {
+                Expr *c=new_expr(E_CALL,line); c->a=e;
+                parse_args(ps,c); e=c; break; }
+            default: return e;
+        }
+    }
+}
+
+static Expr *parse_table(Parser *ps){
+    int line=ps->lx.tline;
+    Expr *e=new_expr(E_TABLE,line);
+    expect(ps,'{');
+    while(ps->lx.t!='}'){
+        if(ps->lx.t=='['){
+            lx_next(&ps->lx);
+            Expr *k=parse_expr(ps); expect(ps,']'); expect(ps,'=');
+            fl_add(&e->fields,k,parse_expr(ps));
+        } else if(ps->lx.t==TK_NAME && lx_peek(&ps->lx)=='='){
+            Expr *k=new_expr(E_STR,ps->lx.tline); k->str=ps->lx.str;
+            lx_next(&ps->lx); lx_next(&ps->lx);
+            fl_add(&e->fields,k,parse_expr(ps));
+        } else {
+            fl_add(&e->fields,NULL,parse_expr(ps));
+        }
+        if(!opt(ps,',') && !opt(ps,';')) break;
+    }
+    expect(ps,'}');
+    return e;
+}
+static Expr *parse_list(Parser *ps){
+    int line=ps->lx.tline;
+    Expr *e=new_expr(E_LIST,line);
+    expect(ps,'[');
+    while(ps->lx.t!=']'){
+        fl_add(&e->fields,NULL,parse_expr(ps));
+        if(!opt(ps,',')) break;
+    }
+    expect(ps,']');
+    return e;
+}
+
+static Expr *parse_simple(Parser *ps){
+    int line=ps->lx.tline;
+    Expr *e;
+    switch(ps->lx.t){
+        case TK_NIL:    e=new_expr(E_NIL,line);   lx_next(&ps->lx); return e;
+        case TK_TRUE:   e=new_expr(E_TRUE,line);  lx_next(&ps->lx); return e;
+        case TK_FALSE:  e=new_expr(E_FALSE,line); lx_next(&ps->lx); return e;
+        case TK_NUMBER: e=new_expr(E_NUM,line); e->num=ps->lx.num; lx_next(&ps->lx); return e;
+        case TK_STRING: e=new_expr(E_STR,line); e->str=ps->lx.str; lx_next(&ps->lx); return e;
+        case TK_DOTS:   e=new_expr(E_VARARG,line); lx_next(&ps->lx); return e;
+        case '{':       return parse_table(ps);
+        case '[':       return parse_list(ps);
+        case TK_FUNCTION: {
+            lx_next(&ps->lx);
+            e=new_expr(E_FUNC,line); e->fb=parse_funcbody(ps,NULL,0); return e; }
+        default: return parse_suffixed(ps);
+    }
+}
+
+/* operator priorities (left, right) */
+typedef struct { unsigned char left,right; } Prio;
+static int getbinop(int t){
+    switch(t){
+        case '+': case '-': case '*': case '/': case '%': case '^':
+        case TK_CONCAT: case TK_EQ: case TK_NE: case '<': case '>':
+        case TK_LE: case TK_GE: case TK_AND: case TK_OR: case TK_IN: return t;
+        default: return 0;
+    }
+}
+static Prio binprio(int op){
+    Prio p;
+    switch(op){
+        case TK_OR:  p.left=1;p.right=1; break;
+        case TK_AND: p.left=2;p.right=2; break;
+        case '<': case '>': case TK_LE: case TK_GE: case TK_NE: case TK_EQ:
+        case TK_IN:  p.left=3;p.right=3; break;
+        case TK_CONCAT: p.left=9;p.right=8; break;      /* right assoc */
+        case '+': case '-': p.left=10;p.right=10; break;
+        case '*': case '/': case '%': p.left=11;p.right=11; break;
+        case '^': p.left=14;p.right=13; break;          /* right assoc */
+        default: p.left=0;p.right=0;
+    }
+    return p;
+}
+#define UNARY_PRIO 12
+
+static Expr *parse_subexpr(Parser *ps,int limit){
+    Expr *e; int line=ps->lx.tline;
+    if(ps->lx.t==TK_NOT||ps->lx.t=='-'||ps->lx.t=='#'){
+        int op=ps->lx.t; lx_next(&ps->lx);
+        Expr *sub=parse_subexpr(ps,UNARY_PRIO);
+        if(op=='-'&&sub->k==E_NUM){ sub->num=-sub->num; e=sub; }
+        else { e=new_expr(E_UN,line); e->op=op; e->a=sub; }
+    } else e=parse_simple(ps);
+
+    for(;;){
+        int op=getbinop(ps->lx.t);
+        if(!op) break;
+        Prio pr=binprio(op);
+        if(pr.left<=limit) break;
+        int l2=ps->lx.tline;
+        lx_next(&ps->lx);
+        Expr *rhs=parse_subexpr(ps,pr.right);
+        Expr *b=new_expr(op==TK_AND?E_AND:(op==TK_OR?E_OR:E_BIN),l2);
+        b->op=op; b->a=e; b->b=rhs;
+        e=b;
+    }
+    return e;
+}
+static Expr *parse_expr(Parser *ps){ return parse_subexpr(ps,0); }
+
+/* --- statements --------------------------------------------------------- */
+static Stat *new_stat(SKind k,int line){ Stat *s=(Stat*)anew(sizeof(Stat)); s->k=k; s->line=line; return s; }
+
+static void clause_add(Stat *s,Expr *c,Block *b){
+    if(s->clauses.n==s->clauses.cap){
+        s->clauses.cap=s->clauses.cap?s->clauses.cap*2:4;
+        s->clauses.cond=(Expr**)lrealloc(s->clauses.cond,sizeof(Expr*)*(size_t)s->clauses.cap);
+        s->clauses.blk =(Block**)lrealloc(s->clauses.blk ,sizeof(Block*)*(size_t)s->clauses.cap);
+    }
+    s->clauses.cond[s->clauses.n]=c; s->clauses.blk[s->clauses.n]=b; s->clauses.n++;
+}
+
+static int block_follow(int t){
+    return t==TK_EOF||t==TK_END||t==TK_ELSE||t==TK_ELSEIF||t==TK_UNTIL;
+}
+
+static Stat *parse_statement(Parser *ps){
+    int line=ps->lx.tline;
+    switch(ps->lx.t){
+        case ';': lx_next(&ps->lx); return NULL;
+
+        case TK_IF: {
+            Stat *s=new_stat(S_IF,line);
+            lx_next(&ps->lx);
+            Expr *c=parse_expr(ps); expect(ps,TK_THEN);
+            clause_add(s,c,parse_block(ps));
+            while(ps->lx.t==TK_ELSEIF){
+                lx_next(&ps->lx);
+                Expr *c2=parse_expr(ps); expect(ps,TK_THEN);
+                clause_add(s,c2,parse_block(ps));
+            }
+            if(opt(ps,TK_ELSE)) s->elseblk=parse_block(ps);
+            expect(ps,TK_END);
+            return s; }
+
+        case TK_WHILE: {
+            Stat *s=new_stat(S_WHILE,line);
+            lx_next(&ps->lx);
+            s->e1=parse_expr(ps); expect(ps,TK_DO);
+            s->body=parse_block(ps); expect(ps,TK_END);
+            return s; }
+
+        case TK_DO: {
+            Stat *s=new_stat(S_DO,line);
+            lx_next(&ps->lx);
+            s->body=parse_block(ps); expect(ps,TK_END);
+            return s; }
+
+        case TK_REPEAT: {
+            Stat *s=new_stat(S_REPEAT,line);
+            lx_next(&ps->lx);
+            s->body=parse_block(ps); expect(ps,TK_UNTIL);
+            s->e1=parse_expr(ps);
+            return s; }
+
+        case TK_FOR: {
+            lx_next(&ps->lx);
+            Str *n1=expect_name(ps);
+            opt_type(ps);
+            if(ps->lx.t=='='){
+                Stat *s=new_stat(S_NUMFOR,line);
+                s->names=(Str**)anew(sizeof(Str*)); s->names[0]=n1; s->nnames=1;
+                lx_next(&ps->lx);
+                s->e1=parse_expr(ps); expect(ps,',');
+                s->e2=parse_expr(ps);
+                if(opt(ps,',')) s->e3=parse_expr(ps);
+                expect(ps,TK_DO);
+                s->body=parse_block(ps); expect(ps,TK_END);
+                return s;
+            } else {
+                Stat *s=new_stat(S_GENFOR,line);
+                s->names=(Str**)anew(sizeof(Str*)*32); s->names[0]=n1; s->nnames=1;
+                while(opt(ps,',')){
+                    if(s->nnames>=30) perr(ps,"too many loop variables");
+                    s->names[s->nnames++]=expect_name(ps); opt_type(ps);
+                }
+                expect(ps,TK_IN);
+                do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
+                expect(ps,TK_DO);
+                s->body=parse_block(ps); expect(ps,TK_END);
+                return s;
+            } }
+
+        case TK_FUNCTION: {
+            lx_next(&ps->lx);
+            Str *n=expect_name(ps);
+            Expr *target=new_expr(E_NAME,line); target->name=n;
+            int ismethod=0;
+            Str *last=n;
+            while(ps->lx.t=='.'){
+                lx_next(&ps->lx);
+                Str *f=expect_name(ps);
+                Expr *ix=new_expr(E_INDEX,line);
+                ix->a=target; ix->b=new_expr(E_STR,line); ix->b->str=f;
+                target=ix; last=f;
+            }
+            if(ps->lx.t==':'){
+                lx_next(&ps->lx);
+                Str *f=expect_name(ps);
+                Expr *ix=new_expr(E_INDEX,line);
+                ix->a=target; ix->b=new_expr(E_STR,line); ix->b->str=f;
+                target=ix; last=f; ismethod=1;
+            }
+            Stat *s=new_stat(S_ASSIGN,line);
+            el_add(&s->lhs,target);
+            Expr *fe=new_expr(E_FUNC,line);
+            fe->fb=parse_funcbody(ps,last,ismethod);
+            el_add(&s->rhs,fe);
+            return s; }
+
+        case TK_LOCAL: {
+            lx_next(&ps->lx);
+            if(opt(ps,TK_FUNCTION)){
+                Stat *s=new_stat(S_LOCALFUNC,line);
+                Str *n=expect_name(ps);
+                s->names=(Str**)anew(sizeof(Str*)); s->names[0]=n; s->nnames=1;
+                s->fb=parse_funcbody(ps,n,0);
+                return s;
+            }
+            Stat *s=new_stat(S_LOCAL,line);
+            s->names=(Str**)anew(sizeof(Str*)*64);
+            do{
+                if(s->nnames>=60) perr(ps,"too many local variables");
+                s->names[s->nnames++]=expect_name(ps);
+                opt_type(ps);
+            }while(opt(ps,','));
+            if(opt(ps,'='))
+                do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
+            return s; }
+
+        case TK_RETURN: {
+            Stat *s=new_stat(S_RETURN,line);
+            lx_next(&ps->lx);
+            if(!block_follow(ps->lx.t) && ps->lx.t!=';')
+                do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
+            opt(ps,';');
+            return s; }
+
+        case TK_BREAK: { lx_next(&ps->lx); opt(ps,';'); return new_stat(S_BREAK,line); }
+
+        default: {
+            Expr *e=parse_suffixed(ps);
+            if(ps->lx.t=='='||ps->lx.t==','){
+                Stat *s=new_stat(S_ASSIGN,line);
+                el_add(&s->lhs,e);
+                while(opt(ps,',')) el_add(&s->lhs,parse_suffixed(ps));
+                expect(ps,'=');
+                do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
+                for(int i=0;i<s->lhs.n;i++)
+                    if(s->lhs.e[i]->k!=E_NAME && s->lhs.e[i]->k!=E_INDEX)
+                        perr(ps,"cannot assign to this expression");
+                return s;
+            }
+            if(e->k!=E_CALL&&e->k!=E_METHCALL) perr(ps,"syntax error near unexpected expression");
+            Stat *s=new_stat(S_CALL,line); s->e1=e;
+            return s; }
+    }
+}
+
+static Block *parse_block(Parser *ps){
+    Block *b=(Block*)anew(sizeof(Block));
+    while(!block_follow(ps->lx.t)){
+        int isret = (ps->lx.t==TK_RETURN);
+        Stat *s=parse_statement(ps);
+        if(s) blk_add(b,s);
+        if(isret) break;
+    }
+    return b;
+}
+
+/* ==========================================================================
+** 9. BYTECODE
+** ========================================================================== */
+
+enum {
+    OP_MOVE, OP_LOADK, OP_LOADNIL, OP_LOADBOOL,
+    OP_GETGLOBAL, OP_SETGLOBAL, OP_GETUPVAL, OP_SETUPVAL,
+    OP_GETTABLE, OP_SETTABLE, OP_NEWTABLE, OP_SETLIST, OP_SELF,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
+    OP_UNM, OP_NOT, OP_LEN, OP_CONCAT,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_IN,
+    OP_JMP, OP_JMPIF, OP_JMPIFNOT,
+    OP_CALL, OP_RETURN, OP_CLOSURE, OP_VARARG, OP_CLOSE,
+    OP_FORPREP, OP_FORLOOP, OP_TFORLOOP,
+    OP_COUNT
+};
+
+#define I_ABC(o,a,b,c) (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|(((uint32_t)(b)&0xFFu)<<8)|((uint32_t)(c)&0xFFu))
+#define I_ABx(o,a,bx)  (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|((uint32_t)(bx)&0xFFFFu))
+#define I_AsBx(o,a,s)  I_ABx(o,a,(int)(s)+32767)
+
+#define GET_OP(i)   ((int)((i)>>24))
+#define GET_A(i)    ((int)(((i)>>16)&0xFFu))
+#define GET_B(i)    ((int)(((i)>>8)&0xFFu))
+#define GET_C(i)    ((int)((i)&0xFFu))
+#define GET_Bx(i)   ((int)((i)&0xFFFFu))
+#define GET_sBx(i)  (GET_Bx(i)-32767)
+
+/* ==========================================================================
+** 10. COMPILER (AST -> bytecode)
+** ========================================================================== */
+
+typedef struct { Str *name; } LocalVar;
+typedef struct BlockCnt {
+    struct BlockCnt *prev;
+    int firstlocal, isloop;
+    int breaks[80], nbreaks;
+} BlockCnt;
+
+typedef struct FuncState {
+    Proto *p;
+    struct FuncState *prev;
+    LocalVar locals[LUC_MAXREG];
+    int nlocals, freereg;
+    Str *upnames[LUC_MAXUPVAL];
+    BlockCnt *bl;
+    Str *source;
+    int line;
+} FuncState;
+
+static void cerror(FuncState *fs,int line,const char *fmt,...){
+    char b[400],m[500]; va_list ap;
+    va_start(ap,fmt); vsnprintf(b,sizeof b,fmt,ap); va_end(ap);
+    snprintf(m,sizeof m,"%s:%d: %s",fs->source->s,line,b);
+    luc_throw(mkobj(LT_STR,str_fromc(m)));
+}
+
+static int emit(FuncState *fs,uint32_t ins,int line){
+    Proto *p=fs->p;
+    if(p->ncode==p->ccap){
+        p->ccap=p->ccap?p->ccap*2:32;
+        p->code =(uint32_t*)lrealloc(p->code ,sizeof(uint32_t)*(size_t)p->ccap);
+        p->lines=(int*)lrealloc(p->lines,sizeof(int)*(size_t)p->ccap);
+    }
+    p->lines[p->ncode]=line;
+    p->code[p->ncode]=ins;
+    return p->ncode++;
+}
+
+/* patch a jump at `pc` so that it continues at `target` */
+static void patch(FuncState *fs,int pc,int target){
+    uint32_t ins=fs->p->code[pc];
+    int op=GET_OP(ins), a=GET_A(ins);
+    fs->p->code[pc]=I_AsBx(op,a,target-(pc+1));
+}
+static int here(FuncState *fs){ return fs->p->ncode; }
+
+static int addk(FuncState *fs,Value v){
+    Proto *p=fs->p;
+    for(int i=0;i<p->nk;i++) if(p->k[i].t==v.t && val_rawequal(p->k[i],v)) return i;
+    if(p->nk==p->kcap){
+        p->kcap=p->kcap?p->kcap*2:8;
+        p->k=(Value*)lrealloc(p->k,sizeof(Value)*(size_t)p->kcap);
+    }
+    p->k[p->nk]=v;
+    if(p->nk>=65000) cerror(fs,fs->line,"too many constants");
+    return p->nk++;
+}
+static int addkstr(FuncState *fs,Str *s){ return addk(fs,mkobj(LT_STR,s)); }
+
+static void checkreg(FuncState *fs,int n){
+    if(n>=LUC_MAXREG) cerror(fs,fs->line,"function or expression too complex");
+    if(n>fs->p->maxstack) fs->p->maxstack=n;
+}
+static int reserve(FuncState *fs,int n){
+    int r=fs->freereg; fs->freereg+=n; checkreg(fs,fs->freereg); return r;
+}
+static int newlocal(FuncState *fs,Str *name){
+    if(fs->nlocals>=LUC_MAXREG-4) cerror(fs,fs->line,"too many local variables");
+    fs->locals[fs->nlocals].name=name;
+    checkreg(fs,fs->nlocals+1);
+    return fs->nlocals++;
+}
+static int findlocal(FuncState *fs,Str *n){
+    for(int i=fs->nlocals-1;i>=0;i--) if(fs->locals[i].name==n) return i;
+    return -1;
+}
+static int findupval(FuncState *fs,Str *n){
+    Proto *p=fs->p;
+    for(int i=0;i<p->nup;i++) if(fs->upnames[i]==n) return i;
+    if(!fs->prev) return -1;
+    int r=findlocal(fs->prev,n);
+    if(r>=0){
+        if(p->nup>=LUC_MAXUPVAL) cerror(fs,fs->line,"too many upvalues");
+        p->upvals[p->nup].instack=1; p->upvals[p->nup].idx=(unsigned char)r;
+        fs->upnames[p->nup]=n; return p->nup++;
+    }
+    int u=findupval(fs->prev,n);
+    if(u<0) return -1;
+    if(p->nup>=LUC_MAXUPVAL) cerror(fs,fs->line,"too many upvalues");
+    p->upvals[p->nup].instack=0; p->upvals[p->nup].idx=(unsigned char)u;
+    fs->upnames[p->nup]=n; return p->nup++;
+}
+
+static void enterblock(FuncState *fs,BlockCnt *bl,int isloop){
+    bl->prev=fs->bl; bl->firstlocal=fs->nlocals; bl->isloop=isloop; bl->nbreaks=0;
+    fs->bl=bl;
+}
+static void leaveblock(FuncState *fs,int line){
+    BlockCnt *bl=fs->bl;
+    if(bl->firstlocal<fs->nlocals) emit(fs,I_ABC(OP_CLOSE,bl->firstlocal,0,0),line);
+    fs->nlocals=bl->firstlocal; fs->freereg=fs->nlocals; fs->bl=bl->prev;
+}
+static void patch_breaks(FuncState *fs,BlockCnt *bl,int target){
+    for(int i=0;i<bl->nbreaks;i++) patch(fs,bl->breaks[i],target);
+}
+
+/* forward decls */
+static void exprd(FuncState *fs,Expr *e,int reg);
+static int  comp_call(FuncState *fs,Expr *e,int nres);
+static void comp_block(FuncState *fs,Block *b);
+static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source);
+
+static int multiret(Expr *e){ return e->k==E_CALL||e->k==E_METHCALL||e->k==E_VARARG; }
+
+/* compile e producing `nres` results (nres<0 = all), returns first register */
+static int comp_multi(FuncState *fs,Expr *e,int nres){
+    if(e->k==E_CALL||e->k==E_METHCALL) return comp_call(fs,e,nres);
+    /* vararg */
+    int r=reserve(fs,1);
+    emit(fs,I_ABC(OP_VARARG,r,nres<0?0:nres+1,0),e->line);
+    if(nres>1) reserve(fs,nres-1);
+    return r;
+}
+
+/* compile expression into a temporary or existing register, return that reg */
+static int exprtmp(FuncState *fs,Expr *e){
+    if(e->k==E_NAME){
+        int r=findlocal(fs,e->name);
+        if(r>=0) return r;
+    }
+    int r=reserve(fs,1);
+    exprd(fs,e,r);
+    return r;
+}
+
+static int comp_call(FuncState *fs,Expr *e,int nres){
+    int func=fs->freereg;
+    int nargs=0;
+    if(e->k==E_METHCALL){
+        reserve(fs,2);
+        exprd(fs,e->a,func+1);                       /* self object */
+        int t=reserve(fs,1);
+        emit(fs,I_ABx(OP_LOADK,t,addkstr(fs,e->name)),e->line);
+        emit(fs,I_ABC(OP_GETTABLE,func,func+1,t),e->line);
+        fs->freereg=func+2;
+        nargs=1;
+    } else {
+        reserve(fs,1);
+        exprd(fs,e->a,func);
+    }
+    int multi=0;
+    for(int i=0;i<e->args.n;i++){
+        Expr *a=e->args.e[i];
+        if(i==e->args.n-1 && multiret(a)){ comp_multi(fs,a,-1); multi=1; }
+        else { int r=reserve(fs,1); exprd(fs,a,r); nargs++; }
+    }
+    emit(fs,I_ABC(OP_CALL,func,multi?0:nargs+1,nres<0?0:nres+1),e->line);
+    fs->freereg = func + (nres<0?1:(nres>0?nres:0));
+    checkreg(fs,fs->freereg+1);
+    return func;
+}
+
+/* table / list constructor */
+static void comp_ctor(FuncState *fs,Expr *e,int reg){
+    int islist=(e->k==E_LIST);
+    int save=fs->freereg;
+    int tmp=reserve(fs,1);
+    emit(fs,I_ABC(OP_NEWTABLE,tmp,islist,0),e->line);
+    int pending=0, startidx=1;
+    for(int i=0;i<e->fields.n;i++){
+        Expr *k=e->fields.k[i], *v=e->fields.v[i];
+        if(k){
+            if(pending){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
+                         startidx+=pending; pending=0; fs->freereg=tmp+1; }
+            int rb=reserve(fs,1); exprd(fs,k,rb);
+            int rc=reserve(fs,1); exprd(fs,v,rc);
+            emit(fs,I_ABC(OP_SETTABLE,tmp,rb,rc),e->line);
+            fs->freereg=tmp+1;
+        } else if(i==e->fields.n-1 && multiret(v)){
+            if(pending){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
+                         startidx+=pending; pending=0; fs->freereg=tmp+1; }
+            comp_multi(fs,v,-1);
+            emit(fs,I_ABC(OP_SETLIST,tmp,0,startidx),e->line);
+            fs->freereg=tmp+1;
+        } else if(startidx+pending>240){
+            /* very long literal: fall back to explicit index stores */
+            if(pending){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
+                         startidx+=pending; pending=0; fs->freereg=tmp+1; }
+            int rb=reserve(fs,1);
+            emit(fs,I_ABx(OP_LOADK,rb,addk(fs,mknum((double)startidx))),e->line);
+            int rc=reserve(fs,1); exprd(fs,v,rc);
+            emit(fs,I_ABC(OP_SETTABLE,tmp,rb,rc),e->line);
+            fs->freereg=tmp+1; startidx++;
+        } else {
+            int r=reserve(fs,1); exprd(fs,v,r); pending++;
+            if(pending>=40){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
+                             startidx+=pending; pending=0; fs->freereg=tmp+1; }
+        }
+    }
+    if(pending) emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
+    if(tmp!=reg) emit(fs,I_ABC(OP_MOVE,reg,tmp,0),e->line);
+    fs->freereg=save;
+}
+
+static int binop2op(int op){
+    switch(op){
+        case '+':return OP_ADD; case '-':return OP_SUB; case '*':return OP_MUL;
+        case '/':return OP_DIV; case '%':return OP_MOD; case '^':return OP_POW;
+        case TK_CONCAT:return OP_CONCAT;
+        case TK_EQ:return OP_EQ;  case TK_NE:return OP_NE;
+        case '<':return OP_LT;    case TK_LE:return OP_LE;
+        case '>':return OP_GT;    case TK_GE:return OP_GE;
+        case TK_IN:return OP_IN;
+        default: return OP_ADD;
+    }
+}
+
+static void exprd(FuncState *fs,Expr *e,int reg){
+    fs->line=e->line;
+    switch(e->k){
+        case E_NIL:   emit(fs,I_ABC(OP_LOADNIL,reg,0,0),e->line); break;
+        case E_TRUE:  emit(fs,I_ABC(OP_LOADBOOL,reg,1,0),e->line); break;
+        case E_FALSE: emit(fs,I_ABC(OP_LOADBOOL,reg,0,0),e->line); break;
+        case E_NUM:   emit(fs,I_ABx(OP_LOADK,reg,addk(fs,mknum(e->num))),e->line); break;
+        case E_STR:   emit(fs,I_ABx(OP_LOADK,reg,addkstr(fs,e->str)),e->line); break;
+        case E_VARARG:emit(fs,I_ABC(OP_VARARG,reg,2,0),e->line); break;
+        case E_NAME: {
+            int r=findlocal(fs,e->name);
+            if(r>=0){ if(r!=reg) emit(fs,I_ABC(OP_MOVE,reg,r,0),e->line); break; }
+            int u=findupval(fs,e->name);
+            if(u>=0){ emit(fs,I_ABC(OP_GETUPVAL,reg,u,0),e->line); break; }
+            emit(fs,I_ABx(OP_GETGLOBAL,reg,addkstr(fs,e->name)),e->line);
+            break; }
+        case E_INDEX: {
+            int save=fs->freereg;
+            int rb=exprtmp(fs,e->a), rc=exprtmp(fs,e->b);
+            emit(fs,I_ABC(OP_GETTABLE,reg,rb,rc),e->line);
+            fs->freereg=save; break; }
+        case E_CALL: case E_METHCALL: {
+            int save=fs->freereg;
+            int f=comp_call(fs,e,1);
+            if(f!=reg) emit(fs,I_ABC(OP_MOVE,reg,f,0),e->line);
+            fs->freereg=save; break; }
+        case E_TABLE: case E_LIST: comp_ctor(fs,e,reg); break;
+        case E_FUNC: {
+            Proto *np=compile_proto(fs,e->fb,fs->source);
+            Proto *p=fs->p;
+            if(p->np==p->pcap){ p->pcap=p->pcap?p->pcap*2:4;
+                p->p=(Proto**)lrealloc(p->p,sizeof(Proto*)*(size_t)p->pcap); }
+            p->p[p->np]=np;
+            emit(fs,I_ABx(OP_CLOSURE,reg,p->np),e->line);
+            p->np++;
+            break; }
+        case E_AND: {
+            exprd(fs,e->a,reg);
+            int j=emit(fs,I_AsBx(OP_JMPIFNOT,reg,0),e->line);
+            exprd(fs,e->b,reg);
+            patch(fs,j,here(fs));
+            break; }
+        case E_OR: {
+            exprd(fs,e->a,reg);
+            int j=emit(fs,I_AsBx(OP_JMPIF,reg,0),e->line);
+            exprd(fs,e->b,reg);
+            patch(fs,j,here(fs));
+            break; }
+        case E_UN: {
+            if(e->op=='('){ exprd(fs,e->a,reg); break; }
+            int save=fs->freereg;
+            int rb=exprtmp(fs,e->a);
+            int op = e->op=='-'?OP_UNM : (e->op=='#'?OP_LEN:OP_NOT);
+            emit(fs,I_ABC(op,reg,rb,0),e->line);
+            fs->freereg=save; break; }
+        case E_BIN: {
+            int save=fs->freereg;
+            int rb=exprtmp(fs,e->a), rc=exprtmp(fs,e->b);
+            emit(fs,I_ABC(binop2op(e->op),reg,rb,rc),e->line);
+            fs->freereg=save; break; }
+    }
+}
+
+/* compile a list of expressions into nvars consecutive registers at `base` */
+static void adjust_assign(FuncState *fs,int nvars,EList *rhs,int base){
+    int n=rhs->n;
+    for(int i=0;i<n;i++){
+        Expr *e=rhs->e[i];
+        if(i==n-1 && i<nvars && multiret(e)){
+            int want=nvars-i;
+            fs->freereg=base+i;
+            comp_multi(fs,e,want);
+            fs->freereg=base+nvars;
+            return;
+        }
+        if(i<nvars){ fs->freereg=base+i; reserve(fs,1); exprd(fs,e,base+i); }
+        else { int t=reserve(fs,1); exprd(fs,e,t); fs->freereg=base+nvars>t?base+nvars:t; }
+    }
+    for(int i=n;i<nvars;i++){ fs->freereg=base+i; reserve(fs,1);
+        emit(fs,I_ABC(OP_LOADNIL,base+i,0,0),fs->line); }
+    fs->freereg=base+nvars;
+    checkreg(fs,fs->freereg);
+}
+
+static void store_to(FuncState *fs,Expr *lhs,int valreg,int line){
+    if(lhs->k==E_NAME){
+        int r=findlocal(fs,lhs->name);
+        if(r>=0){ if(r!=valreg) emit(fs,I_ABC(OP_MOVE,r,valreg,0),line); return; }
+        int u=findupval(fs,lhs->name);
+        if(u>=0){ emit(fs,I_ABC(OP_SETUPVAL,valreg,u,0),line); return; }
+        emit(fs,I_ABx(OP_SETGLOBAL,valreg,addkstr(fs,lhs->name)),line);
+        return;
+    }
+    int save=fs->freereg;
+    int rt=exprtmp(fs,lhs->a), rk=exprtmp(fs,lhs->b);
+    emit(fs,I_ABC(OP_SETTABLE,rt,rk,valreg),line);
+    fs->freereg=save;
+}
+
+static void comp_stat(FuncState *fs,Stat *s){
+    fs->line=s->line;
+    switch(s->k){
+        case S_LOCAL: {
+            int base=fs->nlocals;
+            fs->freereg=base;
+            adjust_assign(fs,s->nnames,&s->rhs,base);
+            for(int i=0;i<s->nnames;i++) newlocal(fs,s->names[i]);
+            fs->freereg=fs->nlocals;
+            break; }
+        case S_LOCALFUNC: {
+            int r=newlocal(fs,s->names[0]);
+            fs->freereg=fs->nlocals;
+            Expr fe; memset(&fe,0,sizeof fe);
+            fe.k=E_FUNC; fe.line=s->line; fe.fb=s->fb;
+            exprd(fs,&fe,r);
+            fs->freereg=fs->nlocals;
+            break; }
+        case S_ASSIGN: {
+            int base=fs->freereg;
+            adjust_assign(fs,s->lhs.n,&s->rhs,base);
+            for(int i=s->lhs.n-1;i>=0;i--) store_to(fs,s->lhs.e[i],base+i,s->line);
+            fs->freereg=fs->nlocals;
+            break; }
+        case S_CALL: {
+            int save=fs->freereg;
+            comp_call(fs,s->e1,0);
+            fs->freereg=save;
+            break; }
+        case S_DO: {
+            BlockCnt bl; enterblock(fs,&bl,0);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            break; }
+        case S_IF: {
+            int endjmps[64],ne=0;
+            for(int i=0;i<s->clauses.n;i++){
+                int save=fs->freereg;
+                int r=reserve(fs,1);
+                exprd(fs,s->clauses.cond[i],r);
+                fs->freereg=save;
+                int jf=emit(fs,I_AsBx(OP_JMPIFNOT,r,0),s->line);
+                BlockCnt bl; enterblock(fs,&bl,0);
+                comp_block(fs,s->clauses.blk[i]);
+                leaveblock(fs,s->line);
+                if(i<s->clauses.n-1 || s->elseblk){
+                    if(ne<64) endjmps[ne++]=emit(fs,I_AsBx(OP_JMP,0,0),s->line);
+                }
+                patch(fs,jf,here(fs));
+            }
+            if(s->elseblk){
+                BlockCnt bl; enterblock(fs,&bl,0);
+                comp_block(fs,s->elseblk);
+                leaveblock(fs,s->line);
+            }
+            for(int i=0;i<ne;i++) patch(fs,endjmps[i],here(fs));
+            break; }
+        case S_WHILE: {
+            int start=here(fs);
+            int save=fs->freereg;
+            int r=reserve(fs,1);
+            exprd(fs,s->e1,r);
+            fs->freereg=save;
+            int jf=emit(fs,I_AsBx(OP_JMPIFNOT,r,0),s->line);
+            BlockCnt bl; enterblock(fs,&bl,1);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            patch(fs,emit(fs,I_AsBx(OP_JMP,0,0),s->line),start);
+            patch(fs,jf,here(fs));
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_REPEAT: {
+            int start=here(fs);
+            BlockCnt bl; enterblock(fs,&bl,1);
+            /* condition can see the body's locals -> evaluate before leaveblock */
+            comp_block(fs,s->body);
+            int save=fs->freereg;
+            int r=reserve(fs,1);
+            exprd(fs,s->e1,r);
+            fs->freereg=save;
+            int jf=emit(fs,I_AsBx(OP_JMPIFNOT,r,0),s->line);
+            leaveblock(fs,s->line);
+            patch(fs,jf,start);
+            /* fallthrough when condition is true */
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_NUMFOR: {
+            int base=fs->nlocals;
+            fs->freereg=base;
+            int r0=reserve(fs,1); exprd(fs,s->e1,r0);
+            int r1=reserve(fs,1); exprd(fs,s->e2,r1);
+            int r2=reserve(fs,1);
+            if(s->e3) exprd(fs,s->e3,r2);
+            else emit(fs,I_ABx(OP_LOADK,r2,addk(fs,mknum(1))),s->line);
+            BlockCnt bl; enterblock(fs,&bl,1);
+            newlocal(fs,str_fromc("(for state)"));
+            newlocal(fs,str_fromc("(for limit)"));
+            newlocal(fs,str_fromc("(for step)"));
+            newlocal(fs,s->names[0]);
+            fs->freereg=fs->nlocals;
+            int prep=emit(fs,I_AsBx(OP_FORPREP,base,0),s->line);
+            int body=here(fs);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            int loop=emit(fs,I_AsBx(OP_FORLOOP,base,0),s->line);
+            patch(fs,loop,body);
+            patch(fs,prep,loop);
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_GENFOR: {
+            int base=fs->nlocals;
+            fs->freereg=base;
+            adjust_assign(fs,3,&s->rhs,base);
+            BlockCnt bl; enterblock(fs,&bl,1);
+            newlocal(fs,str_fromc("(for gen)"));
+            newlocal(fs,str_fromc("(for state)"));
+            newlocal(fs,str_fromc("(for ctrl)"));
+            for(int i=0;i<s->nnames;i++) newlocal(fs,s->names[i]);
+            fs->freereg=fs->nlocals;
+            checkreg(fs,fs->nlocals+3);
+            int prep=emit(fs,I_AsBx(OP_JMP,0,0),s->line);
+            int body=here(fs);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            int tfor=emit(fs,I_ABC(OP_TFORLOOP,base,0,s->nnames),s->line);
+            patch(fs,emit(fs,I_AsBx(OP_JMP,0,0),s->line),body);
+            patch(fs,prep,tfor);
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_RETURN: {
+            int base=fs->freereg;
+            int n=s->rhs.n, multi=0;
+            for(int i=0;i<n;i++){
+                Expr *e=s->rhs.e[i];
+                if(i==n-1 && multiret(e)){ fs->freereg=base+i; comp_multi(fs,e,-1); multi=1; }
+                else { fs->freereg=base+i; reserve(fs,1); exprd(fs,e,base+i); }
+            }
+            emit(fs,I_ABC(OP_RETURN,base,multi?0:n+1,0),s->line);
+            fs->freereg=fs->nlocals;
+            break; }
+        case S_BREAK: {
+            BlockCnt *b=fs->bl;
+            while(b && !b->isloop) b=b->prev;
+            if(!b) cerror(fs,s->line,"'break' outside a loop");
+            emit(fs,I_ABC(OP_CLOSE,b->firstlocal,0,0),s->line);
+            if(b->nbreaks<80) b->breaks[b->nbreaks++]=emit(fs,I_AsBx(OP_JMP,0,0),s->line);
+            break; }
+    }
+}
+
+static void comp_block(FuncState *fs,Block *b){
+    for(int i=0;i<b->n;i++) comp_stat(fs,b->s[i]);
+}
+
+static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source){
+    FuncState fs; memset(&fs,0,sizeof fs);
+    fs.prev=parent;
+    fs.p=proto_new();
+    fs.p->source=source;
+    fs.p->name=fb->name?fb->name:str_fromc("?");
+    fs.p->nparams=fb->nparams;
+    fs.p->isvararg=fb->isvararg;
+    fs.source=source;
+    fs.line=fb->line;
+    for(int i=0;i<fb->nparams;i++) newlocal(&fs,fb->params[i]);
+    fs.freereg=fs.nlocals;
+    fs.p->maxstack = fs.nlocals+2;
+    BlockCnt bl; enterblock(&fs,&bl,0);
+    comp_block(&fs,fb->body);
+    leaveblock(&fs,fb->line);
+    emit(&fs,I_ABC(OP_RETURN,0,1,0),fb->line);
+    if(fs.p->maxstack<2) fs.p->maxstack=2;
+    return fs.p;
+}
+
+/* full compile of a source chunk -> closure for the main function */
+static Closure *luc_compile(const char *src,int len,const char *chunkname){
+    Parser ps; memset(&ps,0,sizeof ps);
+    ps.lx.p=src; ps.lx.end=src+len; ps.lx.line=1;
+    ps.lx.source=str_fromc(chunkname);
+    lx_next(&ps.lx);
+    Block *b=parse_block(&ps);
+    if(ps.lx.t!=TK_EOF) perr(&ps,"'<eof>' expected");
+    FuncBody fb; memset(&fb,0,sizeof fb);
+    fb.body=b; fb.isvararg=1; fb.line=0; fb.name=str_fromc("main chunk");
+    fb.params=(Str**)anew(sizeof(Str*)*2);
+    Proto *p=compile_proto(NULL,&fb,ps.lx.source);
+    return closure_new(p);
+}
+
+/* ==========================================================================
+** 11. VM
+** ========================================================================== */
+
+typedef struct YieldPt { jmp_buf jb; struct YieldPt *prev; LucState *co; int cdepth; } YieldPt;
+static YieldPt *g_yp=NULL;
+static int g_cdepth=0;
+
+static void vm_execute(LucState *L,int baselevel);
+static int  vm_call(LucState *L,int func,int nargs,int nres);
+
+static Upval *find_upval(LucState *L,int idx){
+    Upval **pp=&L->openupv;
+    while(*pp && (*pp)->idx > idx) pp=&(*pp)->next;
+    if(*pp && (*pp)->idx==idx) return *pp;
+    Upval *u=(Upval*)newobj(sizeof(Upval),LT_UPVAL);
+    u->L=L; u->idx=idx; u->isclosed=0; u->closed=NIL;
+    u->next=*pp; *pp=u;
+    return u;
+}
+static void close_upvals(LucState *L,int level){
+    while(L->openupv && L->openupv->idx>=level){
+        Upval *u=L->openupv;
+        L->openupv=u->next;
+        u->closed=L->stack[u->idx];
+        u->isclosed=1; u->next=NULL;
+    }
+}
+
+static double arith_num(Value v){
+    if(v.t==LT_NUM) return v.u.n;
+    if(v.t==LT_STR){ double d; if(str2num(AS_STR(v)->s,AS_STR(v)->len,&d)) return d; }
+    luc_error("attempt to perform arithmetic on a %s value",type_name(v));
+    return 0;
+}
+static Value vm_concat(Value a,Value b){
+    if((a.t==LT_STR||a.t==LT_NUM)&&(b.t==LT_STR||b.t==LT_NUM)){
+        Str *x=tostr(a),*y=tostr(b);
+        int n=x->len+y->len;
+        char *buf=(char*)lmalloc((size_t)n+1);
+        memcpy(buf,x->s,(size_t)x->len);
+        memcpy(buf+x->len,y->s,(size_t)y->len);
+        Str *r=str_new(buf,n); free(buf);
+        return mkobj(LT_STR,r);
+    }
+    if(a.t==LT_LIST||b.t==LT_LIST||a.t==LT_TABLE||b.t==LT_TABLE){
+        Str *x=tostr(a),*y=tostr(b);
+        int n=x->len+y->len;
+        char *buf=(char*)lmalloc((size_t)n+1);
+        memcpy(buf,x->s,(size_t)x->len); memcpy(buf+x->len,y->s,(size_t)y->len);
+        Str *r=str_new(buf,n); free(buf);
+        return mkobj(LT_STR,r);
+    }
+    luc_error("attempt to concatenate a %s value",
+              (a.t==LT_STR||a.t==LT_NUM)?type_name(b):type_name(a));
+    return NIL;
+}
+static int vm_lessthan(Value a,Value b,int orequal){
+    if(a.t==LT_NUM&&b.t==LT_NUM) return orequal? a.u.n<=b.u.n : a.u.n<b.u.n;
+    if(a.t==LT_STR&&b.t==LT_STR){
+        Str *x=AS_STR(a),*y=AS_STR(b);
+        int n=x->len<y->len?x->len:y->len;
+        int c=memcmp(x->s,y->s,(size_t)n);
+        if(c==0) c = x->len<y->len?-1:(x->len>y->len?1:0);
+        return orequal? c<=0 : c<0;
+    }
+    luc_error("attempt to compare %s with %s",type_name(a),type_name(b));
+    return 0;
+}
+static Value vm_index(Value t,Value k){
+    switch(t.t){
+        case LT_TABLE: return tab_get(AS_TAB(t),k);
+        case LT_LIST:
+            if(k.t==LT_NUM) return tab_get(AS_TAB(t),k);
+            if(k.t==LT_STR) return tab_get(V.listmeta,k);
+            return tab_get(AS_TAB(t),k);
+        case LT_STR:
+            if(k.t==LT_STR) return tab_get(V.stringlib,k);
+            return NIL;
+        case LT_BUFFER: return k.t==LT_STR? tab_get(V.bufferlib,k):NIL;
+        case LT_FILE:   return k.t==LT_STR? tab_get(V.filelib,k):NIL;
+        default:
+            luc_error("attempt to index a %s value",type_name(t));
+    }
+    return NIL;
+}
+static void vm_setindex(Value t,Value k,Value v){
+    if(t.t==LT_TABLE||t.t==LT_LIST) tab_set(AS_TAB(t),k,v);
+    else luc_error("attempt to index a %s value",type_name(t));
+}
+static int vm_len(Value v){
+    switch(v.t){
+        case LT_STR: return AS_STR(v)->len;
+        case LT_TABLE: return tab_len(AS_TAB(v));
+        case LT_LIST: return AS_TAB(v)->alen;
+        case LT_BUFFER: return AS_BUF(v)->len;
+        default: luc_error("attempt to get length of a %s value",type_name(v));
+    }
+    return 0;
+}
+static int vm_in(Value x,Value c){
+    if(c.t==LT_LIST||c.t==LT_TABLE){
+        Table *t=AS_TAB(c);
+        for(int i=0;i<t->alen;i++) if(val_rawequal(t->arr[i],x)) return 1;
+        for(int i=0;i<t->ecap;i++)
+            if(t->ents[i].k.t!=LT_NIL && val_rawequal(t->ents[i].v,x)) return 1;
+        return 0;
+    }
+    if(c.t==LT_STR){
+        Str *h=AS_STR(c); Str *n=tostr(x);
+        if(n->len==0) return 1;
+        if(n->len>h->len) return 0;
+        for(int i=0;i+n->len<=h->len;i++)
+            if(memcmp(h->s+i,n->s,(size_t)n->len)==0) return 1;
+        return 0;
+    }
+    luc_error("attempt to use 'in' on a %s value",type_name(c));
+    return 0;
+}
+
+static void pushframe(LucState *L,int func,int nargs,int nres){
+    Closure *cl=AS_CL(L->stack[func]);
+    Proto *p=cl->p; int i,bse;
+    if(L->nci>=LUC_MAXCI) luc_error("stack overflow (too much recursion)");
+    if(p->isvararg){
+        int actual=nargs>p->nparams?nargs:p->nparams;
+        ensure_stack(L,func+2+actual+p->maxstack+8);
+        for(i=nargs;i<p->nparams;i++) L->stack[func+1+i]=NIL;
+        bse=func+1+actual;
+        for(i=0;i<p->nparams;i++){ L->stack[bse+i]=L->stack[func+1+i]; L->stack[func+1+i]=NIL; }
+        for(i=p->nparams;i<p->maxstack;i++) L->stack[bse+i]=NIL;
+    } else {
+        int room=nargs>p->maxstack?nargs:p->maxstack;
+        ensure_stack(L,func+2+room+8);
+        bse=func+1;
+        for(i=p->nparams;i<p->maxstack;i++) L->stack[bse+i]=NIL;
+        for(i=nargs;i<p->nparams;i++) L->stack[bse+i]=NIL;
+    }
+    if(L->nci==L->cicap){
+        L->cicap*=2;
+        L->ci=(CallInfo*)lrealloc(L->ci,sizeof(CallInfo)*(size_t)L->cicap);
+    }
+    CallInfo *nci=&L->ci[L->nci++];
+    nci->cl=cl; nci->func=func; nci->base=bse; nci->nresults=nres; nci->savedpc=p->code;
+    L->top=bse+p->maxstack;
+}
+
+/* generic call usable from C; results are left at `func`, count returned */
+static int vm_call(LucState *L,int func,int nargs,int nres){
+    Value f=L->stack[func];
+    if(f.t==LT_CFUNC){
+        CFunc *cf=AS_CF(f);
+        ensure_stack(L,func+nargs+64);
+        int save=L->top;
+        L->top=func+1+nargs;
+        g_cdepth++;
+        int n=cf->fn(L,func+1,nargs,cf);
+        g_cdepth--;
+        for(int i=0;i<n;i++) L->stack[func+i]=L->stack[func+1+i];
+        if(nres>=0){ for(int i=n;i<nres;i++) L->stack[func+i]=NIL; n=nres; }
+        L->top=save>func+n?save:func+n;
+        return n;
+    }
+    if(f.t==LT_FUNC){
+        int level=L->nci;
+        pushframe(L,func,nargs,nres);
+        g_cdepth++;
+        vm_execute(L,level);
+        g_cdepth--;
+        int n=L->top-func;
+        if(nres>=0) n=nres;
+        return n;
+    }
+    luc_error("attempt to call a %s value",type_name(f));
+    return 0;
+}
+
+static void vm_execute(LucState *L,int baselevel){
+    CallInfo *ci; Closure *cl; Proto *pr; uint32_t *pc; Value *base; Value *K;
+    V.cur=L;
+#if defined(__GNUC__) || defined(__clang__)
+#define VM_LABEL(name) vm_op_##name:
+#define VM_NEXT goto vm_dispatch
+    void *dispatch[OP_COUNT] = {
+        &&vm_op_MOVE, &&vm_op_LOADK, &&vm_op_LOADNIL, &&vm_op_LOADBOOL,
+        &&vm_op_GETGLOBAL, &&vm_op_SETGLOBAL, &&vm_op_GETUPVAL, &&vm_op_SETUPVAL,
+        &&vm_op_GETTABLE, &&vm_op_SETTABLE, &&vm_op_NEWTABLE, &&vm_op_SETLIST,
+        &&vm_op_SELF, &&vm_op_ADD, &&vm_op_SUB, &&vm_op_MUL, &&vm_op_DIV,
+        &&vm_op_MOD, &&vm_op_POW, &&vm_op_UNM, &&vm_op_NOT, &&vm_op_LEN,
+        &&vm_op_CONCAT, &&vm_op_EQ, &&vm_op_NE, &&vm_op_LT, &&vm_op_LE,
+        &&vm_op_GT, &&vm_op_GE, &&vm_op_IN, &&vm_op_JMP, &&vm_op_JMPIF,
+        &&vm_op_JMPIFNOT, &&vm_op_CALL, &&vm_op_RETURN, &&vm_op_CLOSURE,
+        &&vm_op_VARARG, &&vm_op_CLOSE, &&vm_op_FORPREP, &&vm_op_FORLOOP,
+        &&vm_op_TFORLOOP
+    };
+#else
+#define VM_LABEL(name) case OP_##name:
+#define VM_NEXT break
+#endif
+ reentry:
+    ci=&L->ci[L->nci-1];
+    cl=ci->cl; pr=cl->p; pc=ci->savedpc; base=L->stack+ci->base; K=pr->k;
+    L->cursource=pr->source;
+    for(;;){
+#if defined(__GNUC__) || defined(__clang__)
+    vm_dispatch:
+        ;
+#endif
+        uint32_t ins=*pc++;
+        int A=GET_A(ins);
+        L->curline=pr->lines[(int)(pc-1-pr->code)];
+#if defined(__GNUC__) || defined(__clang__)
+        int op=GET_OP(ins);
+        if((unsigned)op>=OP_COUNT) luc_error("bad opcode %d",op);
+        goto *dispatch[op];
+#else
+        switch(GET_OP(ins)){
+#endif
+        VM_LABEL(MOVE)     { base[A]=base[GET_B(ins)]; } VM_NEXT;
+        VM_LABEL(LOADK)    { base[A]=K[GET_Bx(ins)]; } VM_NEXT;
+        VM_LABEL(LOADNIL)  { base[A]=NIL; } VM_NEXT;
+        VM_LABEL(LOADBOOL) { base[A]=mkbool(GET_B(ins)); } VM_NEXT;
+        VM_LABEL(GETGLOBAL) { base[A]=tab_get(V.globals,K[GET_Bx(ins)]); } VM_NEXT;
+        VM_LABEL(SETGLOBAL) { tab_set(V.globals,K[GET_Bx(ins)],base[A]); } VM_NEXT;
+        VM_LABEL(GETUPVAL) { base[A]=*UPVAL_PTR(cl->up[GET_B(ins)]); } VM_NEXT;
+        VM_LABEL(SETUPVAL) { *UPVAL_PTR(cl->up[GET_B(ins)])=base[A]; } VM_NEXT;
+        VM_LABEL(GETTABLE) { base[A]=vm_index(base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(SETTABLE) { vm_setindex(base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(NEWTABLE) {
+            if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
+            base[A]=mkobj(GET_B(ins)?LT_LIST:LT_TABLE,tab_new(GET_B(ins)));
+        } VM_NEXT;
+        VM_LABEL(SETLIST) {
+            int b=GET_B(ins), c=GET_C(ins);
+            int n = b? b : (int)(L->top-(ci->base+A+1));
+            Table *t=AS_TAB(base[A]);
+            for(int i=0;i<n;i++) tab_set(t,mknum((double)(c+i)),base[A+1+i]);
+            L->top=ci->base+pr->maxstack;
+        } VM_NEXT;
+        VM_LABEL(SELF) {
+            base[A+1]=base[GET_B(ins)];
+            base[A]=vm_index(base[GET_B(ins)],base[GET_C(ins)]);
+        } VM_NEXT;
+        VM_LABEL(ADD) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            base[A]=x.t==LT_NUM && y.t==LT_NUM
+                ? mknum(x.u.n+y.u.n)
+                : mknum(arith_num(x)+arith_num(y));
+        } VM_NEXT;
+        VM_LABEL(SUB) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            base[A]=x.t==LT_NUM && y.t==LT_NUM
+                ? mknum(x.u.n-y.u.n)
+                : mknum(arith_num(x)-arith_num(y));
+        } VM_NEXT;
+        VM_LABEL(MUL) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            base[A]=x.t==LT_NUM && y.t==LT_NUM
+                ? mknum(x.u.n*y.u.n)
+                : mknum(arith_num(x)*arith_num(y));
+        } VM_NEXT;
+        VM_LABEL(DIV) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            base[A]=x.t==LT_NUM && y.t==LT_NUM
+                ? mknum(x.u.n/y.u.n)
+                : mknum(arith_num(x)/arith_num(y));
+        } VM_NEXT;
+        VM_LABEL(MOD) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            if(x.t==LT_NUM && y.t==LT_NUM)
+                base[A]=mknum(x.u.n-floor(x.u.n/y.u.n)*y.u.n);
+            else {
+                double xn=arith_num(x), yn=arith_num(y);
+                base[A]=mknum(xn-floor(xn/yn)*yn);
+            }
+        } VM_NEXT;
+        VM_LABEL(POW) {
+            base[A]=mknum(pow(arith_num(base[GET_B(ins)]),arith_num(base[GET_C(ins)])));
+        } VM_NEXT;
+        VM_LABEL(UNM) {
+            Value x=base[GET_B(ins)];
+            base[A]=x.t==LT_NUM ? mknum(-x.u.n) : mknum(-arith_num(x));
+        } VM_NEXT;
+        VM_LABEL(NOT) { base[A]=mkbool(!truthy(base[GET_B(ins)])); } VM_NEXT;
+        VM_LABEL(LEN) { base[A]=mknum((double)vm_len(base[GET_B(ins)])); } VM_NEXT;
+        VM_LABEL(CONCAT) { base[A]=vm_concat(base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(EQ) { base[A]=mkbool(val_rawequal(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
+        VM_LABEL(NE) { base[A]=mkbool(!val_rawequal(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
+        VM_LABEL(LT) { base[A]=mkbool(vm_lessthan(base[GET_B(ins)],base[GET_C(ins)],0)); } VM_NEXT;
+        VM_LABEL(LE) { base[A]=mkbool(vm_lessthan(base[GET_B(ins)],base[GET_C(ins)],1)); } VM_NEXT;
+        VM_LABEL(GT) { base[A]=mkbool(vm_lessthan(base[GET_C(ins)],base[GET_B(ins)],0)); } VM_NEXT;
+        VM_LABEL(GE) { base[A]=mkbool(vm_lessthan(base[GET_C(ins)],base[GET_B(ins)],1)); } VM_NEXT;
+        VM_LABEL(IN) { base[A]=mkbool(vm_in(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
+        VM_LABEL(JMP) { pc+=GET_sBx(ins); } VM_NEXT;
+        VM_LABEL(JMPIF) { if(truthy(base[A])) pc+=GET_sBx(ins); } VM_NEXT;
+        VM_LABEL(JMPIFNOT) { if(!truthy(base[A])) pc+=GET_sBx(ins); } VM_NEXT;
+        VM_LABEL(CLOSE) { close_upvals(L,ci->base+A); } VM_NEXT;
+        VM_LABEL(VARARG) {
+            int b=GET_B(ins);
+            int vabase=ci->func+1+pr->nparams;
+            int nva=ci->base-vabase; if(nva<0) nva=0;
+            if(b==0){
+                ensure_stack(L,ci->base+A+nva+2);
+                base=L->stack+ci->base;
+                for(int i=0;i<nva;i++) base[A+i]=L->stack[vabase+i];
+                L->top=ci->base+A+nva;
+            } else {
+                for(int i=0;i<b-1;i++) base[A+i]= i<nva? L->stack[vabase+i] : NIL;
+            }
+        } VM_NEXT;
+        VM_LABEL(CLOSURE) {
+            if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
+            Proto *np=pr->p[GET_Bx(ins)];
+            Closure *nc=closure_new(np);
+            for(int i=0;i<np->nup;i++){
+                if(np->upvals[i].instack) nc->up[i]=find_upval(L,ci->base+np->upvals[i].idx);
+                else nc->up[i]=cl->up[np->upvals[i].idx];
+            }
+            base[A]=mkobj(LT_FUNC,nc);
+        } VM_NEXT;
+        VM_LABEL(CALL) {
+            int b=GET_B(ins), c=GET_C(ins);
+            int func=ci->base+A;
+            int na = b? b-1 : (int)(L->top-(func+1));
+            int nres = c? c-1 : -1;
+            Value f=L->stack[func];
+            if(f.t==LT_CFUNC){
+                CFunc *cf=AS_CF(f);
+                ci->savedpc=pc; L->yield_A=A; L->yield_C=nres;
+                ensure_stack(L,func+na+64);
+                L->top=func+1+na;
+                int n=cf->fn(L,func+1,na,cf);
+                for(int i=0;i<n;i++) L->stack[func+i]=L->stack[func+1+i];
+                if(nres>=0){ for(int i=n;i<nres;i++) L->stack[func+i]=NIL; }
+                base=L->stack+ci->base;
+                L->top = (nres<0)? func+n : ci->base+pr->maxstack;
+            } else if(f.t==LT_FUNC){
+                ci->savedpc=pc;
+                pushframe(L,func,na,nres);
+                goto reentry;
+            } else luc_error("attempt to call a %s value",type_name(f));
+        } VM_NEXT;
+        VM_LABEL(RETURN) {
+            int b=GET_B(ins);
+            int n = b? b-1 : (int)(L->top-(ci->base+A));
+            close_upvals(L,ci->base);
+            int func=ci->func, want=ci->nresults;
+            for(int i=0;i<n;i++) L->stack[func+i]=base[A+i];
+            L->nci--;
+            if(want>=0){ for(int i=n;i<want;i++) L->stack[func+i]=NIL; L->top=func+want; }
+            else L->top=func+n;
+            if(L->nci<=baselevel) return;
+            ci=&L->ci[L->nci-1];
+            cl=ci->cl; pr=cl->p; pc=ci->savedpc; base=L->stack+ci->base; K=pr->k;
+            L->cursource=pr->source;
+            if(want>=0) L->top=ci->base+pr->maxstack;
+        } VM_NEXT;
+        VM_LABEL(FORPREP) {
+            double init=arith_num(base[A]), lim=arith_num(base[A+1]), st=arith_num(base[A+2]);
+            base[A]=mknum(init-st); base[A+1]=mknum(lim); base[A+2]=mknum(st);
+            pc+=GET_sBx(ins);
+        } VM_NEXT;
+        VM_LABEL(FORLOOP) {
+            double idx=base[A].u.n+base[A+2].u.n;
+            double lim=base[A+1].u.n, st=base[A+2].u.n;
+            if(st>0? idx<=lim : idx>=lim){
+                base[A]=mknum(idx); base[A+3]=mknum(idx);
+                pc+=GET_sBx(ins);
+            }
+        } VM_NEXT;
+        VM_LABEL(TFORLOOP) {
+            int nvars=GET_C(ins);
+            int cb=ci->base+A+3;
+            ensure_stack(L,cb+nvars+8);
+            base=L->stack+ci->base;
+            L->stack[cb]=base[A]; L->stack[cb+1]=base[A+1]; L->stack[cb+2]=base[A+2];
+            ci->savedpc=pc;
+            vm_call(L,cb,2,nvars);
+            base=L->stack+ci->base;
+            L->top=ci->base+pr->maxstack;
+            if(L->stack[cb].t!=LT_NIL) base[A+2]=L->stack[cb];
+            else pc++;
+            for(int i=0;i<nvars;i++) base[A+3+i]=L->stack[cb+i];
+        } VM_NEXT;
+#if !defined(__GNUC__) && !defined(__clang__)
+        default: luc_error("bad opcode %d",GET_OP(ins));
+#endif
+    }
+#undef VM_LABEL
+#undef VM_NEXT
+}
+
+/* ==========================================================================
+** 12. coroutines
+** ========================================================================== */
+
+static int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
+    if(co->status==CO_DEAD){ V.errval=mkobj(LT_STR,str_fromc("cannot resume dead coroutine")); return 1; }
+    if(co->status==CO_RUNNING||co->status==CO_NORMAL){
+        V.errval=mkobj(LT_STR,str_fromc("cannot resume non-suspended coroutine")); return 1; }
+    LucState *prev=V.cur;
+    volatile int rc=0;
+    YieldPt yp; yp.prev=g_yp; yp.co=co; yp.cdepth=g_cdepth; g_yp=&yp;
+    ErrJmp ej; ej.prev=V.errjmp; V.errjmp=&ej;
+    co->resumer=prev;
+    V.cur=co; co->status=CO_RUNNING;
+    if(prev) prev->status=CO_NORMAL;
+    if(setjmp(yp.jb)==0){
+        if(setjmp(ej.jb)==0){
+            if(co->status==CO_RUNNING && co->nci==0){
+                /* first start: function already at stack[0] */
+                ensure_stack(co,nargs+8);
+                for(int i=0;i<nargs;i++) co->stack[1+i]=args[i];
+                Value f=co->stack[0];
+                if(f.t==LT_FUNC){
+                    pushframe(co,0,nargs,-1);
+                    vm_execute(co,0);
+                } else {
+                    int n=vm_call(co,0,nargs,-1);
+                    co->top=n;
+                }
+            } else {
+                CallInfo *ci=&co->ci[co->nci-1];
+                int dst=ci->base+co->yield_A;
+                ensure_stack(co,dst+nargs+8);
+                int want=co->yield_C;
+                if(want<0){ for(int i=0;i<nargs;i++) co->stack[dst+i]=args[i]; co->top=dst+nargs; }
+                else {
+                    for(int i=0;i<want;i++) co->stack[dst+i]= i<nargs? args[i] : NIL;
+                    co->top=ci->base+ci->cl->p->maxstack;
+                }
+                vm_execute(co,0);
+            }
+            co->status=CO_DEAD;
+            int n=co->top; if(n>32) n=32;
+            for(int i=0;i<n;i++) res[i]=co->stack[i];
+            *nres=n; rc=0;
+        } else { co->status=CO_DEAD; rc=1; }
+    } else {
+        co->status=CO_SUSPENDED;
+        int n=co->nyield; if(n>32) n=32;
+        for(int i=0;i<n;i++) res[i]=co->stack[co->yieldbase+i];
+        *nres=n; rc=0;
+    }
+    g_yp=yp.prev; V.errjmp=ej.prev;
+    V.cur=prev; if(prev) prev->status=CO_RUNNING;
+    return rc;
+}
+
+/* ==========================================================================
+** 13. task scheduler
+** ========================================================================== */
+
+static void sched_add(LucState *co,double wake){
+    if(V.nsched==V.schedcap){
+        V.schedcap=V.schedcap?V.schedcap*2:8;
+        V.sched=(SchedEntry*)lrealloc(V.sched,sizeof(SchedEntry)*(size_t)V.schedcap);
+    }
+    V.sched[V.nsched].co=co; V.sched[V.nsched].wake=wake; V.nsched++;
+    co->scheduled=1;
+}
+static void sched_remove(int i){
+    V.sched[i].co->scheduled=0;
+    V.sched[i]=V.sched[--V.nsched];
+}
+static void sched_run(void){
+    Value res[32]; int nres;
+    while(V.nsched>0){
+        int best=0;
+        for(int i=1;i<V.nsched;i++) if(V.sched[i].wake<V.sched[best].wake) best=i;
+        LucState *co=V.sched[best].co;
+        double wake=V.sched[best].wake;
+        sched_remove(best);
+        if(co->status==CO_DEAD) continue;
+        double now=luc_now();
+        if(wake>now) luc_sleep(wake-now);
+        double elapsed=luc_now()-(wake-co->waketime);
+        Value arg=mknum(elapsed>0?elapsed:0);
+        if(co_resume(co,&arg,1,res,&nres)){
+            Str *s=tostr(V.errval);
+            fprintf(stderr,"luc: error in task: %s\n",s->s);
+        }
+    }
+}
+
+/* ==========================================================================
+** 14. standard library
+** ========================================================================== */
+
+#define LFN(name) static int name(LucState *L,int base,int nargs,CFunc *self)
+#define UNUSED_SELF (void)self
+
+static Value argv(LucState *L,int base,int nargs,int i){
+    return i<nargs? L->stack[base+i] : NIL;
+}
+#define AR(i) argv(L,base,nargs,(i))
+#define RET(i,v) do{ ensure_stack(L,base+(i)+2); L->stack[base+(i)]=(v); }while(0)
+
+static double checknum(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t==LT_NUM) return v.u.n;
+    if(v.t==LT_STR){ double d; if(str2num(AS_STR(v)->s,AS_STR(v)->len,&d)) return d; }
+    luc_error("bad argument #%d to '%s' (number expected, got %s)",i+1,fn,type_name(v));
+    return 0;
+}
+static int checkint(LucState *L,int base,int nargs,int i,const char *fn){
+    return (int)checknum(L,base,nargs,i,fn);
+}
+static Str *checkstr(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t==LT_STR) return AS_STR(v);
+    if(v.t==LT_NUM) return tostr(v);
+    luc_error("bad argument #%d to '%s' (string expected, got %s)",i+1,fn,type_name(v));
+    return NULL;
+}
+static Table *checktab(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t==LT_TABLE||v.t==LT_LIST) return AS_TAB(v);
+    luc_error("bad argument #%d to '%s' (table expected, got %s)",i+1,fn,type_name(v));
+    return NULL;
+}
+static Buffer *checkbuf(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t==LT_BUFFER) return AS_BUF(v);
+    luc_error("bad argument #%d to '%s' (buffer expected, got %s)",i+1,fn,type_name(v));
+    return NULL;
+}
+static uint32_t checku32(LucState *L,int base,int nargs,int i,const char *fn){
+    double d=checknum(L,base,nargs,i,fn);
+    return (uint32_t)(int64_t)d;
+}
+static Value strv(const char *s,int n){ return mkobj(LT_STR,str_new(s,n)); }
+static Value cstrv(const char *s){ return mkobj(LT_STR,str_fromc(s)); }
+
+/* ---- base ------------------------------------------------------------- */
+LFN(f_print){ UNUSED_SELF;
+    for(int i=0;i<nargs;i++){
+        Str *s=tostr(L->stack[base+i]);
+        if(i) fputc('\t',stdout);
+        fwrite(s->s,1,(size_t)s->len,stdout);
+    }
+    fputc('\n',stdout);
+    return 0;
+}
+LFN(f_tostring){ UNUSED_SELF; RET(0,mkobj(LT_STR,tostr(AR(0)))); return 1; }
+LFN(f_tonumber){ UNUSED_SELF;
+    Value v=AR(0);
+    if(nargs>=2){
+        int b=checkint(L,base,nargs,1,"tonumber");
+        Str *s=checkstr(L,base,nargs,0,"tonumber");
+        char *end; long long r=strtoll(s->s,&end,b);
+        if(end==s->s){ RET(0,NIL); } else RET(0,mknum((double)r));
+        return 1;
+    }
+    if(v.t==LT_NUM){ RET(0,v); return 1; }
+    if(v.t==LT_STR){ double d;
+        if(str2num(AS_STR(v)->s,AS_STR(v)->len,&d)) RET(0,mknum(d)); else RET(0,NIL);
+        return 1; }
+    RET(0,NIL); return 1;
+}
+LFN(f_type){ UNUSED_SELF; RET(0,cstrv(type_name(AR(0)))); return 1; }
+LFN(f_rawlen){ UNUSED_SELF; RET(0,mknum((double)vm_len(AR(0)))); return 1; }
+LFN(f_error){ UNUSED_SELF;
+    Value v=AR(0);
+    if(v.t==LT_STR && (nargs<2 || checknum(L,base,nargs,1,"error")!=0)){
+        char b[1200];
+        snprintf(b,sizeof b,"%s:%d: %s",
+                 L->cursource?L->cursource->s:"?",L->curline,AS_STR(v)->s);
+        luc_throw(cstrv(b));
+    }
+    luc_throw(v);
+    return 0;
+}
+LFN(f_assert){ UNUSED_SELF;
+    if(!truthy(AR(0))){
+        Value m=AR(1);
+        if(m.t==LT_NIL) luc_error("assertion failed!");
+        luc_throw(m);
+    }
+    return nargs;
+}
+LFN(f_pcall){ UNUSED_SELF;
+    if(nargs<1) luc_error("bad argument #1 to 'pcall' (value expected)");
+    ErrJmp ej; ej.prev=V.errjmp; V.errjmp=&ej;
+    volatile int savenci=L->nci, savetop=L->top;
+    if(setjmp(ej.jb)==0){
+        int n=vm_call(L,base,nargs-1,-1);
+        V.errjmp=ej.prev;
+        for(int i=n;i>0;i--) L->stack[base+i]=L->stack[base+i-1];
+        L->stack[base]=mkbool(1);
+        return n+1;
+    }
+    V.errjmp=ej.prev;
+    L->nci=savenci; L->top=savetop;
+    close_upvals(L,base);
+    L->stack[base]=mkbool(0); L->stack[base+1]=V.errval;
+    return 2;
+}
+LFN(f_select){ UNUSED_SELF;
+    Value v=AR(0);
+    if(v.t==LT_STR && AS_STR(v)->len==1 && AS_STR(v)->s[0]=='#'){
+        RET(0,mknum((double)(nargs-1))); return 1;
+    }
+    int n=(int)checknum(L,base,nargs,0,"select");
+    if(n<0) n=nargs+n;
+    if(n<1) luc_error("bad argument #1 to 'select' (index out of range)");
+    int cnt=nargs-n;
+    if(cnt<0) cnt=0;
+    for(int i=0;i<cnt;i++) L->stack[base+i]=L->stack[base+n+i];
+    return cnt;
+}
+LFN(f_next){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"next");
+    Value k,v2;
+    if(tab_next(t,AR(1),&k,&v2)){ RET(0,k); RET(1,v2); return 2; }
+    RET(0,NIL); return 1;
+}
+LFN(f_inext){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"ipairs");
+    int i=(int)checknum(L,base,nargs,1,"ipairs")+1;
+    Value v=tab_get(t,mknum((double)i));
+    if(v.t==LT_NIL){ RET(0,NIL); return 1; }
+    RET(0,mknum((double)i)); RET(1,v);
+    return 2;
+}
+LFN(f_ipairs){ UNUSED_SELF;
+    checktab(L,base,nargs,0,"ipairs");
+    Value t=AR(0);
+    RET(0,mkobj(LT_CFUNC,cfunc_new(f_inext,"inext",0)));
+    RET(1,t); RET(2,mknum(0));
+    return 3;
+}
+LFN(f_pairs){ UNUSED_SELF;
+    checktab(L,base,nargs,0,"pairs");
+    Value t=AR(0);
+    RET(0,mkobj(LT_CFUNC,cfunc_new(f_next,"next",0)));
+    RET(1,t); RET(2,NIL);
+    return 3;
+}
+LFN(f_unpack){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"unpack");
+    int i = nargs>=2? checkint(L,base,nargs,1,"unpack") : 1;
+    int j = nargs>=3? checkint(L,base,nargs,2,"unpack") : tab_len(t);
+    if(t->o.type==LT_LIST && nargs<3) j=t->alen;
+    int n=j-i+1; if(n<0) n=0;
+    ensure_stack(L,base+n+8);
+    for(int x=0;x<n;x++) L->stack[base+x]=tab_get(t,mknum((double)(i+x)));
+    return n;
+}
+LFN(f_rawget){ UNUSED_SELF; RET(0,tab_get(checktab(L,base,nargs,0,"rawget"),AR(1))); return 1; }
+LFN(f_rawset){ UNUSED_SELF; tab_set(checktab(L,base,nargs,0,"rawset"),AR(1),AR(2)); RET(0,AR(0)); return 1; }
+LFN(f_rawequal){ UNUSED_SELF; RET(0,mkbool(val_rawequal(AR(0),AR(1)))); return 1; }
+LFN(f_collectgarbage){ UNUSED_SELF; gc_collect(); RET(0,mknum((double)V.nalloc)); return 1; }
+
+/* ---- string ----------------------------------------------------------- */
+static int posrelat(int pos,int len){
+    if(pos>=0) return pos;
+    if(-pos>len) return 0;
+    return len+pos+1;
+}
+LFN(f_str_len){ UNUSED_SELF; RET(0,mknum((double)checkstr(L,base,nargs,0,"len")->len)); return 1; }
+LFN(f_str_sub){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"sub");
+    int i=posrelat(nargs>=2?checkint(L,base,nargs,1,"sub"):1,s->len);
+    int j=posrelat(nargs>=3?checkint(L,base,nargs,2,"sub"):-1,s->len);
+    if(i<1) i=1; if(j>s->len) j=s->len;
+    if(i>j){ RET(0,cstrv("")); return 1; }
+    RET(0,strv(s->s+i-1,j-i+1)); return 1;
+}
+LFN(f_str_upper){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"upper");
+    char *b=(char*)lmalloc((size_t)s->len+1);
+    for(int i=0;i<s->len;i++) b[i]=(char)toupper((unsigned char)s->s[i]);
+    RET(0,strv(b,s->len)); free(b); return 1;
+}
+LFN(f_str_lower){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"lower");
+    char *b=(char*)lmalloc((size_t)s->len+1);
+    for(int i=0;i<s->len;i++) b[i]=(char)tolower((unsigned char)s->s[i]);
+    RET(0,strv(b,s->len)); free(b); return 1;
+}
+LFN(f_str_rep){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"rep");
+    int n=checkint(L,base,nargs,1,"rep");
+    Str *sep = nargs>=3? checkstr(L,base,nargs,2,"rep") : NULL;
+    if(n<=0){ RET(0,cstrv("")); return 1; }
+    int sl=sep?sep->len:0;
+    size_t total=(size_t)s->len*(size_t)n+(size_t)sl*(size_t)(n-1);
+    char *b=(char*)lmalloc(total+1); size_t o=0;
+    for(int i=0;i<n;i++){
+        if(i&&sl){ memcpy(b+o,sep->s,(size_t)sl); o+=(size_t)sl; }
+        memcpy(b+o,s->s,(size_t)s->len); o+=(size_t)s->len;
+    }
+    RET(0,strv(b,(int)o)); free(b); return 1;
+}
+LFN(f_str_reverse){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"reverse");
+    char *b=(char*)lmalloc((size_t)s->len+1);
+    for(int i=0;i<s->len;i++) b[i]=s->s[s->len-1-i];
+    RET(0,strv(b,s->len)); free(b); return 1;
+}
+LFN(f_str_byte){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"byte");
+    int i=posrelat(nargs>=2?checkint(L,base,nargs,1,"byte"):1,s->len);
+    int j=posrelat(nargs>=3?checkint(L,base,nargs,2,"byte"):i,s->len);
+    if(i<1)i=1; if(j>s->len)j=s->len;
+    int n=0;
+    for(int x=i;x<=j;x++) RET(n++,mknum((double)(unsigned char)s->s[x-1]));
+    return n;
+}
+LFN(f_str_char){ UNUSED_SELF;
+    char *b=(char*)lmalloc((size_t)nargs+1);
+    for(int i=0;i<nargs;i++) b[i]=(char)(int)checknum(L,base,nargs,i,"char");
+    RET(0,strv(b,nargs)); free(b); return 1;
+}
+LFN(f_str_format){ UNUSED_SELF;
+    Str *f=checkstr(L,base,nargs,0,"format");
+    size_t cap=256,len=0; char *out=(char*)lmalloc(cap);
+    #define OUTC(c) do{ if(len+2>cap){cap*=2;out=(char*)lrealloc(out,cap);} out[len++]=(char)(c);}while(0)
+    #define OUTS(p,n) do{ size_t _n=(size_t)(n); if(len+_n+1>cap){while(len+_n+1>cap)cap*=2;out=(char*)lrealloc(out,cap);} memcpy(out+len,(p),_n); len+=_n;}while(0)
+    int argi=1;
+    for(int i=0;i<f->len;i++){
+        char c=f->s[i];
+        if(c!='%'){ OUTC(c); continue; }
+        i++;
+        if(i>=f->len) break;
+        if(f->s[i]=='%'){ OUTC('%'); continue; }
+        char spec[32]; int sn=0; spec[sn++]='%';
+        while(i<f->len && strchr("-+ #0",f->s[i]) && sn<20) spec[sn++]=f->s[i++];
+        while(i<f->len && isdigit((unsigned char)f->s[i]) && sn<24) spec[sn++]=f->s[i++];
+        if(i<f->len && f->s[i]=='.'){ spec[sn++]=f->s[i++];
+            while(i<f->len && isdigit((unsigned char)f->s[i]) && sn<28) spec[sn++]=f->s[i++]; }
+        char conv= i<f->len? f->s[i] : 's';
+        char tmp[512];
+        switch(conv){
+            case 'd': case 'i': {
+                spec[sn++]='l'; spec[sn++]='l'; spec[sn++]='d'; spec[sn]=0;
+                snprintf(tmp,sizeof tmp,spec,(long long)checknum(L,base,nargs,argi++,"format"));
+                OUTS(tmp,strlen(tmp)); break; }
+            case 'u': case 'x': case 'X': case 'o': case 'c': {
+                spec[sn++]='l'; spec[sn++]='l'; spec[sn++]= conv=='c'?'d':conv;
+                if(conv=='c'){ sn-=3; spec[sn++]='c'; }
+                spec[sn]=0;
+                long long iv=(long long)checknum(L,base,nargs,argi++,"format");
+                if(conv=='c') snprintf(tmp,sizeof tmp,spec,(int)iv);
+                else snprintf(tmp,sizeof tmp,spec,iv);
+                OUTS(tmp,strlen(tmp)); break; }
+            case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': {
+                spec[sn++]=conv; spec[sn]=0;
+                snprintf(tmp,sizeof tmp,spec,checknum(L,base,nargs,argi++,"format"));
+                OUTS(tmp,strlen(tmp)); break; }
+            case 'q': {
+                Str *s=tostr(AR(argi++));
+                OUTC('"');
+                for(int x=0;x<s->len;x++){
+                    char ch=s->s[x];
+                    if(ch=='"'||ch=='\\'){ OUTC('\\'); OUTC(ch); }
+                    else if(ch=='\n'){ OUTC('\\'); OUTC('n'); }
+                    else if(ch=='\r'){ OUTC('\\'); OUTC('r'); }
+                    else if(ch==0){ OUTC('\\'); OUTC('0'); }
+                    else OUTC(ch);
+                }
+                OUTC('"'); break; }
+            case 's': default: {
+                Str *s=tostr(AR(argi++));
+                spec[sn++]='s'; spec[sn]=0;
+                if(sn>2 && s->len<400){ snprintf(tmp,sizeof tmp,spec,s->s); OUTS(tmp,strlen(tmp)); }
+                else OUTS(s->s,s->len);
+                break; }
+        }
+    }
+    RET(0,strv(out,(int)len)); free(out);
+    #undef OUTC
+    #undef OUTS
+    return 1;
+}
+/* --- extensions --- */
+LFN(f_str_split){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"split");
+    Str *sep = nargs>=2? checkstr(L,base,nargs,1,"split") : NULL;
+    Table *l=tab_new(1);
+    Value lv=mkobj(LT_LIST,l);
+    RET(0,lv);                                   /* root it immediately */
+    if(!sep || sep->len==0){
+        for(int i=0;i<s->len;i++) list_push(l,strv(s->s+i,1));
+        return 1;
+    }
+    int start=0;
+    for(int i=0;i+sep->len<=s->len;){
+        if(memcmp(s->s+i,sep->s,(size_t)sep->len)==0){
+            list_push(l,strv(s->s+start,i-start));
+            i+=sep->len; start=i;
+        } else i++;
+    }
+    list_push(l,strv(s->s+start,s->len-start));
+    return 1;
+}
+LFN(f_str_trim){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"trim");
+    int i=0,j=s->len-1;
+    while(i<=j && isspace((unsigned char)s->s[i])) i++;
+    while(j>=i && isspace((unsigned char)s->s[j])) j--;
+    RET(0,strv(s->s+i,j-i+1)); return 1;
+}
+LFN(f_str_startswith){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"startswith"), *p=checkstr(L,base,nargs,1,"startswith");
+    RET(0,mkbool(p->len<=s->len && memcmp(s->s,p->s,(size_t)p->len)==0)); return 1;
+}
+LFN(f_str_endswith){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"endswith"), *p=checkstr(L,base,nargs,1,"endswith");
+    RET(0,mkbool(p->len<=s->len && memcmp(s->s+s->len-p->len,p->s,(size_t)p->len)==0)); return 1;
+}
+LFN(f_str_contains){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"contains");
+    RET(0,mkbool(vm_in(AR(1),mkobj(LT_STR,s)))); return 1;
+}
+static const char *HEXD="0123456789abcdef";
+LFN(f_str_tohex){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"tohex");
+    char *b=(char*)lmalloc((size_t)s->len*2+1);
+    for(int i=0;i<s->len;i++){
+        unsigned char c=(unsigned char)s->s[i];
+        b[i*2]=HEXD[c>>4]; b[i*2+1]=HEXD[c&15];
+    }
+    RET(0,strv(b,s->len*2)); free(b); return 1;
+}
+static int hexval(int c){
+    if(c>='0'&&c<='9') return c-'0';
+    if(c>='a'&&c<='f') return c-'a'+10;
+    if(c>='A'&&c<='F') return c-'A'+10;
+    return -1;
+}
+LFN(f_str_fromhex){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"fromhex");
+    if(s->len%2) luc_error("string.fromhex: hex string must have even length");
+    char *b=(char*)lmalloc((size_t)s->len/2+1);
+    for(int i=0;i<s->len;i+=2){
+        int hi=hexval((unsigned char)s->s[i]), lo=hexval((unsigned char)s->s[i+1]);
+        if(hi<0||lo<0){ free(b); luc_error("string.fromhex: invalid hex digit"); }
+        b[i/2]=(char)((hi<<4)|lo);
+    }
+    RET(0,strv(b,s->len/2)); free(b); return 1;
+}
+
+/* ---- Lua-style pattern matching -------------------------------------- */
+#define L_ESC '%'
+#define MAXCAPT 32
+typedef struct MatchState {
+    const char *src_init,*src_end,*p_end;
+    int level, depth;
+    struct { const char *init; ptrdiff_t len; } capture[MAXCAPT];
+} MatchState;
+#define CAP_UNF (-1)
+#define CAP_POS (-2)
+static const char *do_match(MatchState *ms,const char *s,const char *p);
+
+static const char *classend(MatchState *ms,const char *p){
+    switch(*p++){
+        case L_ESC:
+            if(p==ms->p_end) luc_error("malformed pattern (ends with '%%')");
+            return p+1;
+        case '[':
+            if(p<ms->p_end && *p=='^') p++;
+            do{
+                if(p==ms->p_end) luc_error("malformed pattern (missing ']')");
+                if(*(p++)==L_ESC && p<ms->p_end) p++;
+            }while(p>=ms->p_end || *p!=']');
+            return p+1;
+        default: return p;
+    }
+}
+static int match_class(int c,int cl){
+    int res;
+    switch(tolower(cl)){
+        case 'a': res=isalpha(c); break;  case 'c': res=iscntrl(c); break;
+        case 'd': res=isdigit(c); break;  case 'l': res=islower(c); break;
+        case 'p': res=ispunct(c); break;  case 's': res=isspace(c); break;
+        case 'u': res=isupper(c); break;  case 'w': res=isalnum(c); break;
+        case 'x': res=isxdigit(c); break;
+        default: return cl==c;
+    }
+    if(isupper(cl)) res=!res;
+    return res;
+}
+static int matchbracket(int c,const char *p,const char *ec){
+    int sig=1;
+    if(*(p+1)=='^'){ sig=0; p++; }
+    while(++p<ec){
+        if(*p==L_ESC){ p++; if(match_class(c,(unsigned char)*p)) return sig; }
+        else if(*(p+1)=='-' && p+2<ec){
+            p+=2;
+            if((unsigned char)*(p-2)<=c && c<=(unsigned char)*p) return sig;
+        } else if((unsigned char)*p==c) return sig;
+    }
+    return !sig;
+}
+static int singlematch(MatchState *ms,const char *s,const char *p,const char *ep){
+    if(s>=ms->src_end) return 0;
+    int c=(unsigned char)*s;
+    switch(*p){
+        case '.': return 1;
+        case L_ESC: return match_class(c,(unsigned char)*(p+1));
+        case '[': return matchbracket(c,p,ep-1);
+        default: return (unsigned char)*p==c;
+    }
+}
+static const char *max_expand(MatchState *ms,const char *s,const char *p,const char *ep){
+    ptrdiff_t i=0;
+    while(singlematch(ms,s+i,p,ep)) i++;
+    while(i>=0){
+        const char *r=do_match(ms,s+i,ep+1);
+        if(r) return r;
+        i--;
+    }
+    return NULL;
+}
+static const char *min_expand(MatchState *ms,const char *s,const char *p,const char *ep){
+    for(;;){
+        const char *r=do_match(ms,s,ep+1);
+        if(r) return r;
+        if(singlematch(ms,s,p,ep)) s++;
+        else return NULL;
+    }
+}
+static const char *start_capture(MatchState *ms,const char *s,const char *p,int what){
+    int l=ms->level;
+    if(l>=MAXCAPT) luc_error("too many captures");
+    ms->capture[l].len=what; ms->capture[l].init=s;
+    ms->level=l+1;
+    const char *r=do_match(ms,s,p);
+    if(!r) ms->level--;
+    return r;
+}
+static const char *end_capture(MatchState *ms,const char *s,const char *p){
+    int l=-1;
+    for(int i=ms->level-1;i>=0;i--) if(ms->capture[i].len==CAP_UNF){ l=i; break; }
+    if(l<0) luc_error("invalid pattern capture");
+    ms->capture[l].len=s-ms->capture[l].init;
+    const char *r=do_match(ms,s,p);
+    if(!r) ms->capture[l].len=CAP_UNF;
+    return r;
+}
+static const char *match_capture(MatchState *ms,const char *s,int ll){
+    ll-='1';
+    if(ll<0||ll>=ms->level||ms->capture[ll].len==CAP_UNF) luc_error("invalid capture index");
+    ptrdiff_t len=ms->capture[ll].len;
+    if((ms->src_end-s)>=len && memcmp(ms->capture[ll].init,s,(size_t)len)==0) return s+len;
+    return NULL;
+}
+static const char *do_match(MatchState *ms,const char *s,const char *p){
+    if(ms->depth++ > 200){ ms->depth--; luc_error("pattern too complex"); }
+    while(p!=ms->p_end){
+        switch(*p){
+            case '(':
+                ms->depth--;
+                return (*(p+1)==')')? start_capture(ms,s,p+2,CAP_POS)
+                                    : start_capture(ms,s,p+1,CAP_UNF);
+            case ')': ms->depth--; return end_capture(ms,s,p+1);
+            case '$':
+                if(p+1==ms->p_end){ ms->depth--; return (s==ms->src_end)?s:NULL; }
+                goto dflt;
+            case L_ESC:
+                if(isdigit((unsigned char)*(p+1))){
+                    s=match_capture(ms,s,(unsigned char)*(p+1));
+                    if(!s){ ms->depth--; return NULL; }
+                    p+=2; continue;
+                }
+                goto dflt;
+            default: dflt: {
+                const char *ep=classend(ms,p);
+                if(!singlematch(ms,s,p,ep)){
+                    if(ep<ms->p_end && (*ep=='*'||*ep=='?'||*ep=='-')){ p=ep+1; continue; }
+                    ms->depth--; return NULL;
+                }
+                if(ep<ms->p_end){
+                    switch(*ep){
+                        case '?': {
+                            const char *r=do_match(ms,s+1,ep+1);
+                            if(r){ ms->depth--; return r; }
+                            p=ep+1; continue; }
+                        case '+': ms->depth--; return max_expand(ms,s+1,p,ep);
+                        case '*': ms->depth--; return max_expand(ms,s,p,ep);
+                        case '-': ms->depth--; return min_expand(ms,s,p,ep);
+                    }
+                }
+                s++; p=ep; continue; }
+        }
+    }
+    ms->depth--;
+    return s;
+}
+static int push_captures(LucState *L,int base,MatchState *ms,const char *s,const char *e,int slot){
+    int n = (ms->level==0 && s)? 1 : ms->level;
+    for(int i=0;i<n;i++){
+        if(ms->level==0) RET(slot+i,strv(s,(int)(e-s)));
+        else if(ms->capture[i].len==CAP_POS)
+            RET(slot+i,mknum((double)(ms->capture[i].init-ms->src_init+1)));
+        else RET(slot+i,strv(ms->capture[i].init,(int)ms->capture[i].len));
+    }
+    return n;
+}
+static int str_find_aux(LucState *L,int base,int nargs,int find){
+    Str *s=checkstr(L,base,nargs,0,find?"find":"match");
+    Str *p=checkstr(L,base,nargs,1,find?"find":"match");
+    int init=posrelat(nargs>=3?checkint(L,base,nargs,2,"find"):1,s->len);
+    if(init<1) init=1;
+    if(init>s->len+1){ RET(0,NIL); return 1; }
+    int plain = nargs>=4 && truthy(AR(3));
+    if(find && (plain || !strpbrk(p->s,"^$*+?.([%-"))){
+        for(const char *s1=s->s+init-1; s1+p->len<=s->s+s->len; s1++){
+            if(memcmp(s1,p->s,(size_t)p->len)==0){
+                RET(0,mknum((double)(s1-s->s+1)));
+                RET(1,mknum((double)(s1-s->s+p->len)));
+                return 2;
+            }
+        }
+        RET(0,NIL); return 1;
+    }
+    MatchState ms; ms.src_init=s->s; ms.src_end=s->s+s->len;
+    ms.p_end=p->s+p->len; ms.level=0; ms.depth=0;
+    const char *pp=p->s;
+    int anchor=(*pp=='^'); if(anchor) pp++;
+    const char *s1=s->s+init-1;
+    do{
+        ms.level=0; ms.depth=0;
+        const char *res=do_match(&ms,s1,pp);
+        if(res){
+            if(find){
+                RET(0,mknum((double)(s1-s->s+1)));
+                RET(1,mknum((double)(res-s->s)));
+                return 2+push_captures(L,base,&ms,NULL,NULL,2);
+            }
+            return push_captures(L,base,&ms,s1,res,0);
+        }
+    }while(s1++ < ms.src_end && !anchor);
+    RET(0,NIL); return 1;
+}
+LFN(f_str_find){ UNUSED_SELF; return str_find_aux(L,base,nargs,1); }
+LFN(f_str_match){ UNUSED_SELF; return str_find_aux(L,base,nargs,0); }
+LFN(f_gmatch_iter){
+    Str *s=AS_STR(self->up[0]), *p=AS_STR(self->up[1]);
+    int pos=(int)self->up[2].u.n;
+    MatchState ms; ms.src_init=s->s; ms.src_end=s->s+s->len;
+    ms.p_end=p->s+p->len;
+    for(const char *s1=s->s+pos; s1<=ms.src_end; s1++){
+        ms.level=0; ms.depth=0;
+        const char *e=do_match(&ms,s1,p->s);
+        if(e){
+            int newpos=(int)(e-s->s);
+            if(e==s1) newpos++;
+            self->up[2]=mknum((double)newpos);
+            return push_captures(L,base,&ms,s1,e,0);
+        }
+    }
+    RET(0,NIL); return 1;
+}
+LFN(f_str_gmatch){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"gmatch"), *p=checkstr(L,base,nargs,1,"gmatch");
+    CFunc *c=cfunc_new(f_gmatch_iter,"gmatch",3);
+    c->up[0]=mkobj(LT_STR,s); c->up[1]=mkobj(LT_STR,p); c->up[2]=mknum(0);
+    RET(0,mkobj(LT_CFUNC,c));
+    return 1;
+}
+LFN(f_str_gsub){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"gsub"), *p=checkstr(L,base,nargs,1,"gsub");
+    Value repl=AR(2);
+    int maxn = nargs>=4? checkint(L,base,nargs,3,"gsub") : -1;
+    size_t cap=(size_t)s->len+32,len=0; char *out=(char*)lmalloc(cap);
+    #define OUTS(ptr,n) do{ size_t _n=(size_t)(n); if(len+_n+1>cap){while(len+_n+1>cap)cap*=2;out=(char*)lrealloc(out,cap);} memcpy(out+len,(ptr),_n); len+=_n;}while(0)
+    MatchState ms; ms.src_init=s->s; ms.src_end=s->s+s->len; ms.p_end=p->s+p->len;
+    const char *pp=p->s;
+    int anchor=(*pp=='^'); if(anchor) pp++;
+    const char *s1=s->s; int count=0;
+    int scratch=base+nargs+2;
+    while(maxn<0 || count<maxn){
+        ms.level=0; ms.depth=0;
+        const char *e=do_match(&ms,s1,pp);
+        if(e){
+            count++;
+            /* build replacement */
+            if(repl.t==LT_STR||repl.t==LT_NUM){
+                Str *r=tostr(repl);
+                for(int i=0;i<r->len;i++){
+                    if(r->s[i]==L_ESC && i+1<r->len){
+                        i++;
+                        if(r->s[i]=='0'){ OUTS(s1,e-s1); }
+                        else if(isdigit((unsigned char)r->s[i])){
+                            int idx=r->s[i]-'1';
+                            if(ms.level==0 && idx==0){ OUTS(s1,e-s1); }
+                            else if(idx>=0&&idx<ms.level){
+                                if(ms.capture[idx].len==CAP_POS){
+                                    char nb[32];
+                                    snprintf(nb,sizeof nb,"%d",(int)(ms.capture[idx].init-s->s+1));
+                                    OUTS(nb,strlen(nb));
+                                } else OUTS(ms.capture[idx].init,ms.capture[idx].len);
+                            }
+                        } else { OUTS(&r->s[i],1); }
+                    } else OUTS(&r->s[i],1);
+                }
+            } else if(repl.t==LT_TABLE||repl.t==LT_LIST){
+                ensure_stack(L,scratch+8);
+                int n=push_captures(L,scratch,&ms,s1,e,0);
+                Value v=tab_get(AS_TAB(repl),L->stack[scratch]);
+                (void)n;
+                if(truthy(v)){ Str *r=tostr(v); OUTS(r->s,r->len); }
+                else OUTS(s1,e-s1);
+            } else if(repl.t==LT_FUNC||repl.t==LT_CFUNC){
+                ensure_stack(L,scratch+MAXCAPT+8);
+                L->stack[scratch]=repl;
+                int n=push_captures(L,scratch+1,&ms,s1,e,0);
+                int nr=vm_call(L,scratch,n,1);
+                (void)nr;
+                Value v=L->stack[scratch];
+                if(truthy(v)){ Str *r=tostr(v); OUTS(r->s,r->len); }
+                else OUTS(s1,e-s1);
+            } else luc_error("bad argument #3 to 'gsub' (string/table/function expected)");
+        }
+        if(e && e>s1) s1=e;
+        else if(s1<ms.src_end){ OUTS(s1,1); s1++; }
+        else break;
+        if(anchor) break;
+    }
+    if(s1<=ms.src_end) OUTS(s1,ms.src_end-s1);
+    RET(0,strv(out,(int)len));
+    RET(1,mknum((double)count));
+    free(out);
+    #undef OUTS
+    return 2;
+}
+
+/* ---- list methods ---------------------------------------------------- */
+LFN(f_list_append){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"append");
+    for(int i=1;i<nargs;i++) list_push(t,L->stack[base+i]);
+    RET(0,AR(0)); return 1;
+}
+LFN(f_list_pop){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"pop");
+    int pos = nargs>=2? checkint(L,base,nargs,1,"pop") : t->alen;
+    RET(0,list_removeat(t,pos)); return 1;
+}
+LFN(f_list_insert){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"insert");
+    if(nargs>=3) list_insert(t,checkint(L,base,nargs,1,"insert"),AR(2));
+    else list_push(t,AR(1));
+    return 0;
+}
+LFN(f_list_remove){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"remove");
+    int pos = nargs>=2? checkint(L,base,nargs,1,"remove") : t->alen;
+    RET(0,list_removeat(t,pos)); return 1;
+}
+LFN(f_list_len){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"len");
+    RET(0,mknum((double)(t->o.type==LT_LIST? t->alen : tab_len(t)))); return 1;
+}
+LFN(f_list_contains){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"contains");
+    RET(0,mkbool(vm_in(AR(1),AR(0)))); (void)t; return 1;
+}
+LFN(f_list_indexof){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"indexof");
+    for(int i=0;i<t->alen;i++)
+        if(val_rawequal(t->arr[i],AR(1))){ RET(0,mknum((double)(i+1))); return 1; }
+    RET(0,NIL); return 1;
+}
+LFN(f_list_clear){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"clear");
+    for(int i=0;i<t->alen;i++) t->arr[i]=NIL;
+    t->alen=0; return 0;
+}
+LFN(f_list_extend){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"extend");
+    Table *o=checktab(L,base,nargs,1,"extend");
+    int n=o->o.type==LT_LIST?o->alen:tab_len(o);
+    for(int i=1;i<=n;i++) list_push(t,tab_get(o,mknum((double)i)));
+    RET(0,AR(0)); return 1;
+}
+LFN(f_list_reverse){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"reverse");
+    for(int i=0,j=t->alen-1;i<j;i++,j--){ Value tmp=t->arr[i]; t->arr[i]=t->arr[j]; t->arr[j]=tmp; }
+    return 0;
+}
+static int sort_less(LucState *L,int scratch,Value cmp,Value a,Value b){
+    if(cmp.t==LT_NIL) return vm_lessthan(a,b,0);
+    ensure_stack(L,scratch+8);
+    L->stack[scratch]=cmp; L->stack[scratch+1]=a; L->stack[scratch+2]=b;
+    vm_call(L,scratch,2,1);
+    return truthy(L->stack[scratch]);
+}
+LFN(f_list_sort){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"sort");
+    Value cmp=AR(1);
+    int n=t->o.type==LT_LIST? t->alen : tab_len(t);
+    int scratch=base+nargs+2;
+    for(int i=1;i<n;i++){                       /* insertion sort (stable) */
+        Value key=t->arr[i]; int j=i-1;
+        while(j>=0 && sort_less(L,scratch,cmp,key,t->arr[j])){ t->arr[j+1]=t->arr[j]; j--; }
+        t->arr[j+1]=key;
+    }
+    return 0;
+}
+LFN(f_list_tostring){ UNUSED_SELF;
+    RET(0,mkobj(LT_STR,tostr(AR(0)))); return 1;
+}
+
+/* ---- table ----------------------------------------------------------- */
+LFN(f_tbl_insert){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"insert");
+    if(nargs>=3){
+        int pos=checkint(L,base,nargs,1,"insert");
+        int n=t->o.type==LT_LIST?t->alen:tab_len(t);
+        if(t->o.type==LT_LIST) list_insert(t,pos,AR(2));
+        else {
+            for(int i=n;i>=pos;i--) tab_set(t,mknum((double)(i+1)),tab_get(t,mknum((double)i)));
+            tab_set(t,mknum((double)pos),AR(2));
+        }
+    } else {
+        int n=t->o.type==LT_LIST?t->alen:tab_len(t);
+        tab_set(t,mknum((double)(n+1)),AR(1));
+    }
+    return 0;
+}
+LFN(f_tbl_remove){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"remove");
+    int n=t->o.type==LT_LIST?t->alen:tab_len(t);
+    int pos = nargs>=2? checkint(L,base,nargs,1,"remove") : n;
+    if(n==0){ RET(0,NIL); return 1; }
+    if(t->o.type==LT_LIST){ RET(0,list_removeat(t,pos)); return 1; }
+    Value v=tab_get(t,mknum((double)pos));
+    for(int i=pos;i<n;i++) tab_set(t,mknum((double)i),tab_get(t,mknum((double)(i+1))));
+    tab_set(t,mknum((double)n),NIL);
+    RET(0,v); return 1;
+}
+LFN(f_tbl_concat){ UNUSED_SELF;
+    Table *t=checktab(L,base,nargs,0,"concat");
+    Str *sep = nargs>=2 && AR(1).t!=LT_NIL? checkstr(L,base,nargs,1,"concat") : NULL;
+    int n=t->o.type==LT_LIST?t->alen:tab_len(t);
+    int i = nargs>=3? checkint(L,base,nargs,2,"concat") : 1;
+    int j = nargs>=4? checkint(L,base,nargs,3,"concat") : n;
+    size_t cap=64,len=0; char *b=(char*)lmalloc(cap);
+    for(int x=i;x<=j;x++){
+        Value v=tab_get(t,mknum((double)x));
+        if(v.t!=LT_STR&&v.t!=LT_NUM) luc_error("invalid value (at index %d) in table.concat",x);
+        Str *s=tostr(v);
+        size_t need=len+(size_t)s->len+(sep?(size_t)sep->len:0)+1;
+        if(need>cap){ while(need>cap) cap*=2; b=(char*)lrealloc(b,cap); }
+        memcpy(b+len,s->s,(size_t)s->len); len+=(size_t)s->len;
+        if(sep && x<j){ memcpy(b+len,sep->s,(size_t)sep->len); len+=(size_t)sep->len; }
+    }
+    RET(0,strv(b,(int)len)); free(b); return 1;
+}
+
+/* ---- math ------------------------------------------------------------ */
+static uint64_t rngstate=0x2545F4914F6CDD1DULL;
+static double rnd(void){
+    rngstate^=rngstate>>12; rngstate^=rngstate<<25; rngstate^=rngstate>>27;
+    return (double)((rngstate*2685821657736338717ULL)>>11)/9007199254740992.0;
+}
+#define MATH1(nm,expr) LFN(nm){ UNUSED_SELF; double x=checknum(L,base,nargs,0,"math"); RET(0,mknum(expr)); return 1; }
+MATH1(f_m_floor,floor(x)) MATH1(f_m_ceil,ceil(x)) MATH1(f_m_sqrt,sqrt(x))
+MATH1(f_m_abs,fabs(x))    MATH1(f_m_sin,sin(x))   MATH1(f_m_cos,cos(x))
+MATH1(f_m_tan,tan(x))     MATH1(f_m_asin,asin(x)) MATH1(f_m_acos,acos(x))
+MATH1(f_m_exp,exp(x))     MATH1(f_m_atan,atan(x))
+LFN(f_m_log){ UNUSED_SELF;
+    double x=checknum(L,base,nargs,0,"log");
+    if(nargs>=2){ double b=checknum(L,base,nargs,1,"log"); RET(0,mknum(log(x)/log(b))); }
+    else RET(0,mknum(log(x)));
+    return 1;
+}
+LFN(f_m_pow){ UNUSED_SELF;
+    RET(0,mknum(pow(checknum(L,base,nargs,0,"pow"),checknum(L,base,nargs,1,"pow")))); return 1; }
+LFN(f_m_fmod){ UNUSED_SELF;
+    RET(0,mknum(fmod(checknum(L,base,nargs,0,"fmod"),checknum(L,base,nargs,1,"fmod")))); return 1; }
+LFN(f_m_modf){ UNUSED_SELF;
+    double ip; double fp=modf(checknum(L,base,nargs,0,"modf"),&ip);
+    RET(0,mknum(ip)); RET(1,mknum(fp)); return 2; }
+LFN(f_m_max){ UNUSED_SELF;
+    double m=checknum(L,base,nargs,0,"max");
+    for(int i=1;i<nargs;i++){ double d=checknum(L,base,nargs,i,"max"); if(d>m) m=d; }
+    RET(0,mknum(m)); return 1; }
+LFN(f_m_min){ UNUSED_SELF;
+    double m=checknum(L,base,nargs,0,"min");
+    for(int i=1;i<nargs;i++){ double d=checknum(L,base,nargs,i,"min"); if(d<m) m=d; }
+    RET(0,mknum(m)); return 1; }
+LFN(f_m_random){ UNUSED_SELF;
+    double r=rnd();
+    if(nargs==0){ RET(0,mknum(r)); return 1; }
+    if(nargs==1){ int u=checkint(L,base,nargs,0,"random");
+        RET(0,mknum((double)(1+(int)(r*u)))); return 1; }
+    int lo=checkint(L,base,nargs,0,"random"), hi=checkint(L,base,nargs,1,"random");
+    RET(0,mknum((double)(lo+(int)(r*(hi-lo+1))))); return 1;
+}
+LFN(f_m_randomseed){ UNUSED_SELF;
+    rngstate=(uint64_t)(int64_t)checknum(L,base,nargs,0,"randomseed")|1ULL; return 0; }
+
+/* ---- os -------------------------------------------------------------- */
+LFN(f_os_clock){ UNUSED_SELF; (void)base;(void)nargs;
+    RET(0,mknum((double)clock()/(double)CLOCKS_PER_SEC)); return 1; }
+LFN(f_os_time){ UNUSED_SELF; (void)base;(void)nargs;
+    RET(0,mknum((double)time(NULL))); return 1; }
+LFN(f_os_date){ UNUSED_SELF;
+    const char *fmt = nargs>=1? checkstr(L,base,nargs,0,"date")->s : "%c";
+    time_t t = nargs>=2? (time_t)checknum(L,base,nargs,1,"date") : time(NULL);
+    if(*fmt=='!'||*fmt=='*') fmt++;
+    char buf[256];
+    struct tm *tmv=localtime(&t);
+    if(!tmv || strftime(buf,sizeof buf,fmt,tmv)==0) buf[0]=0;
+    RET(0,cstrv(buf)); return 1;
+}
+LFN(f_os_exit){ UNUSED_SELF;
+    int c = 0;
+    if(nargs>=1){
+        Value v=AR(0);
+        c = (v.t==LT_BOOL)? (v.u.b?0:1) : checkint(L,base,nargs,0,"exit");
+    }
+    fflush(stdout); fflush(stderr);
+    exit(c);
+    return 0;
+}
+LFN(f_os_getenv){ UNUSED_SELF;
+    const char *e=getenv(checkstr(L,base,nargs,0,"getenv")->s);
+    if(e) RET(0,cstrv(e)); else RET(0,NIL);
+    return 1;
+}
+LFN(f_os_remove){ UNUSED_SELF;
+    Str *p=checkstr(L,base,nargs,0,"remove");
+    if(remove(p->s)==0){ RET(0,mkbool(1)); return 1; }
+    RET(0,NIL); RET(1,cstrv("could not remove file")); return 2;
+}
+LFN(f_os_rename){ UNUSED_SELF;
+    Str *a=checkstr(L,base,nargs,0,"rename"), *b=checkstr(L,base,nargs,1,"rename");
+    if(rename(a->s,b->s)==0){ RET(0,mkbool(1)); return 1; }
+    RET(0,NIL); RET(1,cstrv("could not rename file")); return 2;
+}
+LFN(f_os_sleep){ UNUSED_SELF;
+    luc_sleep(checknum(L,base,nargs,0,"sleep")); return 0;
+}
+
+/* ---- io -------------------------------------------------------------- */
+static FileH *checkfile(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t!=LT_FILE) luc_error("bad argument #%d to '%s' (file expected, got %s)",
+                               i+1,fn,type_name(v));
+    FileH *h=AS_FILE(v);
+    if(h->closed || !h->f) luc_error("attempt to use a closed file");
+    return h;
+}
+static Str *read_line_str(FILE *f,int keepnl){
+    size_t cap=128,len=0; char *b=(char*)lmalloc(cap); int c=EOF;
+    while((c=fgetc(f))!=EOF){
+        if(len+2>cap){ cap*=2; b=(char*)lrealloc(b,cap); }
+        if(c=='\n'){ if(keepnl) b[len++]=(char)c; break; }
+        b[len++]=(char)c;
+    }
+    if(c==EOF && len==0){ free(b); return NULL; }
+    Str *s=str_new(b,(int)len); free(b); return s;
+}
+static Str *read_all_str(FILE *f){
+    size_t cap=1024,len=0; char *b=(char*)lmalloc(cap); size_t n;
+    for(;;){
+        if(len+512>cap){ cap*=2; b=(char*)lrealloc(b,cap); }
+        n=fread(b+len,1,cap-len,f);
+        len+=n;
+        if(n==0) break;
+    }
+    Str *s=str_new(b,(int)len); free(b); return s;
+}
+static Str *read_count_str(FILE *f,int count){
+    if(count<=0){ int c=fgetc(f); if(c==EOF) return NULL; ungetc(c,f); return str_new("",0); }
+    char *b=(char*)lmalloc((size_t)count+1);
+    size_t n=fread(b,1,(size_t)count,f);
+    if(n==0){ free(b); return NULL; }
+    Str *s=str_new(b,(int)n); free(b); return s;
+}
+/* read according to format arguments starting at argument index `first` */
+static int io_read_aux(LucState *L,int base,int nargs,FILE *f,int first){
+    int out=0;
+    if(first>=nargs){
+        Str *s=read_line_str(f,0);
+        if(s) RET(0,mkobj(LT_STR,s)); else RET(0,NIL);
+        return 1;
+    }
+    for(int i=first;i<nargs;i++){
+        Value fmt=AR(i);
+        if(fmt.t==LT_NUM){
+            Str *s=read_count_str(f,(int)fmt.u.n);
+            if(s) RET(out,mkobj(LT_STR,s)); else RET(out,NIL);
+            out++; continue;
+        }
+        Str *fs=checkstr(L,base,nargs,i,"read");
+        const char *p=fs->s;
+        if(*p=='*') p++;
+        switch(*p){
+            case 'l': case 'L': {
+                Str *s=read_line_str(f,*p=='L');
+                if(s) RET(out,mkobj(LT_STR,s)); else RET(out,NIL);
+                break; }
+            case 'a': RET(out,mkobj(LT_STR,read_all_str(f))); break;
+            case 'n': {
+                double d;
+                if(fscanf(f,"%lf",&d)==1) RET(out,mknum(d)); else RET(out,NIL);
+                break; }
+            default: luc_error("bad argument #%d to 'read' (invalid format)",i+1);
+        }
+        out++;
+    }
+    return out;
+}
+LFN(f_io_write){ UNUSED_SELF;
+    for(int i=0;i<nargs;i++){
+        Value v=L->stack[base+i];
+        if(v.t!=LT_STR && v.t!=LT_NUM)
+            luc_error("bad argument #%d to 'write' (string expected, got %s)",i+1,type_name(v));
+        Str *s=tostr(v);
+        fwrite(s->s,1,(size_t)s->len,stdout);
+    }
+    fflush(stdout);              /* so '\r' progress lines show up at once */
+    return 0;
+}
+LFN(f_io_replace){ UNUSED_SELF;
+    fputs("\r\033[2K",stdout);    /* return home and erase the current line */
+    for(int i=0;i<nargs;i++){
+        Value v=L->stack[base+i];
+        if(v.t!=LT_STR && v.t!=LT_NUM)
+            luc_error("bad argument #%d to 'replace' (string expected, got %s)",i+1,type_name(v));
+        Str *s=tostr(v);
+        fwrite(s->s,1,(size_t)s->len,stdout);
+    }
+    fflush(stdout);
+    return 0;
+}
+LFN(f_io_clearline){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
+    fputs("\r\033[2K",stdout);
+    fflush(stdout);
+    return 0;
+}
+LFN(f_io_eraseline){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
+    fputs("\033[1A\r\033[2K",stdout); /* move up, return home, erase */
+    fflush(stdout);
+    return 0;
+}
+LFN(f_io_clear){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
+    fputs("\033[2J\033[H",stdout); /* erase screen and move cursor home */
+    fflush(stdout);
+    return 0;
+}
+LFN(f_io_read){ UNUSED_SELF; return io_read_aux(L,base,nargs,stdin,0); }
+LFN(f_io_open){ UNUSED_SELF;
+    Str *path=checkstr(L,base,nargs,0,"open");
+    const char *mode = nargs>=2? checkstr(L,base,nargs,1,"open")->s : "r";
+    FILE *f=fopen(path->s,mode);
+    if(!f){ RET(0,NIL); RET(1,cstrv("cannot open file")); RET(2,mknum(2)); return 3; }
+    RET(0,mkobj(LT_FILE,file_new(f,0)));
+    return 1;
+}
+LFN(f_io_close){ UNUSED_SELF;
+    if(nargs==0){ return 0; }
+    FileH *h=checkfile(L,base,nargs,0,"close");
+    if(!h->isstd) fclose(h->f);
+    h->closed=1; h->f=NULL;
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_file_write){ UNUSED_SELF;
+    FileH *h=checkfile(L,base,nargs,0,"write");
+    for(int i=1;i<nargs;i++){
+        Str *s=tostr(L->stack[base+i]);
+        fwrite(s->s,1,(size_t)s->len,h->f);
+    }
+    RET(0,AR(0)); return 1;
+}
+LFN(f_file_read){ UNUSED_SELF;
+    FileH *h=checkfile(L,base,nargs,0,"read");
+    return io_read_aux(L,base,nargs,h->f,1);
+}
+LFN(f_file_flush){ UNUSED_SELF;
+    FileH *h=checkfile(L,base,nargs,0,"flush"); fflush(h->f); RET(0,AR(0)); return 1;
+}
+LFN(f_file_seek){ UNUSED_SELF;
+    FileH *h=checkfile(L,base,nargs,0,"seek");
+    const char *wh = nargs>=2? checkstr(L,base,nargs,1,"seek")->s : "cur";
+    long off = nargs>=3? (long)checknum(L,base,nargs,2,"seek") : 0;
+    int w = strcmp(wh,"set")==0?SEEK_SET : (strcmp(wh,"end")==0?SEEK_END:SEEK_CUR);
+    if(fseek(h->f,off,w)!=0){ RET(0,NIL); RET(1,cstrv("seek failed")); return 2; }
+    RET(0,mknum((double)ftell(h->f))); return 1;
+}
+LFN(f_lines_iter){
+    Value fv=self->up[0];
+    FileH *h=AS_FILE(fv);
+    if(h->closed||!h->f){ RET(0,NIL); return 1; }
+    Str *s=read_line_str(h->f,0);
+    if(!s){
+        if(!h->isstd && (int)self->up[1].u.n){ fclose(h->f); h->f=NULL; h->closed=1; }
+        RET(0,NIL); return 1;
+    }
+    RET(0,mkobj(LT_STR,s)); return 1;
+}
+LFN(f_io_lines){ UNUSED_SELF;
+    FileH *h; int autoclose=0;
+    if(nargs==0 || AR(0).t==LT_NIL){ h=file_new(stdin,1); }
+    else {
+        Str *p=checkstr(L,base,nargs,0,"lines");
+        FILE *f=fopen(p->s,"r");
+        if(!f) luc_error("cannot open '%s'",p->s);
+        h=file_new(f,0); autoclose=1;
+    }
+    CFunc *c=cfunc_new(f_lines_iter,"lines",2);
+    c->up[0]=mkobj(LT_FILE,h);
+    c->up[1]=mknum(autoclose);
+    RET(0,mkobj(LT_CFUNC,c));
+    return 1;
+}
+LFN(f_file_lines){ UNUSED_SELF;
+    FileH *h=checkfile(L,base,nargs,0,"lines");
+    CFunc *c=cfunc_new(f_lines_iter,"lines",2);
+    c->up[0]=AR(0); c->up[1]=mknum(0); (void)h;
+    RET(0,mkobj(LT_CFUNC,c));
+    return 1;
+}
+
+/* ---- bit32 ----------------------------------------------------------- */
+LFN(f_b_band){ UNUSED_SELF;
+    uint32_t r=0xFFFFFFFFu;
+    for(int i=0;i<nargs;i++) r&=checku32(L,base,nargs,i,"band");
+    RET(0,mknum((double)r)); return 1; }
+LFN(f_b_bor){ UNUSED_SELF;
+    uint32_t r=0;
+    for(int i=0;i<nargs;i++) r|=checku32(L,base,nargs,i,"bor");
+    RET(0,mknum((double)r)); return 1; }
+LFN(f_b_bxor){ UNUSED_SELF;
+    uint32_t r=0;
+    for(int i=0;i<nargs;i++) r^=checku32(L,base,nargs,i,"bxor");
+    RET(0,mknum((double)r)); return 1; }
+LFN(f_b_bnot){ UNUSED_SELF;
+    RET(0,mknum((double)(uint32_t)~checku32(L,base,nargs,0,"bnot"))); return 1; }
+LFN(f_b_lshift){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"lshift"); int n=checkint(L,base,nargs,1,"lshift");
+    RET(0,mknum((double)(uint32_t)(n<=-32||n>=32?0:(n>=0? a<<n : a>>(-n))))); return 1; }
+LFN(f_b_rshift){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"rshift"); int n=checkint(L,base,nargs,1,"rshift");
+    RET(0,mknum((double)(uint32_t)(n<=-32||n>=32?0:(n>=0? a>>n : a<<(-n))))); return 1; }
+LFN(f_b_arshift){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"arshift"); int n=checkint(L,base,nargs,1,"arshift");
+    if(n<0){ RET(0,mknum((double)(uint32_t)(-n>=32?0:a<<(-n)))); return 1; }
+    if(n>=32){ RET(0,mknum((double)(uint32_t)((a&0x80000000u)?0xFFFFFFFFu:0u))); return 1; }
+    uint32_t r=a>>n;
+    if(a&0x80000000u) r|=(uint32_t)(0xFFFFFFFFu<<(32-n));
+    RET(0,mknum((double)r)); return 1; }
+LFN(f_b_btest){ UNUSED_SELF;
+    uint32_t r=0xFFFFFFFFu;
+    for(int i=0;i<nargs;i++) r&=checku32(L,base,nargs,i,"btest");
+    RET(0,mkbool(r!=0)); return 1; }
+LFN(f_b_bswap){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"bswap");
+    a=((a&0xFFu)<<24)|((a&0xFF00u)<<8)|((a>>8)&0xFF00u)|((a>>24)&0xFFu);
+    RET(0,mknum((double)a)); return 1; }
+LFN(f_b_extract){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"extract");
+    int f=checkint(L,base,nargs,1,"extract");
+    int w=nargs>=3?checkint(L,base,nargs,2,"extract"):1;
+    if(f<0||w<1||f+w>32) luc_error("bit32.extract: field out of range");
+    uint32_t mask = (w==32)?0xFFFFFFFFu:((1u<<w)-1u);
+    RET(0,mknum((double)((a>>f)&mask))); return 1; }
+LFN(f_b_replace){ UNUSED_SELF;
+    uint32_t a=checku32(L,base,nargs,0,"replace");
+    uint32_t v=checku32(L,base,nargs,1,"replace");
+    int f=checkint(L,base,nargs,2,"replace");
+    int w=nargs>=4?checkint(L,base,nargs,3,"replace"):1;
+    if(f<0||w<1||f+w>32) luc_error("bit32.replace: field out of range");
+    uint32_t mask=((w==32)?0xFFFFFFFFu:((1u<<w)-1u))<<f;
+    RET(0,mknum((double)((a&~mask)|((v<<f)&mask)))); return 1; }
+
+/* ---- buffer ---------------------------------------------------------- */
+static void bufrange(Buffer *b,int off,int n){
+    if(off<0||n<0||off>b->len-n)
+        luc_error("buffer access out of bounds (offset %d, %d byte(s), size %d)",off,n,b->len);
+}
+LFN(f_buf_create){ UNUSED_SELF;
+    int n=checkint(L,base,nargs,0,"create");
+    if(n<0) luc_error("buffer.create: size must be non-negative");
+    RET(0,mkobj(LT_BUFFER,buf_new(n))); return 1;
+}
+LFN(f_buf_fromstring){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"fromstring");
+    Buffer *b=buf_new(s->len);
+    memcpy(b->b,s->s,(size_t)s->len);
+    RET(0,mkobj(LT_BUFFER,b)); return 1;
+}
+LFN(f_buf_tostring){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"tostring");
+    RET(0,strv((char*)b->b,b->len)); return 1;
+}
+LFN(f_buf_len){ UNUSED_SELF;
+    RET(0,mknum((double)checkbuf(L,base,nargs,0,"len")->len)); return 1;
+}
+LFN(f_buf_fill){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"fill");
+    int off=checkint(L,base,nargs,1,"fill");
+    int val=checkint(L,base,nargs,2,"fill");
+    int cnt=nargs>=4?checkint(L,base,nargs,3,"fill"):b->len-off;
+    bufrange(b,off,cnt);
+    memset(b->b+off,val&0xFF,(size_t)cnt);
+    return 0;
+}
+LFN(f_buf_copy){ UNUSED_SELF;
+    Buffer *d=checkbuf(L,base,nargs,0,"copy");
+    int doff=checkint(L,base,nargs,1,"copy");
+    Buffer *s=checkbuf(L,base,nargs,2,"copy");
+    int soff=nargs>=4?checkint(L,base,nargs,3,"copy"):0;
+    int cnt =nargs>=5?checkint(L,base,nargs,4,"copy"):s->len-soff;
+    bufrange(s,soff,cnt); bufrange(d,doff,cnt);
+    memmove(d->b+doff,s->b+soff,(size_t)cnt);
+    return 0;
+}
+#define BUFRD(nm,ctype,sz,conv) LFN(nm){ UNUSED_SELF;                      \
+    Buffer *b=checkbuf(L,base,nargs,0,"read");                             \
+    int off=checkint(L,base,nargs,1,"read");                               \
+    bufrange(b,off,sz);                                                    \
+    ctype x; memcpy(&x,b->b+off,sz);                                       \
+    RET(0,mknum((double)(conv)));  return 1; }
+#define BUFWR(nm,ctype,sz,cast) LFN(nm){ UNUSED_SELF;                      \
+    Buffer *b=checkbuf(L,base,nargs,0,"write");                            \
+    int off=checkint(L,base,nargs,1,"write");                              \
+    double d=checknum(L,base,nargs,2,"write");                             \
+    bufrange(b,off,sz);                                                    \
+    ctype x=(ctype)(cast); memcpy(b->b+off,&x,sz); return 0; }
+
+BUFRD(f_buf_readu8 ,uint8_t ,1,x) BUFRD(f_buf_readi8 ,int8_t ,1,x)
+BUFRD(f_buf_readu16,uint16_t,2,x) BUFRD(f_buf_readi16,int16_t,2,x)
+BUFRD(f_buf_readu32,uint32_t,4,x) BUFRD(f_buf_readi32,int32_t,4,x)
+BUFRD(f_buf_readf32,float   ,4,x) BUFRD(f_buf_readf64,double ,8,x)
+BUFWR(f_buf_writeu8 ,uint8_t ,1,(int64_t)d) BUFWR(f_buf_writei8 ,int8_t ,1,(int64_t)d)
+BUFWR(f_buf_writeu16,uint16_t,2,(int64_t)d) BUFWR(f_buf_writei16,int16_t,2,(int64_t)d)
+BUFWR(f_buf_writeu32,uint32_t,4,(int64_t)d) BUFWR(f_buf_writei32,int32_t,4,(int64_t)d)
+BUFWR(f_buf_writef32,float   ,4,d)          BUFWR(f_buf_writef64,double ,8,d)
+
+LFN(f_buf_writestring){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"writestring");
+    int off=checkint(L,base,nargs,1,"writestring");
+    Str *s=checkstr(L,base,nargs,2,"writestring");
+    int n=nargs>=4?checkint(L,base,nargs,3,"writestring"):s->len;
+    if(n>s->len) n=s->len;
+    bufrange(b,off,n);
+    memcpy(b->b+off,s->s,(size_t)n);
+    return 0;
+}
+LFN(f_buf_readstring){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"readstring");
+    int off=checkint(L,base,nargs,1,"readstring");
+    int n=nargs>=3?checkint(L,base,nargs,2,"readstring"):b->len-off;
+    bufrange(b,off,n);
+    RET(0,strv((char*)b->b+off,n)); return 1;
+}
+LFN(f_buf_writehex){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"writehex");
+    int off=checkint(L,base,nargs,1,"writehex");
+    Str *h=checkstr(L,base,nargs,2,"writehex");
+    if(h->len%2) luc_error("buffer.writehex: hex string must have even length");
+    int n=h->len/2;
+    bufrange(b,off,n);
+    for(int i=0;i<n;i++){
+        int hi=hexval((unsigned char)h->s[i*2]), lo=hexval((unsigned char)h->s[i*2+1]);
+        if(hi<0||lo<0) luc_error("buffer.writehex: invalid hex digit");
+        b->b[off+i]=(unsigned char)((hi<<4)|lo);
+    }
+    RET(0,mknum((double)n)); return 1;
+}
+LFN(f_buf_readhex){ UNUSED_SELF;
+    Buffer *b=checkbuf(L,base,nargs,0,"readhex");
+    int off=checkint(L,base,nargs,1,"readhex");
+    int n=nargs>=3?checkint(L,base,nargs,2,"readhex"):b->len-off;
+    bufrange(b,off,n);
+    char *o=(char*)lmalloc((size_t)n*2+1);
+    for(int i=0;i<n;i++){
+        unsigned char c=b->b[off+i];
+        o[i*2]=HEXD[c>>4]; o[i*2+1]=HEXD[c&15];
+    }
+    RET(0,strv(o,n*2)); free(o); return 1;
+}
+
+/* ---- coroutine ------------------------------------------------------- */
+LFN(f_co_create){ UNUSED_SELF;
+    Value f=AR(0);
+    if(f.t!=LT_FUNC&&f.t!=LT_CFUNC)
+        luc_error("bad argument #1 to 'create' (function expected, got %s)",type_name(f));
+    LucState *co=state_new(64);
+    co->stack[0]=f;
+    co->cursource=L->cursource;
+    RET(0,mkobj(LT_CORO,co)); return 1;
+}
+LFN(f_co_yield){ UNUSED_SELF;
+    if(!g_yp || g_yp->co!=L) luc_error("attempt to yield from outside a coroutine");
+    L->yieldbase=base; L->nyield=nargs;
+    L->status=CO_SUSPENDED;
+    longjmp(g_yp->jb,1);
+    return 0;                      /* not reached */
+}
+LFN(f_co_resume){ UNUSED_SELF;
+    Value cv=AR(0);
+    if(cv.t!=LT_CORO) luc_error("bad argument #1 to 'resume' (thread expected, got %s)",type_name(cv));
+    LucState *co=AS_CO(cv);
+    Value args[32]; int na=nargs-1; if(na<0) na=0; if(na>32) na=32;
+    for(int i=0;i<na;i++) args[i]=L->stack[base+1+i];
+    Value res[32]; int nres=0;
+    if(co_resume(co,args,na,res,&nres)){ RET(0,mkbool(0)); RET(1,V.errval); return 2; }
+    RET(0,mkbool(1));
+    for(int i=0;i<nres;i++) RET(1+i,res[i]);
+    return nres+1;
+}
+LFN(f_co_wrapped){
+    LucState *co=AS_CO(self->up[0]);
+    Value args[32]; int na=nargs>32?32:nargs;
+    for(int i=0;i<na;i++) args[i]=L->stack[base+i];
+    Value res[32]; int nres=0;
+    if(co_resume(co,args,na,res,&nres)) luc_throw(V.errval);
+    for(int i=0;i<nres;i++) RET(i,res[i]);
+    return nres;
+}
+LFN(f_co_wrap){ UNUSED_SELF;
+    Value f=AR(0);
+    if(f.t!=LT_FUNC&&f.t!=LT_CFUNC) luc_error("bad argument #1 to 'wrap' (function expected)");
+    LucState *co=state_new(64);
+    co->stack[0]=f; co->cursource=L->cursource;
+    CFunc *c=cfunc_new(f_co_wrapped,"wrapped",1);
+    c->up[0]=mkobj(LT_CORO,co);
+    RET(0,mkobj(LT_CFUNC,c)); return 1;
+}
+LFN(f_co_status){ UNUSED_SELF;
+    Value cv=AR(0);
+    if(cv.t!=LT_CORO) luc_error("bad argument #1 to 'status' (thread expected)");
+    LucState *co=AS_CO(cv);
+    const char *s = co==V.cur? "running" :
+                    (co->status==CO_DEAD? "dead" :
+                    (co->status==CO_NORMAL? "normal" : "suspended"));
+    RET(0,cstrv(s)); return 1;
+}
+LFN(f_co_running){ UNUSED_SELF; (void)nargs;
+    RET(0,mkobj(LT_CORO,V.cur));
+    RET(1,mkbool(V.cur==V.mainco));
+    return 2;
+}
+LFN(f_co_isyieldable){ UNUSED_SELF; (void)nargs;
+    RET(0,mkbool(g_yp && g_yp->co==L)); return 1;
+}
+
+/* ---- task ------------------------------------------------------------ */
+/* trampoline: up[0]=function, up[1..] = captured arguments */
+LFN(f_task_trampoline){
+    int n=self->nup-1;
+    ensure_stack(L,base+n+8);
+    L->stack[base]=self->up[0];
+    for(int i=0;i<n;i++) L->stack[base+1+i]=self->up[1+i];
+    return vm_call(L,base,n,-1);
+}
+static LucState *make_task(LucState *L,int base,int nargs,int firstarg){
+    Value f=L->stack[base+firstarg];
+    if(f.t!=LT_FUNC&&f.t!=LT_CFUNC)
+        luc_error("bad argument #%d to 'task' (function expected, got %s)",
+                  firstarg+1,type_name(f));
+    int na=nargs-firstarg-1; if(na<0) na=0;
+    CFunc *tr=cfunc_new(f_task_trampoline,"task",na+1);
+    tr->up[0]=f;
+    for(int i=0;i<na;i++) tr->up[1+i]=L->stack[base+firstarg+1+i];
+    LucState *co=state_new(64);
+    co->stack[0]=mkobj(LT_CFUNC,tr);
+    co->cursource=L->cursource;
+    return co;
+}
+LFN(f_task_wait){ UNUSED_SELF;
+    double n = nargs>=1? checknum(L,base,nargs,0,"wait") : 0;
+    if(n<0) n=0;
+    if(!g_yp || g_yp->co!=L){        /* main thread: block */
+        double t0=luc_now(); luc_sleep(n);
+        RET(0,mknum(luc_now()-t0)); return 1;
+    }
+    L->waketime=n;
+    sched_add(L,luc_now()+n);
+    L->yieldbase=base; L->nyield=0;
+    L->status=CO_SUSPENDED;
+    longjmp(g_yp->jb,1);
+    return 0;
+}
+LFN(f_task_spawn){ UNUSED_SELF;
+    LucState *co=make_task(L,base,nargs,0);
+    Value cv=mkobj(LT_CORO,co);
+    RET(0,cv);                                  /* root before resuming */
+    Value res[32]; int nres=0;
+    if(co_resume(co,NULL,0,res,&nres)){
+        Str *s=tostr(V.errval);
+        fprintf(stderr,"luc: error in task.spawn: %s\n",s->s);
+    }
+    RET(0,cv); return 1;
+}
+LFN(f_task_defer){ UNUSED_SELF;
+    LucState *co=make_task(L,base,nargs,0);
+    Value cv=mkobj(LT_CORO,co);
+    RET(0,cv);
+    co->waketime=0;
+    sched_add(co,luc_now());
+    RET(0,cv); return 1;
+}
+LFN(f_task_delay){ UNUSED_SELF;
+    double d=checknum(L,base,nargs,0,"delay");
+    if(d<0) d=0;
+    LucState *co=make_task(L,base,nargs,1);
+    Value cv=mkobj(LT_CORO,co);
+    RET(0,cv);
+    co->waketime=d;
+    sched_add(co,luc_now()+d);
+    RET(0,cv); return 1;
+}
+LFN(f_task_cancel){ UNUSED_SELF;
+    Value cv=AR(0);
+    if(cv.t!=LT_CORO) luc_error("bad argument #1 to 'cancel' (thread expected)");
+    LucState *co=AS_CO(cv);
+    if(co==V.cur) luc_error("cannot cancel the running thread");
+    co->status=CO_DEAD;
+    for(int i=0;i<V.nsched;i++) if(V.sched[i].co==co){ sched_remove(i); break; }
+    return 0;
+}
+
+/* ==========================================================================
+** MODULE SYSTEM + JSON + NEW STDLIB
+** ========================================================================== */
+
+static char g_scriptdir[1024] = "";
+static char g_exepath[1024]   = "";
+
+static void set_scriptdir(const char *path){
+    size_t n=strlen(path);
+    while(n>0 && path[n-1]!='/' && path[n-1]!='\\') n--;
+    if(n>=sizeof g_scriptdir) n=sizeof g_scriptdir-1;
+    memcpy(g_scriptdir,path,n); g_scriptdir[n]=0;
+}
+
+static void modname_to_path(const char *name,char *out,size_t cap){
+    size_t i=0;
+    for(;name[i] && i+1<cap;i++) out[i]=(name[i]=='.')?'/':name[i];
+    out[i]=0;
+}
+
+static char *read_file(const char *path,int *outlen);
+
+static char *try_dir(const char *dir,const char *rel,int *len,char *found,size_t fcap){
+    char p[1024]; char *src;
+    char sep=(dir[0] && dir[strlen(dir)-1]!='/' && dir[strlen(dir)-1]!='\\')? '/' : 0;
+    if(sep) snprintf(p,sizeof p,"%s/%s.luc",dir,rel);
+    else    snprintf(p,sizeof p,"%s%s.luc",dir,rel);
+    if((src=read_file(p,len))){ snprintf(found,fcap,"%s",p); return src; }
+    if(sep) snprintf(p,sizeof p,"%s/%s/init.luc",dir,rel);
+    else    snprintf(p,sizeof p,"%s%s/init.luc",dir,rel);
+    if((src=read_file(p,len))){ snprintf(found,fcap,"%s",p); return src; }
+    return NULL;
+}
+
+static char *find_module(const char *name,int *len,char *found,size_t fcap){
+    char rel[512]; modname_to_path(name,rel,sizeof rel);
+    char *src;
+    if(*g_scriptdir && (src=try_dir(g_scriptdir,rel,len,found,fcap))) return src;
+    /* fallback: also try CWD in case scriptdir is empty or relative */
+    if((src=try_dir(".",rel,len,found,fcap))) return src;
+    const char *lp=getenv("LUC_PATH");
+    if(lp){
+#if defined(_WIN32)
+        const char sepc=';';
+#else
+        const char sepc=':';
+#endif
+        char dir[512]; const char *p=lp;
+        while(*p){
+            const char *q=strchr(p,sepc); if(!q) q=p+strlen(p);
+            size_t n=(size_t)(q-p); if(n>=sizeof dir) n=sizeof dir-1;
+            memcpy(dir,p,n); dir[n]=0;
+            if(n && (src=try_dir(dir,rel,len,found,fcap))) return src;
+            p = *q? q+1 : q;
+        }
+    }
+    if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
+    return NULL;
+}
+
+/* ---- JSON ---------------------------------------------------------------- */
+typedef struct { char *b; size_t len,cap; } SBuf;
+static void sb_init(SBuf *s){ s->cap=256; s->len=0; s->b=(char*)lmalloc(s->cap); }
+static void sb_put(SBuf *s,const char *p,size_t n){
+    if(s->len+n+1>s->cap){ while(s->len+n+1>s->cap) s->cap*=2;
+                           s->b=(char*)lrealloc(s->b,s->cap); }
+    memcpy(s->b+s->len,p,n); s->len+=n; s->b[s->len]=0;
+}
+static void sb_puts(SBuf *s,const char *p){ sb_put(s,p,strlen(p)); }
+static void sb_putc(SBuf *s,char c){ sb_put(s,&c,1); }
+
+static void json_str(SBuf *o,Str *s){
+    sb_putc(o,'"');
+    for(int i=0;i<s->len;i++){
+        unsigned char c=(unsigned char)s->s[i];
+        switch(c){
+            case '"':  sb_puts(o,"\""); break;
+            case '\\': sb_puts(o,"\\\\"); break;
+            case '\n': sb_puts(o,"\\n"); break;
+            case '\r': sb_puts(o,"\\r"); break;
+            case '\t': sb_puts(o,"\\t"); break;
+            case '\b': sb_puts(o,"\\b"); break;
+            case '\f': sb_puts(o,"\\f"); break;
+            default:
+                if(c<0x20){ char u[8]; snprintf(u,sizeof u,"\\u%04x",c); sb_puts(o,u); }
+                else sb_putc(o,(char)c);
+        }
+    }
+    sb_putc(o,'"');
+}
+static void json_indent(SBuf *o,int pretty,int depth){
+    if(!pretty) return;
+    sb_putc(o,'\n');
+    for(int i=0;i<depth;i++) sb_puts(o,"  ");
+}
+static int table_is_seq(Table *t){ return t->alen>0 && t->ecount==0; }
+
+static void json_encode_val(Value v,SBuf *o,int pretty,int depth){
+    char nb[64];
+    if(depth>100) luc_error("json.encode: nested too deeply");
+    switch(v.t){
+        case LT_NIL:  sb_puts(o,"null"); return;
+        case LT_BOOL: sb_puts(o,v.u.b?"true":"false"); return;
+        case LT_NUM:
+            if(v.u.n!=v.u.n||v.u.n==HUGE_VAL||v.u.n==-HUGE_VAL)
+                luc_error("json.encode: cannot encode nan/inf");
+            num2str(v.u.n,nb,sizeof nb); sb_puts(o,nb); return;
+        case LT_STR: json_str(o,AS_STR(v)); return;
+        case LT_LIST: case LT_TABLE: break;
+        default: luc_error("json.encode: cannot encode %s",type_name(v));
+    }
+    Table *t=AS_TAB(v);
+    if(v.t==LT_LIST || table_is_seq(t)){
+        int n=(v.t==LT_LIST)?t->alen:tab_len(t);
+        if(n==0){ sb_puts(o,"[]"); return; }
+        sb_putc(o,'[');
+        for(int i=1;i<=n;i++){
+            if(i>1) sb_putc(o,',');
+            json_indent(o,pretty,depth+1);
+            json_encode_val(tab_get(t,mknum((double)i)),o,pretty,depth+1);
+        }
+        json_indent(o,pretty,depth); sb_putc(o,']');
+        return;
+    }
+    int cap=16,n=0; Str **keys=(Str**)lmalloc(sizeof(Str*)*(size_t)cap);
+    Value k=NIL,val;
+    while(tab_next(t,k,&k,&val)){
+        if(k.t!=LT_STR && k.t!=LT_NUM) continue;
+        if(n==cap){ cap*=2; keys=(Str**)lrealloc(keys,sizeof(Str*)*(size_t)cap); }
+        keys[n++]=tostr(k);
+    }
+    for(int i=1;i<n;i++){
+        Str *key=keys[i]; int j=i-1;
+        while(j>=0 && strcmp(keys[j]->s,key->s)>0){ keys[j+1]=keys[j]; j--; }
+        keys[j+1]=key;
+    }
+    if(n==0){ free(keys); sb_puts(o,"{}"); return; }
+    sb_putc(o,'{');
+    for(int i=0;i<n;i++){
+        if(i) sb_putc(o,',');
+        json_indent(o,pretty,depth+1);
+        json_str(o,keys[i]);
+        sb_putc(o,':'); if(pretty) sb_putc(o,' ');
+        json_encode_val(tab_get(t,mkobj(LT_STR,keys[i])),o,pretty,depth+1);
+    }
+    json_indent(o,pretty,depth); sb_putc(o,'}');
+    free(keys);
+}
+
+LFN(f_json_encode){ UNUSED_SELF;
+    int pretty=nargs>=2 && truthy(AR(1));
+    SBuf o; sb_init(&o);
+    json_encode_val(AR(0),&o,pretty,0);
+    RET(0,strv(o.b,(int)o.len));
+    free(o.b);
+    return 1;
+}
+
+typedef struct { const char *p,*end; int depth; } JParse;
+static Value json_parse(JParse *j);
+
+static Value json_parse_string(JParse *j){
+    j->p++;
+    SBuf o; sb_init(&o);
+    while(j->p<j->end && *j->p!='"'){
+        if(*j->p=='\\'){
+            j->p++;
+            if(j->p>=j->end) break;
+            char c=*j->p++;
+            switch(c){
+                case 'n': sb_putc(&o,'\n'); break; case 't': sb_putc(&o,'\t'); break;
+                case 'r': sb_putc(&o,'\r'); break; case 'b': sb_putc(&o,'\b'); break;
+                case 'f': sb_putc(&o,'\f'); break; case '/': sb_putc(&o,'/');   break;
+                case '"': sb_putc(&o,'"');   break; case '\\':sb_putc(&o,'\\'); break;
+                case 'u': {
+                    unsigned cp=0;
+                    for(int i=0;i<4 && j->p<j->end;i++){
+                        int h=hexval((unsigned char)*j->p++);
+                        if(h<0){ free(o.b); luc_error("json.decode: bad \\u escape"); }
+                        cp=cp*16+(unsigned)h;
+                    }
+                    if(cp<0x80) sb_putc(&o,(char)cp);
+                    else if(cp<0x800){ sb_putc(&o,(char)(0xC0|(cp>>6))); sb_putc(&o,(char)(0x80|(cp&0x3F))); }
+                    else { sb_putc(&o,(char)(0xE0|(cp>>12))); sb_putc(&o,(char)(0x80|((cp>>6)&0x3F))); sb_putc(&o,(char)(0x80|(cp&0x3F))); }
+                    break; }
+                default: free(o.b); luc_error("json.decode: bad escape");
+            }
+        } else sb_putc(&o,*j->p++);
+    }
+    if(j->p>=j->end){ free(o.b); luc_error("json.decode: unterminated string"); }
+    j->p++;
+    Value v=strv(o.b,(int)o.len); free(o.b);
+    return v;
+}
+
+static void jskip(JParse *j){
+    while(j->p<j->end && (*j->p==' '||*j->p=='\t'||*j->p=='\n'||*j->p=='\r')) j->p++;
+}
+
+static Value json_parse(JParse *j){
+    jskip(j);
+    if(j->p>=j->end) luc_error("json.decode: unexpected end");
+    if(j->depth++>200) luc_error("json.decode: nested too deeply");
+    Value out=NIL;
+    char c=*j->p;
+    if(c=='{'){
+        Table *t=tab_new(0); out=mkobj(LT_TABLE,t);
+        j->p++; jskip(j);
+        if(j->p<j->end && *j->p=='}'){ j->p++; j->depth--; return out; }
+        for(;;){
+            jskip(j);
+            if(j->p>=j->end||*j->p!='"') luc_error("json.decode: expected key");
+            Value k=json_parse_string(j);
+            jskip(j);
+            if(j->p>=j->end||*j->p!=':') luc_error("json.decode: expected ':'");
+            j->p++;
+            Value v=json_parse(j);
+            if(v.t!=LT_NIL) tab_set(t,k,v);
+            jskip(j);
+            if(j->p<j->end&&*j->p==','){ j->p++; continue; }
+            if(j->p<j->end&&*j->p=='}'){ j->p++; break; }
+            luc_error("json.decode: expected ',' or '}'");
+        }
+    } else if(c=='['){
+        Table *t=tab_new(1); out=mkobj(LT_LIST,t);
+        j->p++; jskip(j);
+        if(j->p<j->end&&*j->p==']'){ j->p++; j->depth--; return out; }
+        for(;;){
+            list_push(t,json_parse(j));
+            jskip(j);
+            if(j->p<j->end&&*j->p==','){ j->p++; continue; }
+            if(j->p<j->end&&*j->p==']'){ j->p++; break; }
+            luc_error("json.decode: expected ',' or ']'");
+        }
+    } else if(c=='"'){
+        out=json_parse_string(j);
+    } else if(!strncmp(j->p,"true",4)&&j->end-j->p>=4){ out=mkbool(1); j->p+=4; }
+      else if(!strncmp(j->p,"false",5)&&j->end-j->p>=5){ out=mkbool(0); j->p+=5; }
+      else if(!strncmp(j->p,"null",4)&&j->end-j->p>=4){ out=NIL; j->p+=4; }
+      else {
+        char *endp; double d=strtod(j->p,&endp);
+        if(endp==j->p) luc_error("json.decode: unexpected char '%c'",c);
+        out=mknum(d); j->p=endp;
+    }
+    j->depth--;
+    return out;
+}
+
+LFN(f_json_decode){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"decode");
+    JParse j; j.p=s->s; j.end=s->s+s->len; j.depth=0;
+    Value v=json_parse(&j);
+    jskip(&j);
+    if(j.p!=j.end) luc_error("json.decode: trailing garbage");
+    RET(0,v); return 1;
+}
+
+static Value json_module(void){
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("encode"),mkobj(LT_CFUNC,cfunc_new(f_json_encode,"encode",0)));
+    tab_set(t,cstrv("decode"),mkobj(LT_CFUNC,cfunc_new(f_json_decode,"decode",0)));
+    return mkobj(LT_TABLE,t);
+}
+
+/* ==========================================================================
+** WINDOW LIBRARY (SDL2)   --   require("window")
+** ========================================================================== */
+
+static void reg(Table *t,const char *name,CFn fn);   /* fwd (defined in §15) */
+
+#ifdef LUC_WINDOW
+
+#define W_KEYS        SDL_NUM_SCANCODES
+#define W_IMGCACHE    64
+#define W_TXTCACHE    96
+#define W_FONTSLOTS   12
+#define W_MAXPOLY     256
+
+typedef struct { char path[512]; SDL_Texture *tex; int w,h; unsigned age; } WImg;
+typedef struct { char txt[64]; int size; Uint32 col; SDL_Texture *tex;
+                 int w,h; unsigned age; } WTxt;
+#ifndef LUC_NO_TTF
+typedef struct { int size; TTF_Font *f; unsigned age; } WFont;
+#endif
+
+static struct {
+    SDL_Window   *win;
+    SDL_Renderer *ren;
+    int w,h;
+    int running, started;
+    Uint32 last_frame;
+    int target_fps;
+    double start_time, delta;
+    Uint8 keys_prev[W_KEYS], keys_curr[W_KEYS];
+    int mouse_x, mouse_y;
+    Uint32 mouse_state, mouse_prev;
+    int wheel_dy, wheel_dx;
+    int vsync, fullscreen;
+    unsigned clock;
+    char textbuf[256]; int textlen;
+    WImg img[W_IMGCACHE];
+    WTxt txt[W_TXTCACHE];
+#ifndef LUC_NO_TTF
+    int   ttf_ok;
+    char  fontpath[512];
+    int   fontsize;
+    WFont fonts[W_FONTSLOTS];
+#endif
+} W;
+
+/* ---- embedded 5x7 fallback font (ASCII 32..126, column major, LSB = top) - */
+static const unsigned char W_FONT5x7[95][5] = {
+{0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
+{0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
+{0x36,0x49,0x55,0x22,0x50},{0x00,0x05,0x03,0x00,0x00},{0x00,0x1C,0x22,0x41,0x00},
+{0x00,0x41,0x22,0x1C,0x00},{0x14,0x08,0x3E,0x08,0x14},{0x08,0x08,0x3E,0x08,0x08},
+{0x00,0x50,0x30,0x00,0x00},{0x08,0x08,0x08,0x08,0x08},{0x00,0x60,0x60,0x00,0x00},
+{0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},{0x00,0x42,0x7F,0x40,0x00},
+{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},{0x18,0x14,0x12,0x7F,0x10},
+{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},{0x01,0x71,0x09,0x05,0x03},
+{0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},{0x00,0x36,0x36,0x00,0x00},
+{0x00,0x56,0x36,0x00,0x00},{0x08,0x14,0x22,0x41,0x00},{0x14,0x14,0x14,0x14,0x14},
+{0x00,0x41,0x22,0x14,0x08},{0x02,0x01,0x51,0x09,0x06},{0x32,0x49,0x79,0x41,0x3E},
+{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},{0x3E,0x41,0x41,0x41,0x22},
+{0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},{0x7F,0x09,0x09,0x09,0x01},
+{0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},{0x00,0x41,0x7F,0x41,0x00},
+{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},{0x7F,0x40,0x40,0x40,0x40},
+{0x7F,0x02,0x0C,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},{0x3E,0x41,0x41,0x41,0x3E},
+{0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},{0x7F,0x09,0x19,0x29,0x46},
+{0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},{0x3F,0x40,0x40,0x40,0x3F},
+{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},{0x63,0x14,0x08,0x14,0x63},
+{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},{0x00,0x7F,0x41,0x41,0x00},
+{0x02,0x04,0x08,0x10,0x20},{0x00,0x41,0x41,0x7F,0x00},{0x04,0x02,0x01,0x02,0x04},
+{0x40,0x40,0x40,0x40,0x40},{0x00,0x01,0x02,0x04,0x00},{0x20,0x54,0x54,0x54,0x78},
+{0x7F,0x48,0x44,0x44,0x38},{0x38,0x44,0x44,0x44,0x20},{0x38,0x44,0x44,0x48,0x7F},
+{0x38,0x54,0x54,0x54,0x18},{0x08,0x7E,0x09,0x01,0x02},{0x0C,0x52,0x52,0x52,0x3E},
+{0x7F,0x08,0x04,0x04,0x78},{0x00,0x44,0x7D,0x40,0x00},{0x20,0x40,0x44,0x3D,0x00},
+{0x7F,0x10,0x28,0x44,0x00},{0x00,0x41,0x7F,0x40,0x00},{0x7C,0x04,0x18,0x04,0x78},
+{0x7C,0x08,0x04,0x04,0x78},{0x38,0x44,0x44,0x44,0x38},{0x7C,0x14,0x14,0x14,0x08},
+{0x08,0x14,0x14,0x18,0x7C},{0x7C,0x08,0x04,0x04,0x08},{0x48,0x54,0x54,0x54,0x20},
+{0x04,0x3F,0x44,0x40,0x20},{0x3C,0x40,0x40,0x20,0x7C},{0x1C,0x20,0x40,0x20,0x1C},
+{0x3C,0x40,0x30,0x40,0x3C},{0x44,0x28,0x10,0x28,0x44},{0x0C,0x50,0x50,0x50,0x3C},
+{0x44,0x64,0x54,0x4C,0x44},{0x00,0x08,0x36,0x41,0x00},{0x00,0x00,0x7F,0x00,0x00},
+{0x00,0x41,0x36,0x08,0x00},{0x08,0x08,0x2A,0x1C,0x08}
+};
+
+/* ---- helpers ------------------------------------------------------------ */
+static void w_need(void){
+    if(!W.started || !W.ren)
+        luc_error("window: call window.start(title,w,h) first");
+}
+
+typedef struct { const char *name; Uint8 r,g,b,a; } WNamed;
+static const WNamed W_COLORS[] = {
+    {"black",0,0,0,255},          {"white",255,255,255,255},
+    {"red",255,0,0,255},          {"green",0,200,60,255},
+    {"lime",0,255,0,255},         {"blue",40,90,255,255},
+    {"navy",0,0,128,255},         {"yellow",255,235,60,255},
+    {"orange",255,150,0,255},     {"purple",160,60,220,255},
+    {"magenta",255,0,255,255},    {"pink",255,120,190,255},
+    {"gray",128,128,128,255},     {"grey",128,128,128,255},
+    {"lightgray",200,200,200,255},{"darkgray",60,60,60,255},
+    {"cyan",0,225,255,255},       {"teal",0,128,128,255},
+    {"brown",139,90,43,255},      {"gold",255,205,0,255},
+    {"silver",192,192,192,255},   {"maroon",128,0,0,255},
+    {"olive",128,128,0,255},      {"transparent",0,0,0,0},
+    {NULL,0,0,0,0}
+};
+
+static int w_hex2(const char *s){
+    int a=hexval((unsigned char)s[0]), b=hexval((unsigned char)s[1]);
+    if(a<0||b<0) return -1;
+    return a*16+b;
+}
+static SDL_Color w_color(Value v){
+    SDL_Color c; c.r=255; c.g=255; c.b=255; c.a=255;
+    if(v.t==LT_NIL) return c;
+    if(v.t==LT_NUM){
+        unsigned long u=(unsigned long)(long long)v.u.n;
+        c.r=(Uint8)((u>>16)&255); c.g=(Uint8)((u>>8)&255); c.b=(Uint8)(u&255);
+        return c;
+    }
+    if(v.t==LT_TABLE||v.t==LT_LIST){
+        Table *t=AS_TAB(v);
+        Value r=tab_get(t,mknum(1)), g=tab_get(t,mknum(2));
+        Value b=tab_get(t,mknum(3)), a=tab_get(t,mknum(4));
+        if(r.t==LT_NIL){ r=tab_get(t,cstrv("r")); g=tab_get(t,cstrv("g"));
+                         b=tab_get(t,cstrv("b")); a=tab_get(t,cstrv("a")); }
+        c.r=(Uint8)(r.t==LT_NUM?r.u.n:0);
+        c.g=(Uint8)(g.t==LT_NUM?g.u.n:0);
+        c.b=(Uint8)(b.t==LT_NUM?b.u.n:0);
+        c.a=(Uint8)(a.t==LT_NUM?a.u.n:255);
+        return c;
+    }
+    if(v.t==LT_STR){
+        Str *s=AS_STR(v);
+        const char *p=s->s; int len=s->len;
+        if(len>0 && p[0]=='#'){ p++; len--; }
+        else if(len>1 && p[0]=='0' && (p[1]=='x'||p[1]=='X')){ p+=2; len-=2; }
+        else {
+            for(int i=0;W_COLORS[i].name;i++)
+                if(strcmp(W_COLORS[i].name,p)==0){
+                    c.r=W_COLORS[i].r; c.g=W_COLORS[i].g;
+                    c.b=W_COLORS[i].b; c.a=W_COLORS[i].a;
+                    return c;
+                }
+            luc_error("window: unknown color '%s'",p);
+        }
+        if(len==3){
+            int r=hexval((unsigned char)p[0]),g=hexval((unsigned char)p[1]),
+                b=hexval((unsigned char)p[2]);
+            if(r<0||g<0||b<0) luc_error("window: bad hex color");
+            c.r=(Uint8)(r*17); c.g=(Uint8)(g*17); c.b=(Uint8)(b*17);
+            return c;
+        }
+        if(len==6||len==8){
+            int r=w_hex2(p),g=w_hex2(p+2),b=w_hex2(p+4);
+            if(r<0||g<0||b<0) luc_error("window: bad hex color");
+            c.r=(Uint8)r; c.g=(Uint8)g; c.b=(Uint8)b;
+            if(len==8){ int a=w_hex2(p+6); if(a<0) luc_error("window: bad hex color");
+                        c.a=(Uint8)a; }
+            return c;
+        }
+        luc_error("window: bad color string '%s'",s->s);
+    }
+    luc_error("window: color must be a string, table or number (got %s)",type_name(v));
+    return c;
+}
+static Value w_argc(LucState *L,int base,int nargs,int i){
+    return i<nargs? L->stack[base+i] : NIL;
+}
+static void w_setcolor(SDL_Color c){
+    SDL_SetRenderDrawBlendMode(W.ren,SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(W.ren,c.r,c.g,c.b,c.a);
+}
+
+/* ---- key names ---------------------------------------------------------- */
+static int w_scancodes(const char *n,SDL_Scancode *out){
+    size_t len=strlen(n);
+    if(len==1){
+        char c=(char)tolower((unsigned char)n[0]);
+        if(c>='a'&&c<='z'){ out[0]=(SDL_Scancode)(SDL_SCANCODE_A+(c-'a')); return 1; }
+        if(c>='1'&&c<='9'){ out[0]=(SDL_Scancode)(SDL_SCANCODE_1+(c-'1')); return 1; }
+        if(c=='0'){ out[0]=SDL_SCANCODE_0; return 1; }
+        switch(c){
+            case ' ': out[0]=SDL_SCANCODE_SPACE; return 1;
+            case '-': out[0]=SDL_SCANCODE_MINUS; return 1;
+            case '=': out[0]=SDL_SCANCODE_EQUALS; return 1;
+            case '[': out[0]=SDL_SCANCODE_LEFTBRACKET; return 1;
+            case ']': out[0]=SDL_SCANCODE_RIGHTBRACKET; return 1;
+            case ';': out[0]=SDL_SCANCODE_SEMICOLON; return 1;
+            case '\'':out[0]=SDL_SCANCODE_APOSTROPHE; return 1;
+            case ',': out[0]=SDL_SCANCODE_COMMA; return 1;
+            case '.': out[0]=SDL_SCANCODE_PERIOD; return 1;
+            case '/': out[0]=SDL_SCANCODE_SLASH; return 1;
+            case '\\':out[0]=SDL_SCANCODE_BACKSLASH; return 1;
+            case '`': out[0]=SDL_SCANCODE_GRAVE; return 1;
+        }
+    }
+    if((n[0]=='f'||n[0]=='F') && isdigit((unsigned char)n[1])){
+        int k=atoi(n+1);
+        if(k>=1&&k<=12){ out[0]=(SDL_Scancode)(SDL_SCANCODE_F1+k-1); return 1; }
+    }
+    #define KA(s,c) if(strcmp(n,s)==0){ out[0]=c; return 1; }
+    KA("space",SDL_SCANCODE_SPACE) KA("enter",SDL_SCANCODE_RETURN)
+    KA("return",SDL_SCANCODE_RETURN) KA("escape",SDL_SCANCODE_ESCAPE)
+    KA("esc",SDL_SCANCODE_ESCAPE) KA("tab",SDL_SCANCODE_TAB)
+    KA("backspace",SDL_SCANCODE_BACKSPACE) KA("delete",SDL_SCANCODE_DELETE)
+    KA("insert",SDL_SCANCODE_INSERT) KA("home",SDL_SCANCODE_HOME)
+    KA("end",SDL_SCANCODE_END) KA("pageup",SDL_SCANCODE_PAGEUP)
+    KA("pagedown",SDL_SCANCODE_PAGEDOWN) KA("capslock",SDL_SCANCODE_CAPSLOCK)
+    KA("up",SDL_SCANCODE_UP) KA("down",SDL_SCANCODE_DOWN)
+    KA("left",SDL_SCANCODE_LEFT) KA("right",SDL_SCANCODE_RIGHT)
+    #undef KA
+    #define K2(s,a,b) if(strcmp(n,s)==0){ out[0]=a; out[1]=b; return 2; }
+    K2("shift",SDL_SCANCODE_LSHIFT,SDL_SCANCODE_RSHIFT)
+    K2("ctrl",SDL_SCANCODE_LCTRL,SDL_SCANCODE_RCTRL)
+    K2("control",SDL_SCANCODE_LCTRL,SDL_SCANCODE_RCTRL)
+    K2("alt",SDL_SCANCODE_LALT,SDL_SCANCODE_RALT)
+    K2("super",SDL_SCANCODE_LGUI,SDL_SCANCODE_RGUI)
+    K2("win",SDL_SCANCODE_LGUI,SDL_SCANCODE_RGUI)
+    K2("cmd",SDL_SCANCODE_LGUI,SDL_SCANCODE_RGUI)
+    #undef K2
+    { SDL_Scancode sc=SDL_GetScancodeFromName(n);
+      if(sc!=SDL_SCANCODE_UNKNOWN){ out[0]=sc; return 1; } }
+    luc_error("window: unknown key name '%s'",n);
+    return 0;
+}
+
+/* ---- fonts -------------------------------------------------------------- */
+#ifndef LUC_NO_TTF
+static const char *W_FONTPATHS[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "C:\\Windows\\Fonts\\segoeui.ttf",
+    "C:\\Windows\\Fonts\\arial.ttf",
+    "C:\\Windows\\Fonts\\consola.ttf",
+    NULL
+};
+static void w_find_font(void){
+    if(W.fontpath[0]) return;
+    for(int i=0;W_FONTPATHS[i];i++){
+        FILE *f=fopen(W_FONTPATHS[i],"rb");
+        if(f){ fclose(f); snprintf(W.fontpath,sizeof W.fontpath,"%s",W_FONTPATHS[i]); return; }
+    }
+}
+static TTF_Font *w_font(int size){
+    if(!W.ttf_ok || !W.fontpath[0]) return NULL;
+    if(size<4) size=4; if(size>256) size=256;
+    for(int i=0;i<W_FONTSLOTS;i++)
+        if(W.fonts[i].f && W.fonts[i].size==size){ W.fonts[i].age=++W.clock; return W.fonts[i].f; }
+    TTF_Font *f=TTF_OpenFont(W.fontpath,size);
+    if(!f) return NULL;
+    int slot=-1;
+    for(int i=0;i<W_FONTSLOTS;i++) if(!W.fonts[i].f){ slot=i; break; }
+    if(slot<0){ slot=0;
+        for(int i=1;i<W_FONTSLOTS;i++) if(W.fonts[i].age<W.fonts[slot].age) slot=i;
+        TTF_CloseFont(W.fonts[slot].f); }
+    W.fonts[slot].f=f; W.fonts[slot].size=size; W.fonts[slot].age=++W.clock;
+    return f;
+}
+static void w_drop_fonts(void){
+    for(int i=0;i<W_FONTSLOTS;i++){ if(W.fonts[i].f) TTF_CloseFont(W.fonts[i].f);
+                                    W.fonts[i].f=NULL; W.fonts[i].size=0; }
+}
+#endif
+
+/* ---- texture caches ------------------------------------------------------ */
+static void w_drop_text_cache(void){
+    for(int i=0;i<W_TXTCACHE;i++){
+        if(W.txt[i].tex) SDL_DestroyTexture(W.txt[i].tex);
+        W.txt[i].tex=NULL; W.txt[i].txt[0]=0;
+    }
+}
+static void w_drop_img_cache(void){
+    for(int i=0;i<W_IMGCACHE;i++){
+        if(W.img[i].tex) SDL_DestroyTexture(W.img[i].tex);
+        W.img[i].tex=NULL; W.img[i].path[0]=0;
+    }
+}
+static SDL_Texture *w_image(const char *path,int *ow,int *oh){
+    for(int i=0;i<W_IMGCACHE;i++)
+        if(W.img[i].tex && strcmp(W.img[i].path,path)==0){
+            W.img[i].age=++W.clock;
+            if(ow)*ow=W.img[i].w; if(oh)*oh=W.img[i].h;
+            return W.img[i].tex;
+        }
+    SDL_Surface *s;
+#ifndef LUC_NO_IMAGE
+    s=IMG_Load(path);
+#else
+    s=SDL_LoadBMP(path);
+#endif
+    if(!s) return NULL;
+    int iw=s->w, ih=s->h;
+    SDL_Texture *t=SDL_CreateTextureFromSurface(W.ren,s);
+    SDL_FreeSurface(s);
+    if(!t) return NULL;
+    SDL_SetTextureBlendMode(t,SDL_BLENDMODE_BLEND);
+    int slot=-1;
+    for(int i=0;i<W_IMGCACHE;i++) if(!W.img[i].tex){ slot=i; break; }
+    if(slot<0){ slot=0;
+        for(int i=1;i<W_IMGCACHE;i++) if(W.img[i].age<W.img[slot].age) slot=i;
+        SDL_DestroyTexture(W.img[slot].tex); }
+    snprintf(W.img[slot].path,sizeof W.img[slot].path,"%s",path);
+    W.img[slot].tex=t; W.img[slot].w=iw; W.img[slot].h=ih; W.img[slot].age=++W.clock;
+    if(ow)*ow=iw; if(oh)*oh=ih;
+    return t;
+}
+
+/* ---- text rendering ------------------------------------------------------ */
+static void w_bitmap_text(const char *s,int len,int x,int y,SDL_Color c,int size){
+    int scale=size/8; if(scale<1) scale=1;
+    w_setcolor(c);
+    int cx=x;
+    for(int i=0;i<len;i++){
+        unsigned char ch=(unsigned char)s[i];
+        if(ch=='\n'){ cx=x; y+=8*scale; continue; }
+        if(ch<32||ch>126){ cx+=6*scale; continue; }
+        const unsigned char *g=W_FONT5x7[ch-32];
+        for(int col=0;col<5;col++){
+            for(int row=0;row<7;row++){
+                if(g[col]&(1u<<row)){
+                    SDL_Rect r; r.x=cx+col*scale; r.y=y+row*scale;
+                    r.w=scale; r.h=scale;
+                    SDL_RenderFillRect(W.ren,&r);
+                }
+            }
+        }
+        cx+=6*scale;
+    }
+}
+static void w_bitmap_size(const char *s,int len,int size,int *ow,int *oh){
+    int scale=size/8; if(scale<1) scale=1;
+    int line=0,best=0,rows=1;
+    for(int i=0;i<len;i++){
+        if(s[i]=='\n'){ if(line>best) best=line; line=0; rows++; }
+        else line++;
+    }
+    if(line>best) best=line;
+    *ow=best*6*scale; *oh=rows*8*scale;
+}
+static void w_text(const char *s,int len,int x,int y,SDL_Color c,int size){
+#ifndef LUC_NO_TTF
+    TTF_Font *f=w_font(size);
+    if(f){
+        Uint32 key=((Uint32)c.r<<24)|((Uint32)c.g<<16)|((Uint32)c.b<<8)|c.a;
+        SDL_Texture *tex=NULL; int tw=0,th=0;
+        int cacheable = (len<63);
+        if(cacheable){
+            for(int i=0;i<W_TXTCACHE;i++)
+                if(W.txt[i].tex && W.txt[i].size==size && W.txt[i].col==key
+                   && strcmp(W.txt[i].txt,s)==0){
+                    W.txt[i].age=++W.clock;
+                    tex=W.txt[i].tex; tw=W.txt[i].w; th=W.txt[i].h; break;
+                }
+        }
+        if(!tex){
+            SDL_Surface *sf=TTF_RenderUTF8_Blended(f,s,c);
+            if(!sf) return;
+            tw=sf->w; th=sf->h;
+            tex=SDL_CreateTextureFromSurface(W.ren,sf);
+            SDL_FreeSurface(sf);
+            if(!tex) return;
+            SDL_SetTextureBlendMode(tex,SDL_BLENDMODE_BLEND);
+            if(cacheable){
+                int slot=-1;
+                for(int i=0;i<W_TXTCACHE;i++) if(!W.txt[i].tex){ slot=i; break; }
+                if(slot<0){ slot=0;
+                    for(int i=1;i<W_TXTCACHE;i++) if(W.txt[i].age<W.txt[slot].age) slot=i;
+                    SDL_DestroyTexture(W.txt[slot].tex); }
+                snprintf(W.txt[slot].txt,sizeof W.txt[slot].txt,"%s",s);
+                W.txt[slot].size=size; W.txt[slot].col=key;
+                W.txt[slot].tex=tex; W.txt[slot].w=tw; W.txt[slot].h=th;
+                W.txt[slot].age=++W.clock;
+            } else {
+                SDL_Rect d; d.x=x; d.y=y; d.w=tw; d.h=th;
+                SDL_RenderCopy(W.ren,tex,NULL,&d);
+                SDL_DestroyTexture(tex);
+                return;
+            }
+        }
+        { SDL_Rect d; d.x=x; d.y=y; d.w=tw; d.h=th;
+          SDL_RenderCopy(W.ren,tex,NULL,&d); }
+        return;
+    }
+#endif
+    w_bitmap_text(s,len,x,y,c,size);
+}
+
+/* ---- geometry ------------------------------------------------------------ */
+static void w_fill_circle(int cx,int cy,int r){
+    if(r<0) return;
+    for(int dy=-r;dy<=r;dy++){
+        int dx=(int)(sqrt((double)r*(double)r-(double)dy*(double)dy)+0.5);
+        SDL_RenderDrawLine(W.ren,cx-dx,cy+dy,cx+dx,cy+dy);
+    }
+}
+static void w_circle_outline(int cx,int cy,int r){
+    int x=r,y=0,err=1-r;
+    while(x>=y){
+        SDL_RenderDrawPoint(W.ren,cx+x,cy+y); SDL_RenderDrawPoint(W.ren,cx+y,cy+x);
+        SDL_RenderDrawPoint(W.ren,cx-y,cy+x); SDL_RenderDrawPoint(W.ren,cx-x,cy+y);
+        SDL_RenderDrawPoint(W.ren,cx-x,cy-y); SDL_RenderDrawPoint(W.ren,cx-y,cy-x);
+        SDL_RenderDrawPoint(W.ren,cx+y,cy-x); SDL_RenderDrawPoint(W.ren,cx+x,cy-y);
+        y++;
+        if(err<0) err+=2*y+1;
+        else { x--; err+=2*(y-x)+1; }
+    }
+}
+static void w_fill_poly(const double *pts,int n){
+    if(n<3) return;
+    double miny=pts[1],maxy=pts[1];
+    for(int i=1;i<n;i++){ if(pts[i*2+1]<miny) miny=pts[i*2+1];
+                          if(pts[i*2+1]>maxy) maxy=pts[i*2+1]; }
+    double xs[W_MAXPOLY];
+    for(int y=(int)floor(miny);y<=(int)ceil(maxy);y++){
+        int cnt=0;
+        double yy=y+0.5;
+        for(int i=0,j=n-1;i<n;j=i++){
+            double y1=pts[j*2+1], y2=pts[i*2+1];
+            if((y1<=yy && y2>yy)||(y2<=yy && y1>yy)){
+                double t=(yy-y1)/(y2-y1);
+                if(cnt<W_MAXPOLY) xs[cnt++]=pts[j*2]+t*(pts[i*2]-pts[j*2]);
+            }
+        }
+        for(int a=1;a<cnt;a++){ double k=xs[a]; int b=a-1;
+            while(b>=0&&xs[b]>k){ xs[b+1]=xs[b]; b--; } xs[b+1]=k; }
+        for(int a=0;a+1<cnt;a+=2)
+            SDL_RenderDrawLine(W.ren,(int)(xs[a]+0.5),y,(int)(xs[a+1]+0.5),y);
+    }
+}
+
+/* ---- lifecycle ----------------------------------------------------------- */
+static void w_shutdown(void){
+    if(!W.started) return;
+    w_drop_text_cache();
+    w_drop_img_cache();
+#ifndef LUC_NO_TTF
+    w_drop_fonts();
+#endif
+    if(W.ren){ SDL_DestroyRenderer(W.ren); W.ren=NULL; }
+    if(W.win){ SDL_DestroyWindow(W.win); W.win=NULL; }
+    W.started=0; W.running=0;
+}
+static void w_atexit(void){ w_shutdown(); }
+
+/* ==========================  LUC-facing functions  ======================== */
+
+LFN(f_w_start){ UNUSED_SELF;
+    if(W.started) luc_error("window: already started");
+    const char *title = nargs>=1? checkstr(L,base,nargs,0,"start")->s : "LUC";
+    int ww = nargs>=2? checkint(L,base,nargs,1,"start") : 800;
+    int hh = nargs>=3? checkint(L,base,nargs,2,"start") : 600;
+    if(ww<1) ww=1; if(hh<1) hh=1;
+    W.win=SDL_CreateWindow(title,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
+                           ww,hh,SDL_WINDOW_SHOWN);
+    if(!W.win) luc_error("window: cannot create window (%s)",SDL_GetError());
+    W.ren=SDL_CreateRenderer(W.win,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
+    if(!W.ren) W.ren=SDL_CreateRenderer(W.win,-1,SDL_RENDERER_SOFTWARE);
+    if(!W.ren){ SDL_DestroyWindow(W.win); W.win=NULL;
+                luc_error("window: cannot create renderer (%s)",SDL_GetError()); }
+    SDL_SetRenderDrawBlendMode(W.ren,SDL_BLENDMODE_BLEND);
+    W.w=ww; W.h=hh; W.running=1; W.started=1; W.vsync=1;
+    W.target_fps=0; W.delta=1.0/60.0;
+    W.last_frame=SDL_GetTicks();
+    W.start_time=luc_now();
+    W.clock=0; W.wheel_dy=0; W.wheel_dx=0; W.textlen=0; W.textbuf[0]=0;
+    memset(W.keys_prev,0,sizeof W.keys_prev);
+    memset(W.keys_curr,0,sizeof W.keys_curr);
+    W.mouse_state=0; W.mouse_prev=0;
+    SDL_StartTextInput();
+#ifndef LUC_NO_TTF
+    W.fontsize=16; w_find_font();
+#endif
+    { static int once=0; if(!once){ once=1; atexit(w_atexit); } }
+    RET(0,mkbool(1)); return 1;
+}
+
+LFN(f_w_close){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
+    w_shutdown(); return 0;
+}
+
+LFN(f_w_running){ UNUSED_SELF; (void)base;(void)nargs;
+    if(!W.started){ RET(0,mkbool(0)); return 1; }
+    SDL_Event e;
+    while(SDL_PollEvent(&e)){
+        switch(e.type){
+            case SDL_QUIT: W.running=0; break;
+            case SDL_WINDOWEVENT:
+                if(e.window.event==SDL_WINDOWEVENT_CLOSE) W.running=0;
+                else if(e.window.event==SDL_WINDOWEVENT_SIZE_CHANGED||
+                        e.window.event==SDL_WINDOWEVENT_RESIZED){
+                    W.w=e.window.data1; W.h=e.window.data2;
+                }
+                break;
+            case SDL_MOUSEWHEEL:
+                W.wheel_dy+=e.wheel.y; W.wheel_dx+=e.wheel.x; break;
+            case SDL_TEXTINPUT: {
+                int n=(int)strlen(e.text.text);
+                if(W.textlen+n < (int)sizeof W.textbuf-1){
+                    memcpy(W.textbuf+W.textlen,e.text.text,(size_t)n);
+                    W.textlen+=n; W.textbuf[W.textlen]=0;
+                }
+                break; }
+            default: break;
+        }
+    }
+    { const Uint8 *ks=SDL_GetKeyboardState(NULL);
+      memcpy(W.keys_curr,ks,W_KEYS); }
+    W.mouse_state=SDL_GetMouseState(&W.mouse_x,&W.mouse_y);
+    SDL_GetWindowSize(W.win,&W.w,&W.h);
+    RET(0,mkbool(W.running)); return 1;
+}
+
+LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
+    w_need();
+    SDL_RenderPresent(W.ren);
+    Uint32 now=SDL_GetTicks();
+    if(W.target_fps>0){
+        Uint32 want=(Uint32)(1000/W.target_fps);
+        Uint32 el=now-W.last_frame;
+        if(el<want){ SDL_Delay(want-el); now=SDL_GetTicks(); }
+    }
+    double d=(double)(now-W.last_frame)/1000.0;
+    if(d<=0) d=0.0001; if(d>0.25) d=0.25;
+    W.delta=d; W.last_frame=now;
+    memcpy(W.keys_prev,W.keys_curr,W_KEYS);
+    W.mouse_prev=W.mouse_state;
+    W.wheel_dy=0; W.wheel_dx=0;
+    W.textlen=0; W.textbuf[0]=0;
+    W.clock++;
+    return 0;
+}
+
+LFN(f_w_title){ UNUSED_SELF;
+    w_need();
+    SDL_SetWindowTitle(W.win,checkstr(L,base,nargs,0,"title")->s);
+    return 0;
+}
+LFN(f_w_size){ UNUSED_SELF; (void)nargs;
+    w_need(); RET(0,mknum(W.w)); RET(1,mknum(W.h)); return 2;
+}
+LFN(f_w_resize){ UNUSED_SELF;
+    w_need();
+    int ww=checkint(L,base,nargs,0,"resize"), hh=checkint(L,base,nargs,1,"resize");
+    if(ww<1)ww=1; if(hh<1)hh=1;
+    SDL_SetWindowSize(W.win,ww,hh); W.w=ww; W.h=hh;
+    return 0;
+}
+LFN(f_w_quit){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    W.running=0; return 0;
+}
+
+/* ---- drawing ------------------------------------------------------------- */
+LFN(f_w_clear){ UNUSED_SELF;
+    w_need();
+    SDL_Color c = nargs>=1? w_color(w_argc(L,base,nargs,0)) : (SDL_Color){0,0,0,255};
+    SDL_SetRenderDrawBlendMode(W.ren,SDL_BLENDMODE_NONE);
+    SDL_SetRenderDrawColor(W.ren,c.r,c.g,c.b,255);
+    SDL_RenderClear(W.ren);
+    SDL_SetRenderDrawBlendMode(W.ren,SDL_BLENDMODE_BLEND);
+    return 0;
+}
+LFN(f_w_pixel){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"pixel"), y=checkint(L,base,nargs,1,"pixel");
+    w_setcolor(w_color(w_argc(L,base,nargs,2)));
+    SDL_RenderDrawPoint(W.ren,x,y); return 0;
+}
+LFN(f_w_line){ UNUSED_SELF;
+    w_need();
+    int x1=checkint(L,base,nargs,0,"line"), y1=checkint(L,base,nargs,1,"line");
+    int x2=checkint(L,base,nargs,2,"line"), y2=checkint(L,base,nargs,3,"line");
+    w_setcolor(w_color(w_argc(L,base,nargs,4)));
+    SDL_RenderDrawLine(W.ren,x1,y1,x2,y2); return 0;
+}
+LFN(f_w_rect){ UNUSED_SELF;
+    w_need();
+    SDL_Rect r;
+    r.x=checkint(L,base,nargs,0,"rect"); r.y=checkint(L,base,nargs,1,"rect");
+    r.w=checkint(L,base,nargs,2,"rect"); r.h=checkint(L,base,nargs,3,"rect");
+    w_setcolor(w_color(w_argc(L,base,nargs,4)));
+    SDL_RenderFillRect(W.ren,&r); return 0;
+}
+LFN(f_w_rect_outline){ UNUSED_SELF;
+    w_need();
+    SDL_Rect r;
+    r.x=checkint(L,base,nargs,0,"rect_outline"); r.y=checkint(L,base,nargs,1,"rect_outline");
+    r.w=checkint(L,base,nargs,2,"rect_outline"); r.h=checkint(L,base,nargs,3,"rect_outline");
+    w_setcolor(w_color(w_argc(L,base,nargs,4)));
+    int th = nargs>=6? checkint(L,base,nargs,5,"rect_outline") : 1;
+    for(int i=0;i<(th<1?1:th);i++){
+        SDL_Rect q; q.x=r.x+i; q.y=r.y+i; q.w=r.w-2*i; q.h=r.h-2*i;
+        if(q.w<=0||q.h<=0) break;
+        SDL_RenderDrawRect(W.ren,&q);
+    }
+    return 0;
+}
+LFN(f_w_circle){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"circle"), y=checkint(L,base,nargs,1,"circle");
+    int r=checkint(L,base,nargs,2,"circle");
+    w_setcolor(w_color(w_argc(L,base,nargs,3)));
+    w_fill_circle(x,y,r); return 0;
+}
+LFN(f_w_circle_outline){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"circle_outline"), y=checkint(L,base,nargs,1,"circle_outline");
+    int r=checkint(L,base,nargs,2,"circle_outline");
+    w_setcolor(w_color(w_argc(L,base,nargs,3)));
+    w_circle_outline(x,y,r); return 0;
+}
+LFN(f_w_triangle){ UNUSED_SELF;
+    w_need();
+    double p[6];
+    for(int i=0;i<6;i++) p[i]=checknum(L,base,nargs,i,"triangle");
+    w_setcolor(w_color(w_argc(L,base,nargs,6)));
+    w_fill_poly(p,3); return 0;
+}
+LFN(f_w_polygon){ UNUSED_SELF;
+    w_need();
+    Table *t=checktab(L,base,nargs,0,"polygon");
+    int n=t->o.type==LT_LIST? t->alen : tab_len(t);
+    if(n<6 || (n&1)) luc_error("window.polygon: need a flat list [x1,y1,x2,y2,...]");
+    int np=n/2; if(np>W_MAXPOLY) np=W_MAXPOLY;
+    double *p=(double*)lmalloc(sizeof(double)*(size_t)np*2);
+    for(int i=0;i<np*2;i++){
+        Value v=tab_get(t,mknum((double)(i+1)));
+        p[i]= v.t==LT_NUM? v.u.n : 0;
+    }
+    w_setcolor(w_color(w_argc(L,base,nargs,1)));
+    int outline = nargs>=3 && truthy(w_argc(L,base,nargs,2));
+    if(outline){
+        for(int i=0;i<np;i++){
+            int j=(i+1)%np;
+            SDL_RenderDrawLine(W.ren,(int)p[i*2],(int)p[i*2+1],(int)p[j*2],(int)p[j*2+1]);
+        }
+    } else w_fill_poly(p,np);
+    free(p);
+    return 0;
+}
+LFN(f_w_text){ UNUSED_SELF;
+    w_need();
+    Str *s=checkstr(L,base,nargs,0,"text");
+    int x=checkint(L,base,nargs,1,"text"), y=checkint(L,base,nargs,2,"text");
+    SDL_Color c=w_color(w_argc(L,base,nargs,3));
+    int size = nargs>=5? checkint(L,base,nargs,4,"text") : 16;
+#ifndef LUC_NO_TTF
+    if(nargs<5) size=W.fontsize;
+#endif
+    if(size<4) size=4;
+    w_text(s->s,s->len,x,y,c,size);
+    return 0;
+}
+LFN(f_w_text_size){ UNUSED_SELF;
+    Str *s=checkstr(L,base,nargs,0,"text_size");
+    int size = nargs>=2? checkint(L,base,nargs,1,"text_size") : 16;
+#ifndef LUC_NO_TTF
+    if(nargs<2) size=W.fontsize;
+    { TTF_Font *f=w_font(size);
+      if(f){ int tw=0,th=0; TTF_SizeUTF8(f,s->s,&tw,&th);
+             RET(0,mknum(tw)); RET(1,mknum(th)); return 2; } }
+#endif
+    { int tw,th; w_bitmap_size(s->s,s->len,size,&tw,&th);
+      RET(0,mknum(tw)); RET(1,mknum(th)); }
+    return 2;
+}
+LFN(f_w_font){ UNUSED_SELF;
+#ifdef LUC_NO_TTF
+    (void)L;(void)base;(void)nargs;
+    RET(0,mkbool(0)); RET(1,cstrv("built without SDL2_ttf")); return 2;
+#else
+    if(nargs>=1 && w_argc(L,base,nargs,0).t==LT_STR){
+        Str *p=checkstr(L,base,nargs,0,"font");
+        FILE *fp=fopen(p->s,"rb");
+        if(!fp){ RET(0,mkbool(0)); RET(1,cstrv("cannot open font file")); return 2; }
+        fclose(fp);
+        w_drop_fonts(); w_drop_text_cache();
+        snprintf(W.fontpath,sizeof W.fontpath,"%s",p->s);
+    }
+    if(nargs>=2) W.fontsize=checkint(L,base,nargs,1,"font");
+    else if(nargs==1 && w_argc(L,base,nargs,0).t==LT_NUM)
+        W.fontsize=checkint(L,base,nargs,0,"font");
+    if(W.fontsize<4) W.fontsize=4;
+    RET(0,mkbool(1)); return 1;
+#endif
+}
+LFN(f_w_image){ UNUSED_SELF;
+    w_need();
+    Str *p=checkstr(L,base,nargs,0,"image");
+    int x=checkint(L,base,nargs,1,"image"), y=checkint(L,base,nargs,2,"image");
+    int iw=0,ih=0;
+    SDL_Texture *t=w_image(p->s,&iw,&ih);
+    if(!t){
+#ifndef LUC_NO_IMAGE
+        luc_error("window.image: cannot load '%s' (%s)",p->s,IMG_GetError());
+#else
+        luc_error("window.image: cannot load '%s' (built without SDL2_image; "
+                  "only .bmp is supported)",p->s);
+#endif
+    }
+    SDL_Rect d; d.x=x; d.y=y;
+    d.w = nargs>=4? checkint(L,base,nargs,3,"image") : iw;
+    d.h = nargs>=5? checkint(L,base,nargs,4,"image") : ih;
+    if(nargs>=6){
+        double ang=checknum(L,base,nargs,5,"image");
+        SDL_RenderCopyEx(W.ren,t,NULL,&d,ang,NULL,SDL_FLIP_NONE);
+    } else SDL_RenderCopy(W.ren,t,NULL,&d);
+    return 0;
+}
+LFN(f_w_image_size){ UNUSED_SELF;
+    w_need();
+    Str *p=checkstr(L,base,nargs,0,"image_size");
+    int iw=0,ih=0;
+    if(!w_image(p->s,&iw,&ih)){ RET(0,NIL); RET(1,cstrv("cannot load image")); return 2; }
+    RET(0,mknum(iw)); RET(1,mknum(ih)); return 2;
+}
+LFN(f_w_clip){ UNUSED_SELF;
+    w_need();
+    if(nargs==0){ SDL_RenderSetClipRect(W.ren,NULL); return 0; }
+    SDL_Rect r;
+    r.x=checkint(L,base,nargs,0,"clip"); r.y=checkint(L,base,nargs,1,"clip");
+    r.w=checkint(L,base,nargs,2,"clip"); r.h=checkint(L,base,nargs,3,"clip");
+    SDL_RenderSetClipRect(W.ren,&r); return 0;
+}
+
+/* ---- input --------------------------------------------------------------- */
+static int w_keystate(LucState *L,int base,int nargs,int mode){
+    const char *n=checkstr(L,base,nargs,0,"key")->s;
+    SDL_Scancode sc[2]; int k=w_scancodes(n,sc);
+    for(int i=0;i<k;i++){
+        int cur=W.keys_curr[sc[i]], prv=W.keys_prev[sc[i]];
+        if(mode==0 && cur) return 1;
+        if(mode==1 && cur && !prv) return 1;
+        if(mode==2 && !cur && prv) return 1;
+    }
+    return 0;
+}
+LFN(f_w_key){ UNUSED_SELF; RET(0,mkbool(w_keystate(L,base,nargs,0))); return 1; }
+LFN(f_w_key_pressed){ UNUSED_SELF; RET(0,mkbool(w_keystate(L,base,nargs,1))); return 1; }
+LFN(f_w_key_released){ UNUSED_SELF; RET(0,mkbool(w_keystate(L,base,nargs,2))); return 1; }
+
+LFN(f_w_mouse){ UNUSED_SELF; (void)nargs;
+    RET(0,mknum(W.mouse_x)); RET(1,mknum(W.mouse_y));
+    RET(2,mkbool(W.mouse_state&SDL_BUTTON(SDL_BUTTON_LEFT)));
+    RET(3,mkbool(W.mouse_state&SDL_BUTTON(SDL_BUTTON_RIGHT)));
+    RET(4,mkbool(W.mouse_state&SDL_BUTTON(SDL_BUTTON_MIDDLE)));
+    return 5;
+}
+static Uint32 w_mbutton(LucState *L,int base,int nargs){
+    if(nargs<1) return SDL_BUTTON(SDL_BUTTON_LEFT);
+    const char *b=checkstr(L,base,nargs,0,"mouse")->s;
+    if(strcmp(b,"right")==0)  return SDL_BUTTON(SDL_BUTTON_RIGHT);
+    if(strcmp(b,"middle")==0) return SDL_BUTTON(SDL_BUTTON_MIDDLE);
+    return SDL_BUTTON(SDL_BUTTON_LEFT);
+}
+LFN(f_w_mouse_pressed){ UNUSED_SELF;
+    Uint32 m=w_mbutton(L,base,nargs);
+    RET(0,mkbool((W.mouse_state&m)&&!(W.mouse_prev&m))); return 1;
+}
+LFN(f_w_mouse_released){ UNUSED_SELF;
+    Uint32 m=w_mbutton(L,base,nargs);
+    RET(0,mkbool(!(W.mouse_state&m)&&(W.mouse_prev&m))); return 1;
+}
+LFN(f_w_mouse_wheel){ UNUSED_SELF; (void)nargs;
+    RET(0,mknum(W.wheel_dy)); RET(1,mknum(W.wheel_dx)); return 2;
+}
+LFN(f_w_text_input){ UNUSED_SELF; (void)nargs;
+    RET(0,strv(W.textbuf,W.textlen)); return 1;
+}
+LFN(f_w_cursor){ UNUSED_SELF;
+    int show = nargs<1 || truthy(w_argc(L,base,nargs,0));
+    SDL_ShowCursor(show?SDL_ENABLE:SDL_DISABLE); return 0;
+}
+
+/* ---- timing -------------------------------------------------------------- */
+LFN(f_w_fps){ UNUSED_SELF;
+    if(nargs==0){ RET(0,mknum(W.delta>0?1.0/W.delta:0)); return 1; }
+    int n=checkint(L,base,nargs,0,"fps");
+    W.target_fps = n>0? n : 0;
+    return 0;
+}
+LFN(f_w_delta){ UNUSED_SELF; (void)base;(void)nargs;
+    RET(0,mknum(W.delta)); return 1;
+}
+LFN(f_w_time){ UNUSED_SELF; (void)base;(void)nargs;
+    RET(0,mknum(W.started? luc_now()-W.start_time : 0)); return 1;
+}
+
+/* ---- advanced ------------------------------------------------------------ */
+LFN(f_w_fullscreen){ UNUSED_SELF;
+    w_need();
+    int on = nargs<1 || truthy(w_argc(L,base,nargs,0));
+    if(SDL_SetWindowFullscreen(W.win,on?SDL_WINDOW_FULLSCREEN_DESKTOP:0)!=0){
+        RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2;
+    }
+    W.fullscreen=on;
+    SDL_GetWindowSize(W.win,&W.w,&W.h);
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_w_vsync){ UNUSED_SELF;
+    w_need();
+    int on = nargs<1 || truthy(w_argc(L,base,nargs,0));
+#if SDL_VERSION_ATLEAST(2,0,18)
+    if(SDL_RenderSetVSync(W.ren,on)!=0){
+        RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2;
+    }
+    W.vsync=on; RET(0,mkbool(1)); return 1;
+#else
+    (void)on;
+    RET(0,mkbool(0));
+    RET(1,cstrv("vsync toggling needs SDL 2.0.18+"));
+    return 2;
+#endif
+}
+LFN(f_w_icon){ UNUSED_SELF;
+    w_need();
+    Str *p=checkstr(L,base,nargs,0,"icon");
+    SDL_Surface *s;
+#ifndef LUC_NO_IMAGE
+    s=IMG_Load(p->s);
+#else
+    s=SDL_LoadBMP(p->s);
+#endif
+    if(!s){ RET(0,mkbool(0)); RET(1,cstrv("cannot load icon")); return 2; }
+    SDL_SetWindowIcon(W.win,s);
+    SDL_FreeSurface(s);
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_w_screenshot){ UNUSED_SELF;
+    w_need();
+    Str *p=checkstr(L,base,nargs,0,"screenshot");
+    SDL_Surface *s=SDL_CreateRGBSurfaceWithFormat(0,W.w,W.h,32,SDL_PIXELFORMAT_ARGB8888);
+    if(!s){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
+    if(SDL_RenderReadPixels(W.ren,NULL,SDL_PIXELFORMAT_ARGB8888,s->pixels,s->pitch)!=0){
+        SDL_FreeSurface(s);
+        RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2;
+    }
+    int rc;
+#ifndef LUC_NO_IMAGE
+    if(p->len>4 && strcmp(p->s+p->len-4,".bmp")==0) rc=SDL_SaveBMP(s,p->s);
+    else rc=IMG_SavePNG(s,p->s);
+#else
+    rc=SDL_SaveBMP(s,p->s);
+#endif
+    SDL_FreeSurface(s);
+    if(rc!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
+    RET(0,mkbool(1)); return 1;
+}
+
+/* ---- module table -------------------------------------------------------- */
+static Value window_module(void){
+    static int sdl_ready=0;
+    if(!sdl_ready){
+        SDL_SetMainReady();
+        if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER)!=0)
+            luc_error("window: SDL2 could not initialise (%s)",SDL_GetError());
+#ifndef LUC_NO_TTF
+        if(TTF_Init()==0) W.ttf_ok=1;
+#endif
+#ifndef LUC_NO_IMAGE
+        IMG_Init(IMG_INIT_PNG|IMG_INIT_JPG);
+#endif
+        sdl_ready=1;
+    }
+    Table *t=tab_new(0);
+    reg(t,"start",f_w_start);         reg(t,"close",f_w_close);
+    reg(t,"running",f_w_running);     reg(t,"update",f_w_update);
+    reg(t,"title",f_w_title);         reg(t,"size",f_w_size);
+    reg(t,"resize",f_w_resize);       reg(t,"quit",f_w_quit);
+
+    reg(t,"clear",f_w_clear);         reg(t,"pixel",f_w_pixel);
+    reg(t,"line",f_w_line);           reg(t,"rect",f_w_rect);
+    reg(t,"rect_outline",f_w_rect_outline);
+    reg(t,"circle",f_w_circle);       reg(t,"circle_outline",f_w_circle_outline);
+    reg(t,"triangle",f_w_triangle);   reg(t,"polygon",f_w_polygon);
+    reg(t,"text",f_w_text);           reg(t,"text_size",f_w_text_size);
+    reg(t,"font",f_w_font);           reg(t,"image",f_w_image);
+    reg(t,"image_size",f_w_image_size); reg(t,"clip",f_w_clip);
+
+    reg(t,"key",f_w_key);             reg(t,"key_pressed",f_w_key_pressed);
+    reg(t,"key_released",f_w_key_released);
+    reg(t,"mouse",f_w_mouse);         reg(t,"mouse_pressed",f_w_mouse_pressed);
+    reg(t,"mouse_released",f_w_mouse_released);
+    reg(t,"mouse_wheel",f_w_mouse_wheel);
+    reg(t,"text_input",f_w_text_input); reg(t,"cursor",f_w_cursor);
+
+    reg(t,"fps",f_w_fps);             reg(t,"delta",f_w_delta);
+    reg(t,"time",f_w_time);
+
+    reg(t,"fullscreen",f_w_fullscreen); reg(t,"vsync",f_w_vsync);
+    reg(t,"icon",f_w_icon);           reg(t,"screenshot",f_w_screenshot);
+
+    tab_set(t,cstrv("_VERSION"),cstrv("luc.window 1.0 (SDL2)"));
+#ifndef LUC_NO_TTF
+    tab_set(t,cstrv("has_ttf"),mkbool(W.ttf_ok));
+#else
+    tab_set(t,cstrv("has_ttf"),mkbool(0));
+#endif
+#ifndef LUC_NO_IMAGE
+    tab_set(t,cstrv("has_image"),mkbool(1));
+#else
+    tab_set(t,cstrv("has_image"),mkbool(0));
+#endif
+    return mkobj(LT_TABLE,t);
+}
+#endif /* LUC_WINDOW */
+
+
+/* ---- require ------------------------------------------------------------ */
+LFN(f_require){ UNUSED_SELF;
+    Str *name=checkstr(L,base,nargs,0,"require");
+    Value key=mkobj(LT_STR,name);
+    Value cached=tab_get(V.loaded,key);
+    if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
+    if(strcmp(name->s,"json")==0){
+        Value m=json_module();
+        tab_set(V.loaded,key,m);
+        RET(0,m); return 1;
+    }
+    if(strcmp(name->s,"window")==0){
+#ifdef LUC_WINDOW
+        Value m=window_module();
+        tab_set(V.loaded,key,m);
+        RET(0,m); return 1;
+#else
+        luc_error("module 'window' is not available: this build of LUC has no "
+                  "SDL2 support.\nRebuild with: gcc -O2 -std=c99 -DLUC_WINDOW "
+                  "-o luc main.c -lm -lSDL2 -lSDL2_ttf -lSDL2_image");
+#endif
+    }
+    int len=0; char found[1024];
+    char *src=find_module(name->s,&len,found,sizeof found);
+    if(!src) luc_error("module '%s' not found\ncheck LUC_PATH or luc_modules/",name->s);
+    int scratch=base+nargs+2;
+    ensure_stack(L,scratch+16);
+    Closure *cl=luc_compile(src,len,found);
+    free(src);
+    L->stack[scratch]=mkobj(LT_FUNC,cl);
+    vm_call(L,scratch,0,1);
+    Value res=L->stack[scratch];
+    if(res.t==LT_NIL) res=mkbool(1);
+    tab_set(V.loaded,key,res);
+    RET(0,res); return 1;
+}
+
+/* ---- xpcall ------------------------------------------------------------- */
+LFN(f_xpcall){ UNUSED_SELF;
+    if(nargs<2) luc_error("bad argument #2 to 'xpcall' (value expected)");
+    Value h=AR(1);
+    int na=nargs-2;
+    int scratch=base+nargs+2;
+    ensure_stack(L,scratch+na+32);
+    L->stack[scratch]=AR(0);
+    for(int i=0;i<na;i++) L->stack[scratch+1+i]=L->stack[base+2+i];
+    ErrJmp ej; ej.prev=V.errjmp; V.errjmp=&ej;
+    volatile int savenci=L->nci, savetop=L->top;
+    if(setjmp(ej.jb)==0){
+        int n=vm_call(L,scratch,na,-1);
+        V.errjmp=ej.prev;
+        for(int i=n-1;i>=0;i--) L->stack[base+1+i]=L->stack[scratch+i];
+        L->stack[base]=mkbool(1);
+        return n+1;
+    }
+    V.errjmp=ej.prev;
+    L->nci=savenci; L->top=savetop;
+    close_upvals(L,scratch);
+    Value err=V.errval;
+    ErrJmp hj; hj.prev=V.errjmp; V.errjmp=&hj;
+    Value hres=err;
+    if(setjmp(hj.jb)==0){
+        L->stack[scratch]=h; L->stack[scratch+1]=err;
+        vm_call(L,scratch,1,1);
+        hres=L->stack[scratch];
+    } else {
+        L->nci=savenci; L->top=savetop;
+        hres=cstrv("error in error handling");
+    }
+    V.errjmp=hj.prev;
+    L->stack[base]=mkbool(0); L->stack[base+1]=hres;
+    return 2;
+}
+
+/* ---- table.move --------------------------------------------------------- */
+LFN(f_tbl_move){ UNUSED_SELF;
+    Table *a1=checktab(L,base,nargs,0,"move");
+    int f=checkint(L,base,nargs,1,"move");
+    int e=checkint(L,base,nargs,2,"move");
+    int t=checkint(L,base,nargs,3,"move");
+    Table *a2=nargs>=5?checktab(L,base,nargs,4,"move"):a1;
+    if(e>=f){
+        if(t>e||t<=f||a1!=a2)
+            for(int i=0;i<=e-f;i++)
+                tab_set(a2,mknum((double)(t+i)),tab_get(a1,mknum((double)(f+i))));
+        else
+            for(int i=e-f;i>=0;i--)
+                tab_set(a2,mknum((double)(t+i)),tab_get(a1,mknum((double)(f+i))));
+    }
+    RET(0,nargs>=5?AR(4):AR(0)); return 1;
+}
+
+/* ---- math additions ----------------------------------------------------- */
+LFN(f_m_tointeger){ UNUSED_SELF;
+    Value v=AR(0);
+    if(v.t==LT_NUM && v.u.n==floor(v.u.n) && fabs(v.u.n)<=9007199254740992.0)
+        RET(0,v);
+    else RET(0,NIL);
+    return 1;
+}
+LFN(f_m_type){ UNUSED_SELF;
+    Value v=AR(0);
+    if(v.t!=LT_NUM){ RET(0,NIL); return 1; }
+    RET(0,cstrv((v.u.n==floor(v.u.n)&&fabs(v.u.n)<=9007199254740992.0)?"integer":"float"));
+    return 1;
+}
+
+/* ---- os.execute + io.popen ---------------------------------------------- */
+LFN(f_os_execute){ UNUSED_SELF;
+    if(nargs==0){ RET(0,mkbool(system(NULL)!=0)); return 1; }
+    int rc=system(checkstr(L,base,nargs,0,"execute")->s);
+    RET(0,mkbool(rc==0)); RET(1,cstrv("exit")); RET(2,mknum((double)rc));
+    return 3;
+}
+LFN(f_io_popen){ UNUSED_SELF;
+    Str *cmd=checkstr(L,base,nargs,0,"popen");
+    const char *mode=nargs>=2?checkstr(L,base,nargs,1,"popen")->s:"r";
+#if defined(_WIN32)
+    FILE *fp=_popen(cmd->s,mode);
+#else
+    FILE *fp=popen(cmd->s,mode);
+#endif
+    if(!fp){ RET(0,NIL); RET(1,cstrv("cannot start process")); return 2; }
+    FileH *h=file_new(fp,0);
+    h->ispipe=1;
+    RET(0,mkobj(LT_FILE,h)); return 1;
+}
+
+/* ==========================================================================
+** 15. library registration
+** ========================================================================== */
+
+static void reg(Table *t,const char *name,CFn fn){
+    tab_set(t,cstrv(name),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
+}
+static Table *newlib(const char *name){
+    Table *t=tab_new(0);
+    tab_set(V.globals,cstrv(name),mkobj(LT_TABLE,t));
+    return t;
+}
+
+static void luc_openlibs(void){
+    Table *g=V.globals;
+
+    /* --- base --- */
+    reg(g,"print",f_print);          reg(g,"tostring",f_tostring);
+    reg(g,"tonumber",f_tonumber);    reg(g,"type",f_type);
+    reg(g,"ipairs",f_ipairs);        reg(g,"pairs",f_pairs);
+    reg(g,"next",f_next);            reg(g,"select",f_select);
+    reg(g,"error",f_error);          reg(g,"assert",f_assert);
+    reg(g,"pcall",f_pcall);          reg(g,"unpack",f_unpack);
+    reg(g,"rawget",f_rawget);        reg(g,"rawset",f_rawset);
+    reg(g,"rawequal",f_rawequal);    reg(g,"rawlen",f_rawlen);
+    reg(g,"collectgarbage",f_collectgarbage);
+    reg(g,"require",f_require);
+    reg(g,"xpcall",f_xpcall);
+    tab_set(g,cstrv("_VERSION"),cstrv(LUC_VERSION));
+    tab_set(g,cstrv("_G"),mkobj(LT_TABLE,g));
+    tab_set(g,cstrv("package"),mkobj(LT_TABLE,V.loaded));
+
+    /* --- string (also the method table for string values) --- */
+    Table *s=newlib("string"); V.stringlib=s;
+    reg(s,"len",f_str_len);        reg(s,"sub",f_str_sub);
+    reg(s,"upper",f_str_upper);    reg(s,"lower",f_str_lower);
+    reg(s,"rep",f_str_rep);        reg(s,"reverse",f_str_reverse);
+    reg(s,"byte",f_str_byte);      reg(s,"char",f_str_char);
+    reg(s,"format",f_str_format);  reg(s,"find",f_str_find);
+    reg(s,"match",f_str_match);    reg(s,"gmatch",f_str_gmatch);
+    reg(s,"gsub",f_str_gsub);
+    /* LUC extensions */
+    reg(s,"split",f_str_split);          reg(s,"trim",f_str_trim);
+    reg(s,"startswith",f_str_startswith);reg(s,"endswith",f_str_endswith);
+    reg(s,"contains",f_str_contains);    reg(s,"tohex",f_str_tohex);
+    reg(s,"fromhex",f_str_fromhex);
+
+    /* --- list methods (method table for [] values, also global 'list') --- */
+    Table *li=newlib("list"); V.listmeta=li;
+    reg(li,"append",f_list_append);   reg(li,"pop",f_list_pop);
+    reg(li,"insert",f_list_insert);   reg(li,"remove",f_list_remove);
+    reg(li,"len",f_list_len);         reg(li,"contains",f_list_contains);
+    reg(li,"indexof",f_list_indexof); reg(li,"clear",f_list_clear);
+    reg(li,"extend",f_list_extend);   reg(li,"reverse",f_list_reverse);
+    reg(li,"sort",f_list_sort);       reg(li,"concat",f_tbl_concat);
+    reg(li,"tostring",f_list_tostring);
+
+    /* --- table --- */
+    Table *t=newlib("table");
+    reg(t,"insert",f_tbl_insert);  reg(t,"remove",f_tbl_remove);
+    reg(t,"concat",f_tbl_concat);  reg(t,"unpack",f_unpack);
+    reg(t,"sort",f_list_sort);
+    reg(t,"move",f_tbl_move);
+
+    /* --- math --- */
+    Table *m=newlib("math");
+    reg(m,"floor",f_m_floor); reg(m,"ceil",f_m_ceil);  reg(m,"sqrt",f_m_sqrt);
+    reg(m,"abs",f_m_abs);     reg(m,"sin",f_m_sin);    reg(m,"cos",f_m_cos);
+    reg(m,"tan",f_m_tan);     reg(m,"asin",f_m_asin);  reg(m,"acos",f_m_acos);
+    reg(m,"atan",f_m_atan);   reg(m,"exp",f_m_exp);    reg(m,"log",f_m_log);
+    reg(m,"pow",f_m_pow);     reg(m,"fmod",f_m_fmod);  reg(m,"modf",f_m_modf);
+    reg(m,"max",f_m_max);     reg(m,"min",f_m_min);
+    reg(m,"random",f_m_random); reg(m,"randomseed",f_m_randomseed);
+    tab_set(m,cstrv("pi"),mknum(3.14159265358979323846));
+    tab_set(m,cstrv("huge"),mknum(HUGE_VAL));
+    reg(m,"tointeger",f_m_tointeger); reg(m,"type",f_m_type);
+    tab_set(m,cstrv("maxinteger"),mknum(9007199254740992.0));
+    tab_set(m,cstrv("mininteger"),mknum(-9007199254740992.0));
+
+    /* --- os --- */
+    Table *o=newlib("os");
+    reg(o,"clock",f_os_clock); reg(o,"time",f_os_time);  reg(o,"date",f_os_date);
+    reg(o,"exit",f_os_exit);   reg(o,"getenv",f_os_getenv);
+    reg(o,"remove",f_os_remove);reg(o,"rename",f_os_rename);
+    reg(o,"sleep",f_os_sleep);
+    reg(o,"execute",f_os_execute);
+
+    /* --- io + file methods --- */
+    Table *io=newlib("io");
+    reg(io,"write",f_io_write); reg(io,"read",f_io_read);
+    reg(io,"replace",f_io_replace); reg(io,"clearline",f_io_clearline);
+    reg(io,"eraseline",f_io_eraseline); reg(io,"clear",f_io_clear);
+    reg(io,"open",f_io_open);   reg(io,"close",f_io_close);
+    reg(io,"lines",f_io_lines);
+    reg(io,"popen",f_io_popen);
+    V.filelib=tab_new(0);
+    reg(V.filelib,"read",f_file_read);   reg(V.filelib,"write",f_file_write);
+    reg(V.filelib,"close",f_io_close);   reg(V.filelib,"lines",f_file_lines);
+    reg(V.filelib,"seek",f_file_seek);   reg(V.filelib,"flush",f_file_flush);
+    tab_set(io,cstrv("stdout"),mkobj(LT_FILE,file_new(stdout,1)));
+    tab_set(io,cstrv("stderr"),mkobj(LT_FILE,file_new(stderr,1)));
+    tab_set(io,cstrv("stdin"), mkobj(LT_FILE,file_new(stdin ,1)));
+
+    /* --- bit32 --- */
+    Table *b=newlib("bit32");
+    reg(b,"band",f_b_band);   reg(b,"bor",f_b_bor);     reg(b,"bxor",f_b_bxor);
+    reg(b,"bnot",f_b_bnot);   reg(b,"lshift",f_b_lshift);reg(b,"rshift",f_b_rshift);
+    reg(b,"arshift",f_b_arshift); reg(b,"btest",f_b_btest);
+    reg(b,"bswap",f_b_bswap); reg(b,"extract",f_b_extract); reg(b,"replace",f_b_replace);
+
+    /* --- buffer (also the method table for buffer values) --- */
+    Table *bf=newlib("buffer"); V.bufferlib=bf;
+    reg(bf,"create",f_buf_create); reg(bf,"len",f_buf_len);
+    reg(bf,"fill",f_buf_fill);     reg(bf,"copy",f_buf_copy);
+    reg(bf,"fromstring",f_buf_fromstring); reg(bf,"tostring",f_buf_tostring);
+    reg(bf,"readu8",f_buf_readu8);   reg(bf,"writeu8",f_buf_writeu8);
+    reg(bf,"readi8",f_buf_readi8);   reg(bf,"writei8",f_buf_writei8);
+    reg(bf,"readu16",f_buf_readu16); reg(bf,"writeu16",f_buf_writeu16);
+    reg(bf,"readi16",f_buf_readi16); reg(bf,"writei16",f_buf_writei16);
+    reg(bf,"readu32",f_buf_readu32); reg(bf,"writeu32",f_buf_writeu32);
+    reg(bf,"readi32",f_buf_readi32); reg(bf,"writei32",f_buf_writei32);
+    reg(bf,"readf32",f_buf_readf32); reg(bf,"writef32",f_buf_writef32);
+    reg(bf,"readf64",f_buf_readf64); reg(bf,"writef64",f_buf_writef64);
+    reg(bf,"readstring",f_buf_readstring); reg(bf,"writestring",f_buf_writestring);
+    reg(bf,"readhex",f_buf_readhex);       reg(bf,"writehex",f_buf_writehex);
+
+    /* --- coroutine --- */
+    Table *c=newlib("coroutine");
+    reg(c,"create",f_co_create); reg(c,"resume",f_co_resume);
+    reg(c,"yield",f_co_yield);   reg(c,"status",f_co_status);
+    reg(c,"wrap",f_co_wrap);     reg(c,"running",f_co_running);
+    reg(c,"isyieldable",f_co_isyieldable);
+
+    /* --- task --- */
+    Table *tk=newlib("task");
+    reg(tk,"wait",f_task_wait);   reg(tk,"spawn",f_task_spawn);
+    reg(tk,"delay",f_task_delay); reg(tk,"defer",f_task_defer);
+    reg(tk,"cancel",f_task_cancel);
+}
+
+static void luc_init(void){
+    memset(&V,0,sizeof V);
+    V.strcap=256;
+    V.strtab=(Str**)lcalloc(sizeof(Str*)*(size_t)V.strcap);
+    V.gcthresh=1u<<16;
+    V.gcoff=1;                               /* no GC while bootstrapping */
+    V.globals=tab_new(0);
+    V.loaded=tab_new(0);                     /* module cache */
+    V.mainco=state_new(256);
+    V.mainco->status=CO_RUNNING;
+    V.cur=V.mainco;
+    rngstate ^= (uint64_t)time(NULL)*2654435761u | 1ULL;
+    luc_openlibs();
+    V.gcoff=0;
+}
+
+/* ==========================================================================
+** 16. driver
+** ========================================================================== */
+
+static int run_chunk(const char *src,int len,const char *name,int argc,char **argv,int firstarg){
+    ErrJmp ej; ej.prev=V.errjmp; V.errjmp=&ej;
+    if(setjmp(ej.jb)==0){
+        Closure *cl=luc_compile(src,len,name);
+        LucState *L=V.mainco;
+        int n=(argc>firstarg)? argc-firstarg : 0;
+        ensure_stack(L,n+64);
+        L->top=0;
+        L->stack[0]=mkobj(LT_FUNC,cl);
+        for(int i=0;i<n;i++) L->stack[1+i]=cstrv(argv[firstarg+i]);
+        V.cur=L;
+        vm_call(L,0,n,0);
+        sched_run();                      /* drain task.delay / task.wait */
+        fflush(stdout);
+        V.errjmp=ej.prev;
+        return 0;
+    }
+    V.errjmp=ej.prev;
+    fflush(stdout);
+    Str *msg=tostr(V.errval);
+    fprintf(stderr,"luc: %s\n",msg->s);
+    return 1;
+}
+
+static char *read_file(const char *path,int *outlen){
+    FILE *f=fopen(path,"rb");
+    if(!f) return NULL;
+    fseek(f,0,SEEK_END);
+    long sz=ftell(f);
+    fseek(f,0,SEEK_SET);
+    if(sz<0){ fclose(f); return NULL; }
+    char *b=(char*)lmalloc((size_t)sz+1);
+    size_t n=fread(b,1,(size_t)sz,f);
+    fclose(f);
+    b[n]=0;
+    *outlen=(int)n;
+    return b;
+}
+
+static void print_help(void){
+    printf(
+    "%s  --  the LUC programming language\n\n"
+    "usage: luc [options] [script [args...]]\n\n"
+    "  script.luc        run a LUC source file\n"
+    "  -e \"chunk\"        execute a chunk of LUC code given on the command line\n"
+    "  -v, --version     print version information and exit\n"
+    "  -h, --help        print this help and exit\n\n"
+    "LUC is an independent, register-based language implemented in C99.\n"
+    "Pipeline: lexer -> parser -> AST -> bytecode compiler -> VM (mark & sweep GC).\n"
+    "Syntax follows Lua 5.1 (all 21 keywords) plus LUC additions:\n"
+    "  [1,2,3] list literals with :append/:pop/:insert/:remove/:len/:contains\n"
+    "  the 'in' membership operator, optional type annotations (x: number)\n"
+    "  string.split/trim/startswith/endswith/tohex/fromhex\n"
+     "  io.replace/clearline/eraseline/clear for terminal output control\n"
+    "  task.*, buffer.* (incl. hex helpers), bit32.*\n",
+    "  require(\"window\") for SDL2 graphics (build with -DLUC_WINDOW)\n"
+    LUC_VERSION);
+}
+
+int main(int argc,char **argv){
+    if(argc>0) snprintf(g_exepath,sizeof g_exepath,"%s",argv[0]);
+    luc_init();
+
+    if(argc<2){ print_help(); return 0; }
+
+    if(strcmp(argv[1],"--version")==0||strcmp(argv[1],"-v")==0){
+        printf("%s  [C99 register VM]\n",LUC_VERSION);
+        return 0;
+    }
+    if(strcmp(argv[1],"--help")==0||strcmp(argv[1],"-h")==0){
+        print_help();
+        return 0;
+    }
+    if(strcmp(argv[1],"-e")==0){
+        if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
+        return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);
+    }
+
+    int len=0;
+    char *src=read_file(argv[1],&len);
+    if(!src){ fprintf(stderr,"luc: cannot open '%s'\n",argv[1]); return 1; }
+    /* allow a #! line at the start of a script */
+    int off=0;
+    if(len>1 && src[0]=='#'){ while(off<len && src[off]!='\n') off++; }
+    set_scriptdir(argv[1]);
+    int rc=run_chunk(src+off,len-off,argv[1],argc,argv,2);
+    free(src);
+    return rc;
+}
