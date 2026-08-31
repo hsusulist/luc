@@ -17,7 +17,7 @@
 
 ---
 
-## ⚡ Why LUC?
+##  Why LUC?
 
 | | LUC | Python | Lua |
 |--|--|--|--|
@@ -25,25 +25,25 @@
 | Easy to learn | ✅ | ✅ | ✅ |
 | Window / GUI | ✅ | ✅ | ❌ |
 | JSON built-in | ✅ | ✅ | ❌ |
-| Binary size | ~500KB ✅ | ~30MB ❌ | ~200KB ✅ |
+| Binary size | ~2000KB ✅ | ~30MB ❌ | ~200KB ✅ |
 | Task / coroutine | ✅ | ❌ | ✅ |
 
 LUC is **3x faster than Python** on simple loops, **lightweight under 1MB**, and has all the features Lua is missing.
 
 ---
 
-## 🚀 Install
+##  Install
 
 **Windows** — download and run:
 
-👉 **[luc-installer.exe](https://github.com/hsusulist/luc/releases/latest)**
+**[luc-installer.exe](https://github.com/hsusulist/luc/releases/latest)**
 
 Double click → Next → Install → Done.  
 Open any terminal and type `luc --version` to verify.
 
 ---
 
-## 📝 Quick Start
+## Quick Start
 
 Create a file `hello.luc`:
 
@@ -89,7 +89,7 @@ window.close()
 
 ---
 
-## 📦 Built-in Libraries
+## Built-in Libraries
 
 | Library | Description |
 |--|--|
@@ -107,7 +107,7 @@ window.close()
 
 ---
 
-## 🔤 Syntax
+## Syntax
 
 LUC syntax is based on Lua 5.1 — all 21 keywords supported.  
 Extra features on top:
@@ -155,7 +155,7 @@ io.write("\n")
 
 ---
 
-## 🛠️ Build from Source
+##  Build from Source
 
 **Requirements:** gcc (MinGW on Windows), SDL2 (optional, for window library)
 
@@ -174,7 +174,7 @@ gcc -O2 -std=c99 -DLUC_WINDOW -o luc src/main.c -lm $(pkg-config --libs sdl2 SDL
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 luc/
@@ -191,7 +191,7 @@ luc/
 
 ---
 
-## 📄 License
+##  License
 
 Apache License 2.0 — see [LICENSE](LICENSE)
 
