@@ -1,0 +1,237 @@
+-- ============================================================
+-- pong.luc -- PONG 1 nguoi choi (danh voi may)
+-- Viet bang window lib cua LUC, khong can SDL2_ttf/SDL2_image
+--   (chu dung font bitmap 5x7 co san trong window lib)
+--
+-- Build exe co window:
+--   gcc -O2 -s -std=c99 -DLUC_WINDOW -DLUC_NO_TTF -DLUC_NO_IMAGE
+--       -o luc.exe src/luc_core.c src/luc_libs.c -lm -lSDL2
+-- Choi:
+--   luc.exe pong.luc
+--
+-- Dieu khien:
+--   W/S hoac Up/Down : di chuyen vot
+--   Space            : tam dung / tiep tuc
+--   R                : choi lai (khi ket thuc)
+--   ESC              : thoat
+-- ============================================================
+local w = require("window")
+
+-- ---------------- cau hinh ----------------
+local WW, WH      = 900, 560       -- kich thuoc san
+local WIN_SCORE   = 7              -- diem de thang
+local PW, PH      = 14, 96         -- be day / chieu dai vot
+local MARGIN      = 26             -- khoang cach vot voi le
+local P_SPEED     = 430            -- toc do vot nguoi choi (px/s)
+local AI_SPEED    = 345            -- toc do vot AI khi duoi bong
+local AI_BACK     = 210            -- toc do AI ve lai giua
+local BALL_R      = 8              -- ban kinh bong
+local SERVE_T     = 0.9            -- giay nghi giua cac phat bong
+local SPEED0      = 345            -- toc do bong luc dau
+local SPEED_UP    = 1.045          -- bong nhanh them 4.5%/cu vo
+local SPEED_MAX   = 650
+
+local BG     = "#0f1226"
+local NET_C  = "#2b3257"
+local P_COL  = "cyan"
+local A_COL  = "orange"
+local BALL_C = "white"
+local TXT_C  = "white"
+local DIM_C  = {r=8, g=10, b=24, a=175}
+
+-- ---------------- trang thai ----------------
+local px, py   = MARGIN, (WH-PH)/2        -- vot nguoi choi (trai)
+local ax, ay   = WW-MARGIN-PW, (WH-PH)/2  -- vot AI (phai)
+local bx, by   = WW/2, WH/2               -- bong
+local bvx, bvy = 0, 0
+local speed    = SPEED0
+local pscore, ascore = 0, 0
+local state    = "serve"                  -- serve | play | over
+local tleft    = SERVE_T
+local winner   = ""
+local paused   = false
+local rally    = 0
+
+local function clamp(v, lo, hi)
+  if v < lo then return lo end
+  if v > hi then return hi end
+  return v
+end
+
+local function serve(dir)
+  bx, by = WW/2, WH/2
+  speed = SPEED0
+  local ang = math.random(-45, 45) / 100.0
+  bvx = dir * speed * math.cos(ang)
+  bvy = speed * math.sin(ang)
+  if math.abs(bvy) < 40 then
+    bvy = 40 * (math.random(1, 2) == 1 and 1 or -1)
+  end
+  state = "serve"
+  tleft = SERVE_T
+end
+
+local function reset_game()
+  pscore, ascore = 0, 0
+  py = (WH-PH)/2
+  ay = (WH-PH)/2
+  paused = false
+  rally = 0
+  serve(math.random(1, 2) == 1 and 1 or -1)
+end
+
+local function score_point(who)
+  rally = 0
+  if who == "p" then pscore = pscore + 1 else ascore = ascore + 1 end
+  if pscore >= WIN_SCORE or ascore >= WIN_SCORE then
+    state = "over"
+    winner = (pscore >= WIN_SCORE) and "BAN THANG!" or "MAY THANG!"
+  else
+    -- phat bong ve phia nguoi vua mat diem
+    serve(who == "p" and 1 or -1)
+  end
+end
+
+-- ---------------- cap nhat ----------------
+local function update_player(dt)
+  local dir = 0
+  if w.key("w") or w.key("up") then dir = dir - 1 end
+  if w.key("s") or w.key("down") then dir = dir + 1 end
+  py = clamp(py + dir * P_SPEED * dt, 6, WH - 6 - PH)
+end
+
+local function update_ai(dt)
+  local target, sp
+  if bvx > 0 and state == "play" and bx > 300 then
+    target = by - PH/2          -- duoi bong (chi phan ung khi bong da qua 1/3 san)
+    sp = AI_SPEED
+  else
+    target = (WH-PH)/2          -- khong co bong thi ve giua
+    sp = AI_BACK
+  end
+  local d = target - ay
+  if d > 6 then ay = ay + sp * dt
+  elseif d < -6 then ay = ay - sp * dt end
+  ay = clamp(ay, 6, WH - 6 - PH)
+end
+
+local function ball_step(dt)
+  bx = bx + bvx * dt
+  by = by + bvy * dt
+  -- nop tran / duoi
+  if by - BALL_R < 0 then by = BALL_R; bvy = -bvy end
+  if by + BALL_R > WH then by = WH - BALL_R; bvy = -bvy end
+  -- vo vot nguoi choi (ben trai)
+  if bvx < 0 and bx - BALL_R <= px + PW and bx + BALL_R >= px
+     and by >= py - BALL_R and by <= py + PH + BALL_R then
+    local rel = clamp((by - (py + PH/2)) / (PH/2), -1, 1)
+    speed = speed * SPEED_UP
+    if speed > SPEED_MAX then speed = SPEED_MAX end
+    local ang = rel * 0.72
+    -- chong ket bong ngang: luon co goc doc toi thieu
+    if math.abs(ang) < 0.18 then
+      ang = 0.18 * (math.random(1, 2) == 1 and 1 or -1)
+    end
+    bvx = speed * math.cos(ang)
+    bvy = speed * math.sin(ang)
+    bx = px + PW + BALL_R
+    rally = rally + 1
+  end
+  -- vo vot AI (ben phai)
+  if bvx > 0 and bx + BALL_R >= ax and bx - BALL_R <= ax + PW
+     and by >= ay - BALL_R and by <= ay + PH + BALL_R then
+    local rel = clamp((by - (ay + PH/2)) / (PH/2), -1, 1)
+    speed = speed * SPEED_UP
+    if speed > SPEED_MAX then speed = SPEED_MAX end
+    local ang = rel * 0.72
+    if math.abs(ang) < 0.18 then
+      ang = 0.18 * (math.random(1, 2) == 1 and 1 or -1)
+    end
+    bvx = -speed * math.cos(ang)
+    bvy = speed * math.sin(ang)
+    bx = ax - BALL_R
+    rally = rally + 1
+  end
+  -- ra khoi san
+  if bx < -40 then score_point("a")
+  elseif bx > WW + 40 then score_point("p") end
+end
+
+local function update_ball(dt)
+  if state == "serve" then
+    tleft = tleft - dt
+    if tleft <= 0 then state = "play" end
+    return
+  end
+  if state ~= "play" then return end
+  -- chia nho buoc di de bong khong xuyen qua vot khi nhanh
+  local steps = 1
+  local maxmove = speed * dt
+  if maxmove > 16 then steps = math.ceil(maxmove / 16) end
+  for i = 1, steps do
+    if state == "play" then ball_step(dt / steps) end
+  end
+end
+
+-- ---------------- ve ----------------
+local function draw_net()
+  local x = WW/2 - 2
+  local y = 8
+  while y < WH do
+    w.rect(x, y, 4, 20, NET_C)
+    y = y + 34
+  end
+end
+
+local function center_text(s, cy, col, size)
+  local tw, th = w.text_size(s, size)
+  w.text(s, (WW - tw)/2, cy, col, size)
+end
+
+local function draw()
+  w.clear(BG)
+  draw_net()
+  w.rect(px, py, PW, PH, P_COL)
+  w.rect(ax, ay, PW, PH, A_COL)
+  w.circle(bx, by, BALL_R, BALL_C)
+  w.text(tostring(pscore), WW/2 - 112, 24, TXT_C, 60)
+  w.text(tostring(ascore), WW/2 + 70, 24, TXT_C, 60)
+  if state == "serve" then
+    center_text("SAP PHAT BONG...", WH - 44, "silver", 16)
+  elseif state == "play" and paused then
+    w.rect(0, 0, WW, WH, DIM_C)
+    center_text("TAM DUNG", WH/2 - 40, TXT_C, 40)
+    center_text("SPACE: TIEP TUC", WH/2 + 20, "silver", 16)
+  elseif state == "over" then
+    w.rect(0, 0, WW, WH, DIM_C)
+    center_text(winner, WH/2 - 60, TXT_C, 48)
+    center_text(tostring(pscore) .. " - " .. tostring(ascore), WH/2 - 4, "gold", 32)
+    center_text("R: CHOI LAI      ESC: THOAT", WH/2 + 48, "silver", 16)
+  end
+end
+
+-- ---------------- vong lap chinh ----------------
+w.start("LUC PONG", WW, WH)                  -- tao cua so SDL2
+serve(math.random(1, 2) == 1 and 1 or -1)   -- phat bong dau tien
+
+while w.running() do
+  local dt = w.delta()
+
+  if w.key_pressed("escape") then w.quit() end
+
+  if state == "over" then
+    if w.key_pressed("r") then reset_game() end
+  else
+    if w.key_pressed("space") then paused = not paused end
+    if not paused then
+      update_player(dt)
+      update_ai(dt)
+      update_ball(dt)
+    end
+  end
+
+  draw()
+  w.update()
+end
+
+w.close()

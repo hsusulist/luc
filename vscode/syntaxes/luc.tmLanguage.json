@@ -1,0 +1,81 @@
+{
+  "name": "LUC",
+  "scopeName": "source.luc",
+  "fileTypes": ["luc"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#keywords" },
+    { "include": "#functions" },
+    { "include": "#numbers" },
+    { "include": "#operators" },
+    { "include": "#types" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.luc",
+          "begin": "--\\[\\[",
+          "end": "\\]\\]"
+        },
+        {
+          "name": "comment.line.double-dash.luc",
+          "match": "--.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.luc",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [{ "name": "constant.character.escape.luc", "match": "\\\\." }]
+        },
+        {
+          "name": "string.quoted.single.luc",
+          "begin": "'",
+          "end": "'",
+          "patterns": [{ "name": "constant.character.escape.luc", "match": "\\\\." }]
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.luc",
+          "match": "\\b(and|break|do|else|elseif|end|for|function|if|in|local|not|or|repeat|return|then|until|while)\\b"
+        },
+        {
+          "name": "constant.language.luc",
+          "match": "\\b(true|false|nil)\\b"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "support.function.luc",
+          "match": "\\b(print|tostring|tonumber|type|ipairs|pairs|error|assert|pcall|select|unpack|rawget|rawset|rawequal|collectgarbage)\\b"
+        },
+        {
+          "name": "support.function.library.luc",
+          "match": "\\b(string|table|math|io|os|bit32|buffer|task|coroutine|list)\\.(\\w+)"
+        }
+      ]
+    },
+    "numbers": {
+      "name": "constant.numeric.luc",
+      "match": "\\b(0x[0-9a-fA-F]+|[0-9]+\\.?[0-9]*)\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.luc",
+      "match": "\\+|-|\\*|\\/|%|\\^|#|==|~=|<=|>=|<|>|=|\\.\\.|\\.\\.\\."
+    },
+    "types": {
+      "name": "entity.name.type.luc",
+      "match": "(?<=:)\\s*(number|string|boolean|table|list|buffer|thread|function|nil)\\b"
+    }
+  }
+}

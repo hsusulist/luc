@@ -1,0 +1,50 @@
+-- ============================================================
+-- hello.luc -- tour nhanh cu phap LUC
+-- Chay duoc tren CA HAI ban (full va core only)
+-- Chay: luc hello.luc
+-- ============================================================
+print("Xin chao tu LUC!")
+print("Ban dang dung:", _VERSION)
+print("")
+
+-- 1) bien + chuoi: dung .. de noi chuoi
+local name = "LUC-er"
+print("Chao " .. name .. "! 1 + 1 = " .. (1 + 1))
+
+-- 2) ham co the tra ve nhieu gia tri
+local function minmax(a, b, c)
+  local lo = a
+  local hi = a
+  if b < lo then lo = b end
+  if b > hi then hi = b end
+  if c < lo then lo = c end
+  if c > hi then hi = c end
+  return lo, hi
+end
+local lo, hi = minmax(7, 2, 9)
+print("min/max cua (7, 2, 9):", lo, hi)
+
+-- 3) list: tao bang [..], them phan tu, kiem tra
+local scores = [10, 25, 8]
+scores:append(42)
+print("Diem so:", scores, "so phan tu:", #scores)
+print("42 nam trong list?", 42 in scores)
+
+-- 4) vong lap: tong 1..10
+local s = 0
+for i = 1, 10, 1 do
+  s = s + i
+end
+print("Tong 1..10 =", s)
+
+-- 5) chuoi hoat dong nhu object (nho ngoac quanh chuoi)
+print(("luc lang"):upper())
+print(("a,b,c"):split(","))
+
+-- 6) bat loi cho tot voi pcall
+local ok, err = pcall(function() error("day la loi mau") end)
+print("pcall:", ok, err)
+
+print("")
+print("Thu tiep: luc json_demo.luc")
+print("Neu ban cai ban day du thi luc demos/pong.luc de choi Pong!")

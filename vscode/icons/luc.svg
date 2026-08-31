@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" role="img">
+  <title>LUC</title>
+  <defs>
+    <linearGradient id="cgrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffb347"/>
+      <stop offset="1" stop-color="#ff6600"/>
+    </linearGradient>
+    <linearGradient id="moongrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#90d5f0"/>
+      <stop offset="1" stop-color="#3B82F6"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(3 0)">
+    <path
+      d="
+        M 165.667 63.965
+        A 68 68 0 1 0 165.667 136.035
+        C 160.439 125.689 148.171 121.872 142.714 111.279
+        A 36.5 36.5 0 1 1 142.714 88.721
+        C 148.171 78.128 160.439 74.311 165.667 63.965
+        Z
+      "
+      fill="url(#cgrad)"
+    />
+    <path
+      d="
+        M 147.944 87.021
+        L 173.2 79.2
+        C 174.0 78.95 174.8 79.6 174.8 80.5 L 174.8 119.5
+        C 174.8 120.4 174.0 121.05 173.2 120.8
+        L 147.944 112.979
+        A 42 42 0 0 0 147.944 87.021
+        Z
+      "
+      fill="url(#cgrad)"
+    />
+    <circle cx="176" cy="30" r="26" fill="url(#moongrad)"/>
+  </g>
+</svg>
