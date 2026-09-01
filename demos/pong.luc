@@ -27,9 +27,9 @@ local AI_SPEED    = 345            -- toc do vot AI khi duoi bong
 local AI_BACK     = 210            -- toc do AI ve lai giua
 local BALL_R      = 8              -- ban kinh bong
 local SERVE_T     = 0.9            -- giay nghi giua cac phat bong
-local SPEED0      = 345            -- toc do bong luc dau
+local SPEED0      = 500            -- toc do bong luc dau
 local SPEED_UP    = 1.045          -- bong nhanh them 4.5%/cu vo
-local SPEED_MAX   = 650
+local SPEED_MAX   = 2000
 
 local BG     = "#0f1226"
 local NET_C  = "#2b3257"

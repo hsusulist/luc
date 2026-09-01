@@ -1,0 +1,22 @@
+
+local json = require("json")
+
+-- 1) bang -> chuoi JSON
+local player = {name = "Lucy", level = 3, hp = 87.5, alive = true}
+local enc = json.encode(player)
+print("encode:", enc)
+
+-- 2) chuoi JSON -> bang
+local data = json.decode('{"item":"potion","count":5,"tags":["fire","cheap"]}')
+print("item :", data.item)
+print("count:", data.count)
+print("tags :", data.tags[1], data.tags[2])
+
+-- 3) sua du lieu roi encode lai
+data.count = data.count + 1
+data.tags:append("popular")
+print("mua them:", json.encode(data))
+
+-- 4) JSON sai se bao ro li do (bat bang pcall)
+local ok, err = pcall(function() return json.decode('{"broken": ') end)
+print("pcall :", ok, err)
