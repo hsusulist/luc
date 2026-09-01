@@ -130,6 +130,7 @@ Str *str_new(const char *s,int len){
 Table *tab_new(int islist){
     Table *t=(Table*)newobj(sizeof(Table), islist?LT_LIST:LT_TABLE);
     t->tid=++V.tidcounter;
+    t->meta=NULL;
     return t;
 }
 Buffer *buf_new(int n){
@@ -337,6 +338,7 @@ static void mark_obj(Obj *o){
             Table *t=(Table*)o;
             for(int i=0;i<t->alen;i++) mark_value(t->arr[i]);
             for(int i=0;i<t->ecap;i++){ mark_value(t->ents[i].k); mark_value(t->ents[i].v); }
+            if(t->meta) mark_obj((Obj*)t->meta);
             break; }
         case LT_PROTO: {
             Proto *p=(Proto*)o;
@@ -462,6 +464,7 @@ int str2num(const char *s,int len,double *out){
 }
 
 static Str *v2str(Value v,int depth);
+static Value meta_callv(LucState *L,Value f,Value *args,int n);   /* fwd: VM */
 
 static Str *list_tostr(Table *t,int depth){
     /* pretty-print lists: [1, 2, 3] */
@@ -489,9 +492,21 @@ static Str *v2str(Value v,int depth){
         case LT_NUM:  num2str(v.u.n,buf,sizeof buf); return str_fromc(buf);
         case LT_STR:  return AS_STR(v);
         case LT_LIST: return list_tostr(AS_TAB(v),depth);
-        default:
+        default: {
+            if(v.t==LT_TABLE){
+                Table *t=AS_TAB(v);
+                if(t->meta){
+                    Value h=tab_get(t->meta,mkobj(LT_STR,str_fromc("__tostring")));
+                    if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                        Value r=meta_callv(V.cur,h,(Value[]){v},1);
+                        if(r.t==LT_STR) return AS_STR(r);
+                        if(r.t==LT_NUM||r.t==LT_BOOL) return tostr(r);
+                    }
+                }
+            }
             snprintf(buf,sizeof buf,"%s: %p",type_name(v),(void*)v.u.o);
             return str_fromc(buf);
+        }
     }
 }
 Str *tostr(Value v){ return v2str(v,0); }
@@ -502,13 +517,13 @@ enum {
     TK_EOF=256, TK_NAME, TK_NUMBER, TK_STRING,
     TK_AND, TK_BREAK, TK_DO, TK_ELSE, TK_ELSEIF, TK_END, TK_FALSE, TK_FOR,
     TK_FUNCTION, TK_IF, TK_IN, TK_LOCAL, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
-    TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE,
+    TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE, TK_IMPORT,
     TK_CONCAT, TK_DOTS, TK_EQ, TK_NE, TK_LE, TK_GE
 };
 
 static const char *const kwnames[] = {
     "and","break","do","else","elseif","end","false","for","function","if",
-    "in","local","nil","not","or","repeat","return","then","true","until","while"
+    "in","local","nil","not","or","repeat","return","then","true","until","while","import"
 };
 
 typedef struct {
@@ -528,7 +543,7 @@ static void lex_error(Lexer *lx,const char *msg){
 }
 
 static int lx_check_kw(const char *s,int len){
-    for(int i=0;i<21;i++)
+    for(int i=0;i<22;i++)
         if((int)strlen(kwnames[i])==len && memcmp(kwnames[i],s,(size_t)len)==0)
             return TK_AND+i;
     return TK_NAME;
@@ -1137,6 +1152,23 @@ static Stat *parse_statement(Parser *ps){
             }while(opt(ps,','));
             if(opt(ps,'='))
                 do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
+            return s; }
+
+        case TK_IMPORT: {
+            /* import a, b  ==  do a = __import("a") b = __import("b") end */
+            lx_next(&ps->lx);
+            Stat *s=new_stat(S_DO,line);
+            s->body=(Block*)anew(sizeof(Block));
+            do{
+                Str *n=expect_name(ps);
+                Expr *target=new_expr(E_NAME,line); target->name=n;
+                Expr *fn=new_expr(E_NAME,line); fn->name=str_fromc("__import");
+                Expr *arg=new_expr(E_STR,line); arg->str=n;
+                Expr *call=new_expr(E_CALL,line); call->a=fn; el_add(&call->args,arg);
+                Stat *as=new_stat(S_ASSIGN,line);
+                el_add(&as->lhs,target); el_add(&as->rhs,call);
+                blk_add(s->body,as);
+            }while(opt(ps,','));
             return s; }
 
         case TK_RETURN: {
@@ -1785,7 +1817,17 @@ int vm_lessthan(Value a,Value b,int orequal){
 }
 static Value vm_index(Value t,Value k){
     switch(t.t){
-        case LT_TABLE: return tab_get(AS_TAB(t),k);
+        case LT_TABLE: {
+            Table *tb=AS_TAB(t);
+            Value r=tab_get(tb,k);
+            int d=0;
+            while(r.t==LT_NIL && tb->meta && d<16){
+                Value h=tab_get(tb->meta,mkobj(LT_STR,str_fromc("__index")));
+                if(h.t==LT_TABLE||h.t==LT_LIST){ tb=AS_TAB(h); r=tab_get(tb,k); d++; }
+                else break;
+            }
+            return r;
+        }
         case LT_LIST:
             if(k.t==LT_NUM) return tab_get(AS_TAB(t),k);
             if(k.t==LT_STR) return tab_get(V.listmeta,k);
@@ -1891,6 +1933,36 @@ int vm_call(LucState *L,int func,int nargs,int nres){
     return 0;
 }
 
+/* --- metatable-lite runtime (after vm_call is available) ---------------- */
+
+/* call f(args...) from deep inside VM/C helpers; single result on return.
+   NOTE: may reallocate L->stack and L->ci — caller must refresh base/pc. */
+static Value meta_callv(LucState *L,Value f,Value *args,int n){
+    ensure_stack(L,L->top+n+8);
+    int slot=L->top;
+    L->stack[slot]=f;
+    for(int i=0;i<n;i++) L->stack[slot+1+i]=args[i];
+    L->top=slot+n+1;
+    vm_call(L,slot,n,1);
+    Value r=L->stack[slot];
+    L->top=slot;
+    return r;
+}
+
+/* lookup metamethod 'ev' for a binary op: x side first, then y side.
+   returns 1 and fills *out when a handler fired. */
+static int vm_metabin(LucState *L,Value x,Value y,const char *ev,Value *out){
+    if(x.t==LT_TABLE && AS_TAB(x)->meta){
+        Value f=tab_get(AS_TAB(x)->meta,mkobj(LT_STR,str_fromc(ev)));
+        if(f.t==LT_FUNC||f.t==LT_CFUNC){ Value a[2]={x,y}; *out=meta_callv(L,f,a,2); return 1; }
+    }
+    if(y.t==LT_TABLE && AS_TAB(y)->meta){
+        Value f=tab_get(AS_TAB(y)->meta,mkobj(LT_STR,str_fromc(ev)));
+        if(f.t==LT_FUNC||f.t==LT_CFUNC){ Value a[2]={x,y}; *out=meta_callv(L,f,a,2); return 1; }
+    }
+    return 0;
+}
+
 static void vm_execute(LucState *L,int baselevel){
     CallInfo *ci; Closure *cl; Proto *pr; uint32_t *pc; Value *base; Value *K;
     V.cur=L;
@@ -1940,7 +2012,20 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(SETGLOBAL) { tab_set(V.globals,K[GET_Bx(ins)],base[A]); } VM_NEXT;
         VM_LABEL(GETUPVAL) { base[A]=*UPVAL_PTR(cl->up[GET_B(ins)]); } VM_NEXT;
         VM_LABEL(SETUPVAL) { *UPVAL_PTR(cl->up[GET_B(ins)])=base[A]; } VM_NEXT;
-        VM_LABEL(GETTABLE) { base[A]=vm_index(base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(GETTABLE) {
+            Value tv=base[GET_B(ins)], kv=base[GET_C(ins)];
+            Value r=vm_index(tv,kv);
+            if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
+                Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+                if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                    ci->savedpc=pc;
+                    r=meta_callv(L,h,(Value[]){tv,kv},2);
+                    ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                    L->top=ci->base+pr->maxstack;
+                }
+            }
+            base[A]=r;
+        } VM_NEXT;
         VM_LABEL(SETTABLE) { vm_setindex(base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
         VM_LABEL(NEWTABLE) {
             if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
@@ -1954,32 +2039,64 @@ static void vm_execute(LucState *L,int baselevel){
             L->top=ci->base+pr->maxstack;
         } VM_NEXT;
         VM_LABEL(SELF) {
-            base[A+1]=base[GET_B(ins)];
-            base[A]=vm_index(base[GET_B(ins)],base[GET_C(ins)]);
+            int rb=GET_B(ins);
+            base[A+1]=base[rb];
+            Value tv=base[rb], kv=base[GET_C(ins)];
+            Value r=vm_index(tv,kv);
+            if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
+                Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+                if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                    ci->savedpc=pc;
+                    r=meta_callv(L,h,(Value[]){tv,kv},2);
+                    ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                    L->top=ci->base+pr->maxstack;
+                }
+            }
+            base[A]=r;
         } VM_NEXT;
         VM_LABEL(ADD) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
-            base[A]=x.t==LT_NUM && y.t==LT_NUM
-                ? mknum(x.u.n+y.u.n)
-                : mknum(arith_num(x)+arith_num(y));
+            if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n+y.u.n); VM_NEXT; }
+            Value mr; ci->savedpc=pc;
+            if(vm_metabin(L,x,y,"__add",&mr)){
+                ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                L->top=ci->base+pr->maxstack;
+                base[A]=mr; VM_NEXT;
+            }
+            base[A]=mknum(arith_num(x)+arith_num(y));
         } VM_NEXT;
         VM_LABEL(SUB) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
-            base[A]=x.t==LT_NUM && y.t==LT_NUM
-                ? mknum(x.u.n-y.u.n)
-                : mknum(arith_num(x)-arith_num(y));
+            if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n-y.u.n); VM_NEXT; }
+            Value mr; ci->savedpc=pc;
+            if(vm_metabin(L,x,y,"__sub",&mr)){
+                ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                L->top=ci->base+pr->maxstack;
+                base[A]=mr; VM_NEXT;
+            }
+            base[A]=mknum(arith_num(x)-arith_num(y));
         } VM_NEXT;
         VM_LABEL(MUL) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
-            base[A]=x.t==LT_NUM && y.t==LT_NUM
-                ? mknum(x.u.n*y.u.n)
-                : mknum(arith_num(x)*arith_num(y));
+            if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n*y.u.n); VM_NEXT; }
+            Value mr; ci->savedpc=pc;
+            if(vm_metabin(L,x,y,"__mul",&mr)){
+                ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                L->top=ci->base+pr->maxstack;
+                base[A]=mr; VM_NEXT;
+            }
+            base[A]=mknum(arith_num(x)*arith_num(y));
         } VM_NEXT;
         VM_LABEL(DIV) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
-            base[A]=x.t==LT_NUM && y.t==LT_NUM
-                ? mknum(x.u.n/y.u.n)
-                : mknum(arith_num(x)/arith_num(y));
+            if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n/y.u.n); VM_NEXT; }
+            Value mr; ci->savedpc=pc;
+            if(vm_metabin(L,x,y,"__div",&mr)){
+                ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                L->top=ci->base+pr->maxstack;
+                base[A]=mr; VM_NEXT;
+            }
+            base[A]=mknum(arith_num(x)/arith_num(y));
         } VM_NEXT;
         VM_LABEL(MOD) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
@@ -1991,11 +2108,29 @@ static void vm_execute(LucState *L,int baselevel){
             }
         } VM_NEXT;
         VM_LABEL(POW) {
-            base[A]=mknum(pow(arith_num(base[GET_B(ins)]),arith_num(base[GET_C(ins)])));
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            if(x.t!=LT_NUM || y.t!=LT_NUM){
+                Value mr; ci->savedpc=pc;
+                if(vm_metabin(L,x,y,"__pow",&mr)){
+                    ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                    L->top=ci->base+pr->maxstack;
+                    base[A]=mr; VM_NEXT;
+                }
+            }
+            base[A]=mknum(pow(arith_num(x),arith_num(y)));
         } VM_NEXT;
         VM_LABEL(UNM) {
             Value x=base[GET_B(ins)];
-            base[A]=x.t==LT_NUM ? mknum(-x.u.n) : mknum(-arith_num(x));
+            if(x.t==LT_NUM){ base[A]=mknum(-x.u.n); VM_NEXT; }
+            if(x.t==LT_TABLE && AS_TAB(x)->meta){
+                Value mr; ci->savedpc=pc;
+                if(vm_metabin(L,x,x,"__unm",&mr)){
+                    ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                    L->top=ci->base+pr->maxstack;
+                    base[A]=mr; VM_NEXT;
+                }
+            }
+            base[A]=mknum(-arith_num(x));
         } VM_NEXT;
         VM_LABEL(NOT) { base[A]=mkbool(!truthy(base[GET_B(ins)])); } VM_NEXT;
         VM_LABEL(LEN) { base[A]=mknum((double)vm_len(base[GET_B(ins)])); } VM_NEXT;
@@ -2040,6 +2175,19 @@ static void vm_execute(LucState *L,int baselevel){
             int na = b? b-1 : (int)(L->top-(func+1));
             int nres = c? c-1 : -1;
             Value f=L->stack[func];
+            if(f.t==LT_TABLE){
+                Table *mtb=AS_TAB(f)->meta;
+                Value hf = mtb? tab_get(mtb,mkobj(LT_STR,str_fromc("__call"))) : NIL;
+                if(hf.t==LT_FUNC||hf.t==LT_CFUNC){
+                    ci->savedpc=pc;
+                    ensure_stack(L,func+na+64);
+                    base=L->stack+ci->base;
+                    for(int i=na;i>0;i--) L->stack[func+1+i]=L->stack[func+i];
+                    L->stack[func+1]=f;
+                    L->stack[func]=hf;
+                    f=hf; na=na+1;
+                } else luc_error("attempt to call a %s value",type_name(f));
+            }
             if(f.t==LT_CFUNC){
                 CFunc *cf=AS_CF(f);
                 ci->savedpc=pc; L->yield_A=A; L->yield_C=nres;
@@ -2279,6 +2427,9 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     if(*g_scriptdir && (src=try_dir(g_scriptdir,rel,len,found,fcap))) return src;
     /* fallback: also try CWD in case scriptdir is empty or relative */
     if((src=try_dir(".",rel,len,found,fcap))) return src;
+    /* local bundle first: ./luc_modules shadows the installed LUC_PATH so a
+       refreshed copy next to the project is always the one that loads */
+    if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
     const char *lp=getenv("LUC_PATH");
     if(lp){
 #if defined(_WIN32)
@@ -2295,7 +2446,6 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
             p = *q? q+1 : q;
         }
     }
-    if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
     return NULL;
 }
 
@@ -2389,6 +2539,8 @@ static void print_help(void){
     "LUC is an independent, register-based language implemented in C99.\n"
     "Pipeline: lexer -> parser -> AST -> bytecode compiler -> VM (mark & sweep GC).\n"
     "Syntax follows Lua 5.1 (all 21 keywords) plus LUC additions:\n"
+    "  import <name>       - load built-in or third-party modules (ai, json, ...)\n"
+    "  setmetatable/metatable-lite: __index, __call, __add..__pow, __unm, __tostring\n"
     "  [1,2,3] list literals with :append/:pop/:insert/:remove/:len/:contains\n"
     "  the 'in' membership operator, optional type annotations (x: number)\n"
     "  string.split/trim/startswith/endswith/tohex/fromhex\n"
@@ -2398,7 +2550,39 @@ static void print_help(void){
     LUC_VERSION);
 }
 
+/* -mwindows builds are GUI-subsystem: cmd does not attach stdout/stderr,
+   so print()/errors are invisible when run from a terminal. Re-attach to
+   the parent console if we have no standard handles (GUI subsystem run
+   from cmd/PowerShell). Double-clicked from Explorer: stay silent. */
+#if defined(_WIN32)
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004u
+#endif
+static void luc_win_enable_vt(HANDLE out){
+    DWORD mode=0;
+    if(out && out!=INVALID_HANDLE_VALUE && GetConsoleMode(out,&mode))
+        SetConsoleMode(out,mode|ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+}
+static void luc_win_attach_console(void){
+    HANDLE out=GetStdHandle(STD_OUTPUT_HANDLE);
+    if(out && out!=INVALID_HANDLE_VALUE){        /* console build or redirected */
+        luc_win_enable_vt(out);                  /* io.replace ANSI erase works */
+        return;
+    }
+    if(!AttachConsole(ATTACH_PARENT_PROCESS)) return;   /* double-click: quiet */
+    freopen("CONOUT$","w",stdout);
+    freopen("CONOUT$","w",stderr);
+    freopen("CONIN$","r",stdin);
+    SetConsoleOutputCP(65001);                   /* UTF-8 output */
+    SetConsoleCP(65001);
+    luc_win_enable_vt(GetStdHandle(STD_OUTPUT_HANDLE));
+}
+#else
+#define luc_win_attach_console() ((void)0)
+#endif
+
 int main(int argc,char **argv){
+    luc_win_attach_console();
     if(argc>0) snprintf(g_exepath,sizeof g_exepath,"%s",argv[0]);
     luc_init();
 

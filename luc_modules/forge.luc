@@ -1,0 +1,456 @@
+--  forge.lua -- LanternL's FULL CONTROL branch.
+--
+--  A small PyTorch-style module system built directly on the tensor2
+--  autograd engine.  Nothing here trains for you: you build modules,
+--  write your own loop, choose your own losses and schedules.  If
+--  LMTrain is an automatic camera, this is the darkroom.
+--
+--      local F = ai.forge()
+--
+--      local model = F.Sequential(
+--          F.Linear(2, 32), F.ReLU(),
+--          F.Linear(32, 16), F.GELU(),
+--          F.Linear(16, 1))
+--      local opt = F.optim.AdamW(model:parameters(), { lr = 1e-3 })
+--
+--      for step = 1, 1000 do
+--          local pred = model(x)                 -- __call -> :forward
+--          local loss = F.mse(pred, y)
+--          opt.zero_grad()
+--          loss:backward()
+--          opt.step()
+--      end
+--
+--  Conventions (documented, deliberate):
+--    * Tensors are ALWAYS 2-D matrices (rows, cols).  Flatten batches
+--      yourself; the engine underneath is 2-D too.
+--    * Linear stores weight as (out_features x in_features), PyTorch
+--      style: y = x * W^T + b.  Embedding stores (vocab x dim).
+--    * Targets for losses are either Tensors or flat Lua tables.
+--    * Module:train()/eval() flips the GLOBAL Tensor.training switch that
+--      functional dropout reads -- one switch, same as the rest of the
+--      library.  Call model:eval() before generating, :train() resuming.
+
+local matrix = require("matrix")
+local Tensor = require("tensor2")
+local optim2 = require("optim2")
+
+local forge = { version = "1.0" }
+
+local sqrt = math.sqrt
+local sformat = string.format
+local setmetatable = setmetatable
+
+-- ==========================================================================
+--  Module base
+-- ==========================================================================
+
+local Module = {}
+Module.__index = Module
+forge.Module = Module
+
+function Module:parameters()
+    local out = {}
+    self:_collect(out)
+    return out
+end
+
+function Module:_collect(out)
+    local own = self._params
+    if own then
+        for i = 1, #own do out[#out + 1] = own[i] end
+    end
+    local kids = self._modules
+    if kids then
+        for i = 1, #kids do kids[i]:_collect(out) end
+    end
+end
+
+function Module:zero_grad()
+    local p = self:parameters()
+    for i = 1, #p do p[i]:zero_grad() end
+    return self
+end
+
+--- Flips this module (and the global training switch functional dropout
+--- reads).  train(false) == eval().
+function Module:train(v)
+    v = (v == nil) and true or (v and true or false)
+    self._training = v
+    Tensor.training = v
+    return self
+end
+
+function Module:eval()
+    return self:train(false)
+end
+
+function Module:nparams()
+    local p = self:parameters()
+    local n = 0
+    for i = 1, #p do
+        n = n + p[i].data.rows * p[i].data.cols
+    end
+    return n
+end
+
+Module.__call = function(self, ...)
+    return self:forward(...)
+end
+
+-- Subclass helper: keeps the Module chain intact for user-defined blocks.
+-- The returned class is CALLABLE -- C(...) delegates to C.new(...), so
+-- user modules read exactly like torch:   local b = MyBlock(16)
+function Module.subclass(name)
+    local C = setmetatable({}, { __index = Module })
+    C.__index = C
+    C.classname = name or "Module"
+    -- Metamethods do NOT resolve through __index chains -- every class
+    -- needs its own copy or m(x) won't route into m:forward(x).
+    C.__call = Module.__call
+    -- constructor-dispatching metamethod on the CLASS itself
+    getmetatable(C).__call = function(cls, ...)
+        if type(cls.new) == "function" then return cls.new(...) end
+        error("forge: class '" .. C.classname .. "' has no .new constructor", 2)
+    end
+    return C
+end
+
+local function newmodule(C)
+    return setmetatable({}, C or Module)
+end
+
+-- ==========================================================================
+--  Parameter initialisation helpers
+-- ==========================================================================
+
+local function make_param(rows, cols, kind, arg)
+    local m = matrix.alloc(rows, cols)
+    local d = m.data
+    -- NB: matrix.alloc does NOT pre-zero its storage; every element must
+    -- be written here before anything reads it.
+    if kind == "zeros" then
+        for k = 1, rows * cols do d[k] = 0 end
+    elseif kind == "ones" then
+        for k = 1, rows * cols do d[k] = 1 end
+    elseif kind == "uniform" then
+        for k = 1, rows * cols do d[k] = (math.random() * 2 - 1) * arg end
+    else
+        error("forge: unknown init kind '" .. tostring(kind) .. "'", 3)
+    end
+    return Tensor.param(m)
+end
+
+--- Constant leaf (no gradient flows into constants).
+function forge.const(rows, cols, value)
+    return Tensor.new(matrix.fill(rows, cols, value), nil, "leaf", nil)
+end
+
+-- ==========================================================================
+--  Layers
+-- ==========================================================================
+
+local Linear = Module.subclass("Linear")
+
+--- Linear(in_features, out_features, { bias = true })
+--- Weight is (out x in), y = x * W^T (+ b).  Init: U(-k, k), k = 1/sqrt(in).
+forge.Linear = function(in_features, out_features, opts)
+    opts = opts or {}
+    local self = newmodule(Linear)
+    self.in_features = in_features
+    self.out_features = out_features
+    local k = 1 / sqrt(in_features)
+    self.weight = make_param(out_features, in_features, "uniform", k)
+    self._params = { self.weight }
+    if opts.bias ~= false then
+        self.bias = make_param(1, out_features, "zeros")
+        self._params[2] = self.bias
+    end
+    return self
+end
+
+function Linear:forward(x)
+    local y = Tensor.matmul_nt(x, self.weight)
+    if self.bias then y = Tensor.add_rows(y, self.bias) end
+    return y
+end
+
+local Embedding = Module.subclass("Embedding")
+
+--- Embedding(vocab_size, dim): forward takes a TABLE of token ids.
+forge.Embedding = function(vocab_size, dim)
+    local self = newmodule(Embedding)
+    self.vocab_size = vocab_size
+    self.dim = dim
+    self.weight = make_param(vocab_size, dim, "uniform", 1 / sqrt(dim))
+    self._params = { self.weight }
+    return self
+end
+
+function Embedding:forward(ids)
+    if type(ids) ~= "table" then
+        error("Embedding:forward expects a Lua table of token ids, got " .. type(ids), 2)
+    end
+    return Tensor.embed(self.weight, ids)
+end
+
+local RMSNorm = Module.subclass("RMSNorm")
+
+forge.RMSNorm = function(dim, eps)
+    local self = newmodule(RMSNorm)
+    self.dim = dim
+    self.eps = eps or 1e-5
+    self.weight = make_param(1, dim, "ones")
+    self._params = { self.weight }
+    return self
+end
+
+function RMSNorm:forward(x)
+    return Tensor.rmsnorm(x, self.weight, self.eps)
+end
+
+local LayerNorm = Module.subclass("LayerNorm")
+
+forge.LayerNorm = function(dim, opts)
+    opts = opts or {}
+    local self = newmodule(LayerNorm)
+    self.dim = dim
+    self.eps = opts.eps or 1e-5
+    self.weight = make_param(1, dim, "ones")
+    self._params = { self.weight }
+    if opts.bias ~= false then
+        self.bias = make_param(1, dim, "zeros")
+        self._params[2] = self.bias
+    end
+    return self
+end
+
+function LayerNorm:forward(x)
+    return Tensor.layernorm(x, self.weight, self.bias, self.eps)
+end
+
+local Dropout = Module.subclass("Dropout")
+
+forge.Dropout = function(p)
+    local self = newmodule(Dropout)
+    self.p = p or 0
+    return self
+end
+
+function Dropout:forward(x)
+    return Tensor.dropout(x, self.p)
+end
+
+local Sequential = Module.subclass("Sequential")
+
+--- Sequential(module1, module2, ...) or Sequential({ m1, m2, ... })
+forge.Sequential = function(...)
+    local self = newmodule(Sequential)
+    local items = { ... }
+    if #items == 1 and type(items[1]) == "table" and items[1].forward == nil then
+        items = items[1]
+    end
+    self._modules = {}
+    for i = 1, #items do
+        local m = items[i]
+        if type(m) ~= "table" or type(m.forward) ~= "function" then
+            error(sformat("Sequential: item %d has no :forward -- not a module", i), 2)
+        end
+        self._modules[i] = m
+    end
+    return self
+end
+
+function Sequential:forward(x)
+    for i = 1, #self._modules do
+        x = self._modules[i]:forward(x)
+    end
+    return x
+end
+
+function Sequential:get(i)
+    return self._modules[i]
+end
+
+function Sequential:len()
+    return #self._modules
+end
+
+-- --------------------------------------------------------------------------
+--  Activations
+-- --------------------------------------------------------------------------
+
+local function activation(name, fn)
+    local C = Module.subclass(name)
+    -- fn receives just the input; C.forward receives (self, input).
+    C.forward = function(_, x) return fn(x) end
+    forge[name] = function()
+        return newmodule(C)
+    end
+    return C
+end
+
+activation("ReLU", function(x) return Tensor.relu(x) end)
+activation("SiLU", function(x) return Tensor.silu(x) end)
+activation("Tanh", function(x) return Tensor.tanh(x) end)
+
+--- GELU, tanh approximation -- composed entirely from engine primitives, so
+--- autograd through it is free (a good example of building your own ops).
+local gelu_c = sqrt(2 / math.pi)
+activation("GELU", function(x)
+    local r, c = x.data.rows, x.data.cols
+    local xc = Tensor.mul(x, Tensor.mul(x, x))              -- x^3
+    local inner = Tensor.scale(Tensor.add(x, Tensor.scale(xc, 0.044715)), gelu_c)
+    local t = Tensor.tanh(inner)
+    return Tensor.scale(Tensor.mul(x, Tensor.add(t, forge.const(r, c, 1))), 0.5)
+end)
+
+local SoftmaxRows = Module.subclass("SoftmaxRows")
+
+--- SoftmaxRows({ causal = false }): softmax across each ROW (dim -1 in
+--- torch terms -- the engine is 2-D, rows are the batch/time axis).
+forge.SoftmaxRows = function(opts)
+    local self = newmodule(SoftmaxRows)
+    self.opts = opts
+    return self
+end
+
+function SoftmaxRows:forward(x)
+    return Tensor.softmax_rows(x, self.opts)
+end
+
+-- ==========================================================================
+--  Losses
+-- ==========================================================================
+
+local BACKWARD = Tensor.ops   -- live reference to tensor2's backward table
+
+local function target_data(t, rows, cols, who)
+    if Tensor.is(t) then return t.data.data end
+    if type(t) == "table" then
+        if #t ~= rows * cols then
+            error(sformat("%s: expected %d target values, got %d", who, rows * cols, #t), 3)
+        end
+        return t
+    end
+    error(who .. ": target must be a Tensor or a flat Lua table", 3)
+end
+
+local function register_elementwise_loss(opname, elem_grad, total_fn)
+    local fwd = function(pred, target, opts)
+        if not Tensor.is(pred) then
+            error(opname .. ": prediction must be a Tensor", 2)
+        end
+        local rows, cols = pred.data.rows, pred.data.cols
+        local td = target_data(target, rows, cols, opname)
+        local pd = pred.data.data
+        local n = rows * cols
+        local total = 0
+        for k = 1, n do
+            total = total + total_fn(pd[k], td[k])
+        end
+        local outm = matrix.alloc(1, 1)
+        outm.data[1] = (opts and opts.reduction == "sum") and total or (total / n)
+        return Tensor.new(outm, { pred }, opname,
+            { t = td, n = n, reduction = opts and opts.reduction })
+    end
+
+    BACKWARD[opname] = function(nd)
+        local g = nd._grad
+        if not g then return end
+        local ctx = nd.ctx
+        local gv = g.data[1]
+        if ctx.reduction ~= "sum" then gv = gv * 2 / ctx.n end
+        local pg = Tensor.gradbuf(nd.children[1]).data
+        local pd = nd.children[1].data.data
+        local td, n = ctx.t, ctx.n
+        for k = 1, n do
+            pg[k] = pg[k] + gv * elem_grad(pd[k], td[k])
+        end
+    end
+
+    return fwd
+end
+
+--- F.mse(pred, target, { reduction = "mean"|"sum" })
+forge.mse = register_elementwise_loss("mse",
+    function(pd, td) return pd - td end,
+    function(pd, td)
+        local d = pd - td
+        return d * d
+    end)
+
+--- F.l1(pred, target, { reduction = "mean"|"sum" })
+forge.l1 = register_elementwise_loss("l1",
+    function(pd, td)
+        if pd > td then return 1 elseif pd < td then return -1 else return 0 end
+    end,
+    function(pd, td)
+        local d = pd - td
+        if d < 0 then return -d end
+        return d
+    end)
+
+forge.MSELoss = Module.subclass("MSELoss")
+forge.MSELoss.forward = function(self, pred, target, opts)
+    return forge.mse(pred, target, opts)
+end
+
+forge.L1Loss = Module.subclass("L1Loss")
+forge.L1Loss.forward = function(self, pred, target, opts)
+    return forge.l1(pred, target, opts)
+end
+
+--- F.cross_entropy(logits, targets, opts): targets are CLASS IDS
+--- (1..vocab), one per row -- the engine convention, like torch.cross_entropy
+--- receiving long indices.
+forge.cross_entropy = function(logits, targets, opts)
+    return Tensor.cross_entropy(logits, targets, opts)
+end
+
+forge.CrossEntropyLoss = Module.subclass("CrossEntropyLoss")
+forge.CrossEntropyLoss.forward = function(self, logits, targets, opts)
+    return forge.cross_entropy(logits, targets, opts)
+end
+
+-- ==========================================================================
+--  Optimizers (accept a Module OR a plain parameter list)
+-- ==========================================================================
+
+local function as_param_list(x, who)
+    if type(x) == "table" and type(x.parameters) == "function"
+        and type(x.forward) == "function" then
+        return x:parameters()
+    end
+    return x
+end
+
+forge.optim = {
+    SGD = function(params, cfg) return optim2.SGD(as_param_list(params), cfg) end,
+    AdamW = function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end,
+    Adam = function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end,
+    create = function(kind, params, cfg) return optim2.create(kind, as_param_list(params), cfg) end,
+}
+
+-- ==========================================================================
+--  Utilities
+-- ==========================================================================
+
+function forge.manual_seed(seed)
+    math.randomseed(seed)
+    return forge
+end
+
+forge.no_grad = function(fn, ...) return Tensor.no_grad(fn, ...) end
+forge.enable_grad = function(v) return Tensor.set_grad_enabled(v ~= false) end
+forge.rand = function(rows, cols, scale) return Tensor.random(rows, cols, scale) end
+forge.zeros = function(rows, cols) return Tensor.zeros(rows, cols) end
+forge.from = function(t) return Tensor.from(t) end
+forge.Tensor = Tensor
+forge.Matrix = matrix
+
+--- Freeze/unfreeze by simply excluding parameters from the optimizer list --
+--- documented trick, no library magic needed:
+---     opt = F.optim.AdamW(head_only_parameters, {lr=...})
+
+return forge

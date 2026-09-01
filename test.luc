@@ -1,0 +1,857 @@
+-- ============================================================
+-- minesweeper.luc -- MINESWEEPER viet bang ngon ngu LUC
+-- Dung thu vien window (SDL2) co san trong LUC
+--   (khong can SDL2_ttf / SDL2_image: chu dung font bitmap 5x7,
+--    nen toan bo text viet hoa khong dau)
+--
+-- Build luc.exe co window (Windows MinGW):
+--   gcc -O2 -s -std=c99 -DLUC_WINDOW -DLUC_NO_TTF -DLUC_NO_IMAGE
+--       -o luc.exe src/luc_core.c src/luc_libs.c -lm -lSDL2
+-- Choi:
+--   luc.exe minesweeper.luc
+--
+-- Cach choi:
+--   Chuot trai        : mo o
+--   Chuot phai        : co -> dau hoi -> xoa co
+--   Chuot giua / click vao so du co du : mo nhanh cac o quanh (chord)
+--   1 / 2 / 3         : chuyen do kho (DE / VUA / KHO)
+--   R                 : choi lai
+--   ESC               : thoat
+--   Click mat cuoi    : choi lai
+--
+-- Ky luc moi do kho duoc luu vao file luc_minesweeper_best.txt
+-- Chay tu kiem tra loi:  MS_TEST=1 luc minesweeper.luc
+-- Chup anh man hinh demo: MS_SHOT=30 luc minesweeper.luc (ms_demo.bmp)
+-- ============================================================
+local w = require("window")
+
+-- ---------------- cau hinh do kho ----------------
+local DIFFS = {
+    { name = "DE",  cols = 9,  rows = 9,  mines = 10 },
+    { name = "VUA", cols = 16, rows = 16, mines = 40 },
+    { name = "KHO", cols = 30, rows = 16, mines = 99 },
+}
+
+local CELL   = 34   -- kich thuoc 1 o (px)
+local MARGIN = 12   -- le cua so
+local MENU_H = 32   -- chieu cao thanh menu
+local HUD_H  = 60   -- chieu cao bang dem gio / mat cuoi
+
+-- ---------------- mau sac ----------------
+local BG        = "#14161f"   -- nen cua so
+local PANEL     = "#1e2230"   -- nen thanh menu / hud
+local PANEL_DK  = "#171a26"
+local CELL_UP   = "#2d3345"   -- o chua mo
+local CELL_UP_H = "#3a4260"   -- o chua mo (hover)
+local CELL_DN   = "#1a1e2b"   -- o da mo
+local CELL_BOM  = "#822626"   -- o chua min vua no
+local BEV_L     = "#414a66"   -- bevel sang (tren / trai)
+local BEV_D     = "#151824"   -- bevel toi (duoi / phai)
+local GRID_LN   = "#0f1119"   -- ke o da mo
+local TXT_DIM   = "#8a93ad"
+local TXT_MED   = "#c7cde0"
+local TXT_WHI   = "#eef1fa"
+local LED_BG    = "#0a0c12"
+local LED_RED   = "#ff4b4b"
+local FLAG_C    = "#ff5566"
+local POLE_C    = "#dfe3ee"
+local MINE_C    = "#e8ebf4"
+local GOOD_GRN  = "#58d68d"
+local BAD_RED   = "#ff6b6b"
+local GOLD      = "#ffd166"
+local GOLD_DK   = "#c9a13b"
+local ACCENT    = "#5aa2ff"
+local OVERLAY   = { r = 6, g = 8, b = 16, a = 172 }
+
+-- mau so 1..8 (phong cach minesweeper kinh dien)
+local NUM_COL = {
+    "#5aa2ff", "#69d869", "#ff5f5f", "#b48cff",
+    "#ffb454", "#4fd8c8", "#e8e8f0", "#98a0b3",
+}
+
+-- ---------------- trang thai game ----------------
+local diff      = 1        -- chi so do kho hien tai (1..3)
+local cols, rows = 9, 9
+local mines_tot = 10
+local grid      = {}       -- grid[y][x] = {m,r,f,n,boom,wrong}
+local state     = "ready"  -- ready | play | win | lose
+local mines_placed = false
+local mine_cnt  = 0
+local flags_cnt = 0
+local rev_cnt   = 0
+local tsec      = 0        -- giay da choi
+local boom_x, boom_y = 0, 0
+
+-- layout (tinh lai khi doi do kho)
+local GX, GY = 0, 0        -- goc tren trai cua luoi o
+local WW, WH = 0, 0        -- kich thuoc cua so
+
+local best = { -1, -1, -1 }  -- ky luc theo do kho; -1 = chua co
+local save_best = nil        -- gan o phan ky luc ben duoi
+
+-- ---------------- tien ich ----------------
+local function floor(n) return math.floor(n) end
+
+local function center_text(s, cx, cy, col, size)
+    local tw, th = w.text_size(s, size)
+    w.text(s, floor(cx - tw / 2), floor(cy - th / 2), col, size)
+end
+
+-- do size chu lon nhat (buoc 8px cho font bitmap) de chu vua be rong
+local function fit_size(s, want, maxw)
+    local len = string.len(s)
+    local max_scale = floor(maxw / (len * 6))
+    if max_scale < 1 then max_scale = 1 end
+    local scale = floor(want / 8)
+    if scale > max_scale then scale = max_scale end
+    if scale < 1 then scale = 1 end
+    return scale * 8
+end
+
+local function center_fit(s, cy, col, want)
+    center_text(s, WW / 2, cy, col, fit_size(s, want, WW - 24))
+end
+
+local function in_board(x, y)
+    return x >= 1 and x <= cols and y >= 1 and y <= rows
+end
+
+-- ---------------- tao / dat lai ban co ----------------
+local function new_game()
+    cols      = DIFFS[diff].cols
+    rows      = DIFFS[diff].rows
+    mines_tot = DIFFS[diff].mines
+    grid = {}
+    for y = 1, rows do
+        local row = {}
+        for x = 1, cols do
+            row[x] = { m = false, r = false, f = 0, n = 0, boom = false, wrong = false }
+        end
+        grid[y] = row
+    end
+    state = "ready"
+    mines_placed = false
+    mine_cnt  = 0
+    flags_cnt = 0
+    rev_cnt   = 0
+    tsec      = 0
+    boom_x, boom_y = 0, 0
+end
+
+local function apply_difficulty(d)
+    diff = d
+    cols, rows = DIFFS[diff].cols, DIFFS[diff].rows
+    GX = MARGIN
+    GY = MARGIN + MENU_H + HUD_H
+    WW = cols * CELL + 2 * MARGIN
+    WH = GY + rows * CELL + MARGIN
+    new_game()
+end
+
+-- ---------------- sinh min (lan click dau tien) ----------------
+local function place_mines(sx, sy)
+    -- khong dat min vao o dau tien va 8 o quanh no (neu du cho)
+    local excl = {}
+    local nx = 0
+    for dy = -1, 1 do
+        for dx = -1, 1 do
+            local x, y = sx + dx, sy + dy
+            if in_board(x, y) then
+                excl[(y - 1) * cols + x] = true
+                nx = nx + 1
+            end
+        end
+    end
+    if cols * rows - nx < mines_tot then
+        excl = {}
+        excl[(sy - 1) * cols + sx] = true
+    end
+    local placed = 0
+    while placed < mines_tot do
+        local p = math.random(1, cols * rows)
+        if not excl[p] then
+            local y = floor((p - 1) / cols) + 1
+            local x = p - (y - 1) * cols
+            if not grid[y][x].m then
+                grid[y][x].m = true
+                placed = placed + 1
+            end
+        end
+    end
+    -- dem so min lan can
+    for y = 1, rows do
+        for x = 1, cols do
+            local c = 0
+            for dy = -1, 1 do
+                for dx = -1, 1 do
+                    if not (dx == 0 and dy == 0) and in_board(x + dx, y + dy) then
+                        if grid[y + dy][x + dx].m then c = c + 1 end
+                    end
+                end
+            end
+            grid[y][x].n = c
+        end
+    end
+    mines_placed = true
+    mine_cnt = mines_tot
+end
+
+-- ---------------- thua / thang ----------------
+local function do_lose(sx, sy)
+    state = "lose"
+    boom_x, boom_y = sx, sy
+    for y = 1, rows do
+        for x = 1, cols do
+            local c = grid[y][x]
+            if c.m then c.r = true end                  -- lo het min
+            if c.f == 1 and not c.m then c.wrong = true end -- co sai
+        end
+    end
+end
+
+local function count_revealed()
+    local n = 0
+    for y = 1, rows do
+        for x = 1, cols do
+            if grid[y][x].r then n = n + 1 end
+        end
+    end
+    return n
+end
+
+local function check_win()
+    if state ~= "play" then return end
+    if rev_cnt >= cols * rows - mine_cnt then
+        state = "win"
+        for y = 1, rows do
+            for x = 1, cols do
+                if grid[y][x].m then grid[y][x].f = 1 end  -- tu dong cam co
+            end
+        end
+        flags_cnt = mine_cnt
+        -- luu ky luc
+        if best[diff] < 0 or tsec < best[diff] then
+            best[diff] = tsec
+            if save_best then save_best() end
+        end
+    end
+end
+
+-- ---------------- mo o (flood fill bang ngan xep) ----------------
+local function flood_reveal(sx, sy)
+    local stack = {}
+    local top = 0
+    top = top + 1
+    stack[top] = { sx, sy }
+    while top > 0 do
+        local p = stack[top]
+        stack[top] = nil
+        top = top - 1
+        local x, y = p[1], p[2]
+        if in_board(x, y) then
+            local c = grid[y][x]
+            if not c.r and not c.m and c.f ~= 1 then
+                c.r = true
+                rev_cnt = rev_cnt + 1
+                if c.n == 0 then
+                    for dy = -1, 1 do
+                        for dx = -1, 1 do
+                            if not (dx == 0 and dy == 0) then
+                                top = top + 1
+                                stack[top] = { x + dx, y + dy }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function reveal(sx, sy)
+    if state ~= "ready" and state ~= "play" then return end
+    if not in_board(sx, sy) then return end
+    local c = grid[sy][sx]
+    if c.r or c.f == 1 then return end      -- co chan mo o (nhu ban goc)
+    if c.f == 2 then c.f = 0 end            -- dau hoi: mo binh thuong
+    if state == "ready" then
+        place_mines(sx, sy)
+        state = "play"
+    end
+    if c.m then
+        c.boom = true
+        do_lose(sx, sy)
+        return
+    end
+    flood_reveal(sx, sy)
+    check_win()
+end
+
+-- ---------------- cam co / dau hoi ----------------
+local function toggle_flag(sx, sy)
+    if state ~= "ready" and state ~= "play" then return end
+    if not in_board(sx, sy) then return end
+    local c = grid[sy][sx]
+    if c.r then return end
+    if c.f == 0 then c.f = 1; flags_cnt = flags_cnt + 1
+    elseif c.f == 1 then c.f = 2; flags_cnt = flags_cnt - 1
+    else c.f = 0 end
+end
+
+-- ---------------- chord (mo nhanh nhieu o) ----------------
+local function chord(sx, sy)
+    if state ~= "ready" and state ~= "play" then return end
+    if not in_board(sx, sy) then return end
+    local c = grid[sy][sx]
+    if not c.r or c.n == 0 then return end
+    local fl = 0
+    for dy = -1, 1 do
+        for dx = -1, 1 do
+            if not (dx == 0 and dy == 0) and in_board(sx + dx, sy + dy) then
+                if grid[sy + dy][sx + dx].f == 1 then fl = fl + 1 end
+            end
+        end
+    end
+    if fl ~= c.n then return end
+    for dy = -1, 1 do
+        for dx = -1, 1 do
+            if not (dx == 0 and dy == 0) then
+                local x, y = sx + dx, sy + dy
+                if in_board(x, y) then
+                    local nc = grid[y][x]
+                    if not nc.r and nc.f ~= 1 then
+                        reveal(x, y)   -- reveal tu xu ly truong hop trung min
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ---------------- ky luc (luu / doc file) ----------------
+local BEST_FILE = "luc_minesweeper_best.txt"
+
+save_best = function()
+    local ok, err = pcall(function()
+        local f = io.open(BEST_FILE, "w")
+        if f then
+            for i = 1, 3 do
+                if best[i] >= 0 then
+                    f:write(i .. " " .. string.format("%.2f", best[i]) .. "\n")
+                end
+            end
+            f:close()
+        end
+    end)
+    if not ok then print("Khong luu duoc ky luc: " .. tostring(err)) end
+end
+
+local function load_best()
+    local ok, err = pcall(function()
+        local f = io.open(BEST_FILE, "r")
+        if not f then return end
+        local data = f:read("*a")
+        f:close()
+        for line in string.gmatch(data, "[^\r\n]+") do
+            local d, t = string.match(line, "^(%d+)%s+([%d%.]+)$")
+            if d and t then
+                local di = tonumber(d)
+                local tv = tonumber(t)
+                if di and tv and di >= 1 and di <= 3 then
+                    if best[di] < 0 or tv < best[di] then best[di] = tv end
+                end
+            end
+        end
+    end)
+    if not ok then print("Khong doc duoc ky luc: " .. tostring(err)) end
+end
+
+-- ---------------- che do tu kiem tra (MS_TEST=1) ----------------
+local function run_selftest()
+    print("MS TEST: bat dau tu kiem tra logic minesweeper...")
+    local fails = 0
+    local function T(name, cond)
+        if cond then
+            print("  [PASS] " .. name)
+        else
+            fails = fails + 1
+            print("  [FAIL] " .. name)
+        end
+    end
+
+    -- A) chu ky cam co: khong -> co -> dau hoi -> khong
+    apply_difficulty(1)
+    new_game()
+    T("state ban dau = ready", state == "ready")
+    T("grid 9x9 da tao", rows == 9 and cols == 9 and grid[9] ~= nil and grid[9][9] ~= nil)
+    T("chua dat min truoc click dau", mines_placed == false)
+    toggle_flag(3, 3)
+    T("co duoc cam", grid[3][3].f == 1 and flags_cnt == 1)
+    toggle_flag(3, 3)
+    T("dau hoi thay co", grid[3][3].f == 2 and flags_cnt == 0)
+    toggle_flag(3, 3)
+    T("xoa dau hoi", grid[3][3].f == 0)
+
+    -- B) click dau tien: sinh min + mo vung an toan
+    reveal(5, 5)
+    T("min da duoc sinh sau click dau", mines_placed and mine_cnt == 10)
+    T("click dau tien khong trung min", grid[5][5].r and not grid[5][5].m)
+    T("state chuyen sang play", state == "play")
+    T("mo duoc vung > 1 o", rev_cnt > 1)
+
+    -- C) tim min -> click -> thua
+    local mxf, myf = 0, 0
+    for y = 1, rows do
+        for x = 1, cols do
+            if grid[y][x].m then mxf, myf = x, y end
+        end
+    end
+    T("co it nhat 1 min tren ban", mxf > 0)
+    if mxf > 0 then
+        reveal(mxf, myf)
+        T("trung min -> lose", state == "lose")
+        T("min da lo het", count_revealed() >= mine_cnt)
+    end
+
+    -- D) 50 van ngau nhien: mo het o an toan -> phai thang
+    local wins = 0
+    for i = 1, 50 do
+        apply_difficulty((i % 3) + 1)
+        reveal(math.random(1, cols), math.random(1, rows))
+        for y = 1, rows do
+            for x = 1, cols do
+                local c = grid[y][x]
+                if not c.m then
+                    c.f = 0
+                    reveal(x, y)
+                end
+            end
+        end
+        if state == "win" then wins = wins + 1 end
+    end
+    T("50 van choi deu thang khi mo het o an toan", wins == 50)
+
+    -- E) chord khong lam crash interpreter
+    local okchord = pcall(function()
+        apply_difficulty(1)
+        reveal(5, 5)
+        for y = 1, rows do
+            for x = 1, cols do
+                chord(x, y)
+            end
+        end
+    end)
+    T("chord an toan (pcall)", okchord)
+
+    -- F) luu / doc ky luc
+    apply_difficulty(1)
+    best[1] = 12.5
+    local oksave = pcall(save_best)
+    T("save_best chay khong loi", oksave)
+    best[1] = -1
+    local okload = pcall(load_best)
+    T("load_best chay khong loi", okload)
+    T("ky luc duoc nap lai dung", best[1] >= 0 and best[1] <= 12.5)
+
+    if fails == 0 then
+        print("MS TEST: ALL PASSED")
+    else
+        print("MS TEST: " .. fails .. " FAILURES")
+    end
+    os.exit(fails == 0 and 0 or 1)
+end
+
+-- ================================ VE ================================
+
+local function bevel_up(x, y, bw, bh)
+    -- bevel nang len: sang tren/trai, toi duoi/phai
+    w.rect(x, y, bw, 2, BEV_L)
+    w.rect(x, y, 2, bh, BEV_L)
+    w.rect(x, y + bh - 2, bw, 2, BEV_D)
+    w.rect(x + bw - 2, y, 2, bh, BEV_D)
+end
+
+local function bevel_down(x, y, bw, bh)
+    -- bevel lui vao: toi tren/trai, sang duoi/phai
+    w.rect(x, y, bw, 2, BEV_D)
+    w.rect(x, y, 2, bh, BEV_D)
+    w.rect(x, y + bh - 2, bw, 2, BEV_L)
+    w.rect(x + bw - 2, y, 2, bh, BEV_L)
+end
+
+local function draw_flag(px, py, col)
+    -- cot co
+    w.rect(px + 15, py + 7, 2, 18, POLE_C)
+    w.rect(px + 10, py + 25, 12, 2, POLE_C)
+    -- la co (tam giac)
+    w.triangle(px + 17, py + 7, px + 17, py + 17, px + 27, py + 12, col)
+end
+
+local function draw_mine(px, py, col)
+    local cx, cy = px + 17, py + 17
+    w.circle(cx, cy, 7, col)
+    w.line(cx - 10, cy, cx + 10, cy, col)
+    w.line(cx, cy - 10, cx, cy + 10, col)
+    w.line(cx - 7, cy - 7, cx + 7, cy + 7, col)
+    w.line(cx - 7, cy + 7, cx + 7, cy - 7, col)
+end
+
+local function draw_cell(x, y, mx, my)
+    local px = GX + (x - 1) * CELL
+    local py = GY + (y - 1) * CELL
+    local c = grid[y][x]
+
+    if c.r then
+        -- o da mo
+        local bg = CELL_DN
+        if c.boom then bg = CELL_BOM end
+        w.rect(px, py, CELL, CELL, bg)
+        w.rect_outline(px, py, CELL, CELL, GRID_LN)
+        if c.m then
+            draw_mine(px, py, c.boom and TXT_WHI or MINE_C)
+        elseif c.n > 0 then
+            local s = tostring(c.n)
+            local tw, th = w.text_size(s, 16)
+            w.text(s, px + floor((CELL - tw) / 2), py + floor((CELL - th) / 2),
+                   NUM_COL[c.n], 16)
+        end
+        if c.wrong then
+            -- co sai: min + gach cheo do
+            w.line(px + 6, py + 6, px + CELL - 7, py + CELL - 7, BAD_RED)
+            w.line(px + CELL - 7, py + 6, px + 6, py + CELL - 7, BAD_RED)
+        end
+    else
+        -- o chua mo (bevel nang len)
+        local hov = (state == "ready" or state == "play")
+                    and mx >= px and mx < px + CELL
+                    and my >= py and my < py + CELL
+        w.rect(px, py, CELL, CELL, hov and CELL_UP_H or CELL_UP)
+        bevel_up(px, py, CELL, CELL)
+        if c.f == 1 then
+            if state == "win" then
+                draw_flag(px, py, GOOD_GRN)   -- thang: co min mau xanh
+            else
+                draw_flag(px, py, FLAG_C)
+            end
+        elseif c.f == 2 then
+            center_text("?", px + CELL / 2, py + CELL / 2, TXT_MED, 16)
+        end
+    end
+end
+
+-- ------ cac nut / bang tren HUD ------
+local menu_btns = {}   -- dien lai moi frame (x,y,w,h cho tung nut)
+
+local function draw_menu_bar(mx, my)
+    w.rect(0, 0, WW, MARGIN, BG)
+    w.rect(0, MARGIN, WW, MENU_H, PANEL)
+    w.rect(0, MARGIN + MENU_H, WW, 1, PANEL_DK)
+
+    menu_btns = {}
+    local bx = MARGIN
+    for i = 1, 3 do
+        local label = i .. " " .. DIFFS[i].name
+        local tw = w.text_size(label, 16)
+        local bw = tw + 22
+        local by = MARGIN + 4
+        local bh = MENU_H - 8
+        local act = (i == diff)
+        local hov = mx >= bx and mx < bx + bw and my >= by and my < by + bh
+        w.rect(bx, by, bw, bh, act and "#232a3d" or (hov and "#20263a" or PANEL_DK))
+        if act then
+            w.rect_outline(bx, by, bw, bh, ACCENT)
+        end
+        center_text(label, bx + bw / 2, by + bh / 2,
+                    act and TXT_WHI or TXT_DIM, 16)
+        menu_btns[i] = { x = bx, y = by, w = bw, h = bh }
+        bx = bx + bw + 8
+    end
+
+    -- ten game (chi hien neu du rong)
+    local title = "LUC MINESWEEPER"
+    local ttw = w.text_size(title, 16)
+    if bx + ttw + 30 < WW then
+        center_text(title, (bx + WW) / 2 + 4, MARGIN + MENU_H / 2, TXT_DIM, 16)
+    end
+end
+
+local function draw_led_panel(x, y, bw, bh, s)
+    w.rect(x, y, bw, bh, LED_BG)
+    bevel_down(x, y, bw, bh)
+    local tw, th = w.text_size(s, 24)
+    w.text(s, x + floor((bw - tw) / 2), y + floor((bh - th) / 2), LED_RED, 24)
+end
+
+local face_rect = { x = 0, y = 0, w = 0, h = 0 }
+
+local function draw_face(mx, my)
+    local fw = 44
+    local fx = GX + floor((cols * CELL - fw) / 2)
+    local fy = GY - HUD_H + floor((HUD_H - fw) / 2)
+    face_rect = { x = fx, y = fy, w = fw, h = fw }
+
+    local hov = mx >= fx and mx < fx + fw and my >= fy and my < fy + fw
+    w.rect(fx - 2, fy - 2, fw + 4, fw + 4, PANEL)
+    if state == "lose" then
+        w.circle(fx + 22, fy + 22, 19, "#e06c5a")
+    elseif hov then
+        w.circle(fx + 22, fy + 22, 19, "#ffe08a")
+    else
+        w.circle(fx + 22, fy + 22, 19, GOLD)
+    end
+    w.circle_outline(fx + 22, fy + 22, 19, GOLD_DK)
+
+    if state == "lose" then
+        -- mat X X (2 mat cheo)
+        w.line(fx + 12, fy + 13, fx + 19, fy + 20, "#402a10")
+        w.line(fx + 19, fy + 13, fx + 12, fy + 20, "#402a10")
+        w.line(fx + 25, fy + 13, fx + 32, fy + 20, "#402a10")
+        w.line(fx + 32, fy + 13, fx + 25, fy + 20, "#402a10")
+        w.line(fx + 14, fy + 30, fx + 30, fy + 30, "#402a10")
+    else
+        -- 2 mat ngang
+        w.rect(fx + 13, fy + 13, 4, 7, "#402a10")
+        w.rect(fx + 27, fy + 13, 4, 7, "#402a10")
+        if state == "win" then
+            -- cuoi rong (3 bac)
+            w.rect(fx + 13, fy + 27, 18, 3, "#402a10")
+            w.rect(fx + 15, fy + 30, 14, 2, "#402a10")
+            w.rect(fx + 18, fy + 32, 8, 2, "#402a10")
+        elseif state == "lose" then
+            -- (khong vao day)
+        else
+            -- cuoi nhe
+            w.rect(fx + 14, fy + 28, 16, 3, "#402a10")
+            w.rect(fx + 16, fy + 31, 12, 2, "#402a10")
+        end
+    end
+end
+
+local function draw_hud(mx, my)
+    local hy = GY - HUD_H
+    w.rect(0, hy, WW, HUD_H, PANEL)
+    w.rect(0, GY - 1, WW, 1, "#0d0f18")
+
+    -- bang dem min (trai)
+    local remain = mines_tot - flags_cnt
+    local s
+    if remain < 0 then
+        s = "-" .. string.format("%02d", math.min(99, -remain))
+    else
+        s = string.format("%03d", math.min(999, remain))
+    end
+    draw_led_panel(GX, hy + 10, 84, 40, s)
+
+    -- bang dem gio (phai)
+    local t = floor(math.min(999, tsec))
+    draw_led_panel(GX + cols * CELL - 84, hy + 10, 84, 40, string.format("%03d", t))
+
+    draw_face(mx, my)
+end
+
+local function draw_grid(mx, my)
+    -- vien quanh luoi (bevel lui vao)
+    local gx, gy = GX - 3, GY - 3
+    local gw, gh = cols * CELL + 6, rows * CELL + 6
+    w.rect(gx, gy, gw, gh, PANEL_DK)
+    bevel_down(gx, gy, gw, gh)
+
+    for y = 1, rows do
+        for x = 1, cols do
+            draw_cell(x, y, mx, my)
+        end
+    end
+end
+
+local function draw_overlay()
+    if state ~= "win" and state ~= "lose" then return end
+    w.rect(0, 0, WW, WH, OVERLAY)
+
+    if state == "win" then
+        center_fit("BAN THANG!", WH / 2 - 58, GOOD_GRN, 40)
+        local ts = "THOI GIAN: " .. string.format("%.1f", tsec) .. " GIAY"
+        center_fit(ts, WH / 2 - 8, TXT_WHI, 24)
+        if best[diff] >= 0 and tsec <= best[diff] + 0.001 then
+            center_fit("* KY LUC MOI *", WH / 2 + 28, GOLD, 24)
+        elseif best[diff] >= 0 then
+            center_fit("KY LUC: " .. string.format("%.1f", best[diff]) .. " GIAY",
+                        WH / 2 + 28, TXT_MED, 16)
+        end
+    else
+        center_fit("BOOM! THUA ROI", WH / 2 - 40, BAD_RED, 32)
+    end
+    center_fit("R = CHOI LAI     1/2/3 = DOI KHO     ESC = THOAT",
+                WH / 2 + 76, TXT_MED, 16)
+end
+
+local function draw(mx, my)
+    w.clear(BG)
+    draw_menu_bar(mx, my)
+    draw_hud(mx, my)
+    draw_grid(mx, my)
+    draw_overlay()
+end
+
+-- ============================ VONG LAP CHINH ============================
+
+local function cell_from_mouse(mx, my)
+    local x = floor((mx - GX) / CELL) + 1
+    local y = floor((my - GY) / CELL) + 1
+    if mx >= GX and my >= GY and in_board(x, y) then
+        return x, y
+    end
+    return 0, 0
+end
+
+local function point_in(r, mx, my)
+    return mx >= r.x and mx < r.x + r.w and my >= r.y and my < r.y + r.h
+end
+
+local function switch_difficulty(d)
+    if d == diff then return end
+    apply_difficulty(d)
+    w.resize(WW, WH)
+end
+
+local function handle_input()
+    local mx, my = w.mouse()
+
+    -- ban phim
+    if w.key_pressed("escape") then w.quit() end
+    if w.key_pressed("r") then new_game() end
+    if w.key_pressed("1") then switch_difficulty(1) end
+    if w.key_pressed("2") then switch_difficulty(2) end
+    if w.key_pressed("3") then switch_difficulty(3) end
+
+    -- nut do kho tren menu
+    if w.mouse_pressed("left") then
+        for i = 1, 3 do
+            if menu_btns[i] and point_in(menu_btns[i], mx, my) then
+                switch_difficulty(i)
+            end
+        end
+        if point_in(face_rect, mx, my) then
+            new_game()
+        end
+    end
+
+    -- thao tac tren ban co
+    local cx, cy = cell_from_mouse(mx, my)
+    if cx > 0 then
+        if w.mouse_pressed("right") then
+            toggle_flag(cx, cy)
+        end
+        if w.mouse_pressed("middle") then
+            chord(cx, cy)
+        end
+        if w.mouse_pressed("left") then
+            local c = grid[cy][cx]
+            if c.r and c.n > 0 then
+                chord(cx, cy)      -- click vao so: chord neu du co
+            else
+                reveal(cx, cy)
+            end
+        end
+    end
+end
+
+-- ---------------- khoi dong ----------------
+load_best()
+apply_difficulty(1)
+math.randomseed(os.time())
+
+-- che do tu kiem tra: MS_TEST=1 luc minesweeper.luc
+if os.getenv("MS_TEST") then
+    run_selftest()
+end
+
+w.start("LUC MINESWEEPER", WW, WH)
+w.fps(60)
+
+-- che do chup anh demo: MS_SHOT = 30 | "demo" | "win" | "lose" | "vua" | "kho"
+local shot_arg = os.getenv("MS_SHOT") or ""
+local shot_n = tonumber(shot_arg)
+if not shot_n then
+    if shot_arg == "demo" or shot_arg == "win" or shot_arg == "lose"
+       or shot_arg == "vua" or shot_arg == "kho" then
+        shot_n = 30
+    end
+end
+local shot_frame = 0
+local shot_file = "ms_demo.bmp"
+if shot_n then
+    math.randomseed(7)
+    if shot_arg == "win" then
+        -- lap van thang: mo het o an toan
+        reveal(5, 5)
+        for y = 1, rows do
+            for x = 1, cols do
+                local c = grid[y][x]
+                if not c.m then
+                    c.f = 0
+                    reveal(x, y)
+                end
+            end
+        end
+        shot_file = "ms_demo_win.bmp"
+    elseif shot_arg == "lose" then
+        -- lap van thua: click thang vao min
+        reveal(5, 5)
+        for y = 1, rows do
+            for x = 1, cols do
+                if grid[y][x].m then
+                    reveal(x, y)
+                    break
+                end
+            end
+        end
+        shot_file = "ms_demo_lose.bmp"
+    elseif shot_arg == "vua" then
+        apply_difficulty(2)
+        w.resize(WW, WH)
+        reveal(8, 8)
+        shot_file = "ms_demo_vua.bmp"
+    elseif shot_arg == "kho" then
+        apply_difficulty(3)
+        w.resize(WW, WH)
+        reveal(15, 8)
+        shot_file = "ms_demo_kho.bmp"
+    else
+        -- van demo nho
+        reveal(5, 5)
+        for i = 1, 14 do
+            local x = math.random(1, cols)
+            local y = math.random(1, rows)
+            if not grid[y][x].m and not grid[y][x].r then reveal(x, y) end
+        end
+        toggle_flag(2, 2)
+        toggle_flag(8, 3)
+        toggle_flag(4, 7)
+        tsec = 73.4
+    end
+end
+
+while w.running() do
+    local dt = w.delta()
+    if state == "play" then
+        tsec = tsec + dt
+    end
+
+    handle_input()
+
+    local mx, my = w.mouse()
+    draw(mx, my)
+
+    if shot_n then
+        shot_frame = shot_frame + 1
+        if shot_frame >= shot_n then
+            w.screenshot(shot_file)
+            w.quit()
+        end
+    end
+
+    w.update()
+end
+
+w.close()
+

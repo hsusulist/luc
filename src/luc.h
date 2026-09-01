@@ -80,6 +80,7 @@ struct Table {
     Value *arr;  int alen, acap;      /* array part: indices 1..alen        */
     Entry *ents; int ecap, ecount;    /* hash part: open addressing          */
     unsigned tid, ver;               /* inline cache identity + version     */
+    struct Table *meta;              /* metatable-lite: __index/__call/...  */
 };
 
 typedef struct { unsigned char instack; unsigned char idx; } UpvalDesc;

@@ -163,6 +163,20 @@ LFN(f_require){ UNUSED_SELF;
     tab_set(V.loaded,key,res);
     RET(0,res); return 1;
 }
+LFN(f_setmetatable){ UNUSED_SELF;
+    Value t=AR(0);
+    if(t.t!=LT_TABLE && t.t!=LT_LIST)
+        luc_error("bad argument #1 to 'setmetatable' (table expected)");
+    Table *mt=NULL;
+    if(AR(1).t==LT_TABLE || AR(1).t==LT_LIST) mt=AS_TAB(AR(1));
+    AS_TAB(t)->meta=mt;
+    RET(0,t); return 1;
+}
+LFN(f_getmetatable){ UNUSED_SELF;
+    Value t=AR(0);
+    if((t.t!=LT_TABLE && t.t!=LT_LIST) || !AS_TAB(t)->meta){ RET(0,NIL); return 1; }
+    RET(0,mkobj(t.t,AS_TAB(t)->meta)); return 1;
+}
 LFN(f_xpcall){ UNUSED_SELF;
     if(nargs<2) luc_error("bad argument #2 to 'xpcall' (value expected)");
     Value h=AR(1);
@@ -211,6 +225,9 @@ void lucL_open_base(void){
     reg(g,"rawequal",f_rawequal);    reg(g,"rawlen",f_rawlen);
     reg(g,"collectgarbage",f_collectgarbage);
     reg(g,"require",f_require);
+    reg(g,"__import",f_require);
+    reg(g,"setmetatable",f_setmetatable);
+    reg(g,"getmetatable",f_getmetatable);
     reg(g,"xpcall",f_xpcall);
     tab_set(g,cstrv("_VERSION"),cstrv(LUC_VERSION));
     tab_set(g,cstrv("_G"),mkobj(LT_TABLE,g));
@@ -1239,10 +1256,20 @@ void lucL_open_math(void){
 ** luc_lib_os.c -- os library (os.execute moved here from the window section)
 */
 /* ---- os -------------------------------------------------------------- */
+#if defined(_WIN32)
+#  include <windows.h>
+#else
+#  include <sys/ioctl.h>
+#  include <unistd.h>
+#endif
 LFN(f_os_clock){ UNUSED_SELF; (void)base;(void)nargs;
     RET(0,mknum((double)clock()/(double)CLOCKS_PER_SEC)); return 1; }
 LFN(f_os_time){ UNUSED_SELF; (void)base;(void)nargs;
     RET(0,mknum((double)time(NULL))); return 1; }
+LFN(f_os_difftime){ UNUSED_SELF;
+    double t2=checknum(L,base,nargs,0,"difftime");
+    double t1=nargs>=2?checknum(L,base,nargs,1,"difftime"):0;
+    RET(0,mknum(t2-t1)); return 1; }
 LFN(f_os_date){ UNUSED_SELF;
     const char *fmt = nargs>=1? checkstr(L,base,nargs,0,"date")->s : "%c";
     time_t t = nargs>=2? (time_t)checknum(L,base,nargs,1,"date") : time(NULL);
@@ -1286,9 +1313,24 @@ LFN(f_os_execute){ UNUSED_SELF;
     RET(0,mkbool(rc==0)); RET(1,cstrv("exit")); RET(2,mknum((double)rc));
     return 3;
 }
+LFN(f_os_termwidth){ UNUSED_SELF; (void)base;(void)nargs;
+    int cols=80;
+#if defined(_WIN32)
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    if(h && h!=INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h,&csbi))
+        cols=(int)(csbi.srWindow.Right-csbi.srWindow.Left+1);
+#else
+    struct winsize ws;
+    if(ioctl(1,TIOCGWINSZ,&ws)==0 && ws.ws_col>0) cols=ws.ws_col;
+#endif
+    RET(0,mknum((double)cols)); return 1;
+}
 void lucL_open_os(void){
     Table *o=newlib("os");
     reg(o,"clock",f_os_clock); reg(o,"time",f_os_time);  reg(o,"date",f_os_date);
+    reg(o,"difftime",f_os_difftime);
+    reg(o,"termwidth",f_os_termwidth);
     reg(o,"exit",f_os_exit);   reg(o,"getenv",f_os_getenv);
     reg(o,"remove",f_os_remove);reg(o,"rename",f_os_rename);
     reg(o,"sleep",f_os_sleep);
@@ -1355,7 +1397,7 @@ LFN(f_str_byte){ UNUSED_SELF;
     if(i<1)i=1;
     if(j>s->len)j=s->len;
     int n=0;
-    for(int x=i;x<=j;x++) RET(n++,mknum((double)(unsigned char)s->s[x-1]));
+    for(int x=i;x<=j;x++){ RET(n,mknum((double)(unsigned char)s->s[x-1])); n++; }  /* RET() expands its index twice — never pass n++ */
     return n;
 }
 LFN(f_str_char){ UNUSED_SELF;
