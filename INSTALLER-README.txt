@@ -1,7 +1,7 @@
-LUC - BUILDING THE WINDOWS INSTALLER (setup v3, prebuilt)
+LUC 0.1 - BUILDING THE WINDOWS INSTALLER (prebuilt)
 =========================================================
 
-What changed in v3
+What changed (prebuilt installer)
 ------------------
 The installer now ships READY-TO-RUN binaries:
 
@@ -14,7 +14,7 @@ test suite + real SDL2 window rendering). The user's PC needs NOTHING:
 no compiler, no MSYS2, no MinGW, no downloads during setup - tick the
 components, click Install, done. Just like installing Python.
 
-The old setup-time compile (v1/v2: gcc probing, lucgcc.exe silent-fail
+The old setup-time compile (gcc probing, lucgcc.exe silent-fail
 helper, rebuild.bat, install-time SDL2 headers) is completely gone,
 together with its failure modes (missing-DLL "System Error" dialogs,
 "No working C compiler was found", rebuild.bat problems).
@@ -39,9 +39,9 @@ How to build dist\luc-installer.exe
      - SDL2 dev files (MSYS2 MinGW64: pacman -S mingw-w64-x86_64-SDL2)
 3. Inno Setup 6/7 (ISCC.exe) packs dist\luc-installer.exe.
 
-Verify you are running the new installer: the Welcome page must say
-"Setup v3: everything is prebuilt - no compiler, no MSYS2 ...".
-AppVersion is 0.1.2.
+Verify the version: the Welcome page must say
+"LUC 0.1 - everything is prebuilt - no compiler, no MSYS2 ...".
+AppVersion is 0.1.
 
 Component layout (Components page)
 ----------------------------------

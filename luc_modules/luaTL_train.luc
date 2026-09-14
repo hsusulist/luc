@@ -1,9 +1,9 @@
 --     -- training extension for luaTL.lua --
 --  Requires the library built from luaTL_train.cu.
 
-local ffi   = require("ffi")
-local luaTL = require("luaTL")
-local C     = luaTL.C
+create ffi   = require("ffi")
+create luaTL = require("luaTL")
+create C     = luaTL.C
 
 ffi.cdef[=[
 typedef struct {
@@ -89,19 +89,13 @@ int           luaTL_prog_push(luaTL_prog_t* P, const luaTL_op_t* op);
 void          luaTL_prog_graph_free(luaTL_prog_t* P);
 ]=]
 
-local T      = luaTL.TensorClass
-local ck     = luaTL.check
-local F32    = luaTL.F32
-local i32_ct = ffi.typeof("int32_t[?]")
-local f32_ct = ffi.typeof("float[?]")
+create T      = luaTL.TensorClass
+create ck     = luaTL.check
+create F32    = luaTL.F32
+create i32_ct = ffi.typeof("int32_t[?]")
+create f32_ct = ffi.typeof("float[?]")
 
-luaTL.POP = {
-    NOP=0, GEMM=1, EW=2, RMSNORM=3, RMSNORM_BWD=4, SOFTMAX=5, SOFTMAX_BWD=6,
-    SWIGLU=7, SWIGLU_BWD=8, ROPE=9, EMBED=10, EMBED_BWD=11, CE=12,
-    REDUCE_COLS=13, L2=14, CLIP=15, ADAMW=16, ZERO=17, COPY=18, CAST=19,
-    TRANSPOSE=20, BCAST_ADD=21, SYNC=22, ARGMAX=23, SUM=24, GATHER=25,
-    ROWRMS=26,
-}
+luaTL.POP = { "NOP": 0, "GEMM": 1, "EW": 2, "RMSNORM": 3, "RMSNORM_BWD": 4, "SOFTMAX": 5, "SOFTMAX_BWD": 6, "SWIGLU": 7, "SWIGLU_BWD": 8, "ROPE": 9, "EMBED": 10, "EMBED_BWD": 11, "CE": 12, "REDUCE_COLS": 13, "L2": 14, "CLIP": 15, "ADAMW": 16, "ZERO": 17, "COPY": 18, "CAST": 19, "TRANSPOSE": 20, "BCAST_ADD": 21, "SYNC": 22, "ARGMAX": 23, "SUM": 24, "GATHER": 25, "ROWRMS": 26 }
 
 luaTL.train_version = ffi.string(C.luaTL_train_version())
 
@@ -110,9 +104,8 @@ function luaTL.finalize() C.luaTL_finalize() end
 --  Strided views: describe transposes / head slices WITHOUT copying.
 --  A "stride view" is a plain Lua table, not a tensor -- it just carries
 --  a pointer plus the six strides that gemm_ex needs.
-local function sv(ptr, rows, cols, rs, cs, dtype, bs)
-    return { data = ptr, rows = rows, cols = cols,
-             rs = rs, cs = cs, bs = bs or 0, dtype = dtype or F32 }
+create function sv(ptr, rows, cols, rs, cs, dtype, bs)
+    return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  dtype or F32  }
 end
 luaTL.sv = sv
 
@@ -129,8 +122,8 @@ end
 --- Column slice [., col0 .. col0+w-1] keeping the parent leading dim.
 --- This is how you read Q, K, V out of one fused [T, 3D] projection.
 function T:cols_view(col0, w)
-    local esz = luaTL.dtype_size[self.dtype]
-    local p   = ffi.cast("char*", self.data) + col0 * esz
+    create esz = luaTL.dtype_size[self.dtype]
+    create p   = ffi.cast("char*", self.data) + col0 * esz
     return sv(p, self.rows, w, self.cols, 1, self.dtype, 0)
 end
 
@@ -140,11 +133,10 @@ function T:head_view(hd, heads)
     return sv(self.data, self.rows, hd, heads * hd, 1, self.dtype, hd)
 end
 
-local function coerce(x)
+create function coerce(x)
     -- accepts a Tensor or a stride view
     if type(x) == "table" then return x end
-    return { data = x.data, rows = x.rows, cols = x.cols,
-             rs = x.cols, cs = 1, bs = 0, dtype = x.dtype }
+    return { "data":  x.data, "rows":  x.rows, "cols":  x.cols, "rs":  x.cols, "cs":  1, "bs":  0, "dtype":  x.dtype  }
 end
 luaTL.coerce = coerce
 
@@ -153,9 +145,9 @@ luaTL.coerce = coerce
 --  A, B, Cc may each be a Tensor or a stride view.
 function luaTL.gemm_ex(A, B, Cc, o)
     o = o or {}
-    local a, b, c = coerce(A), coerce(B), coerce(Cc)
-    local M, K, N = a.rows, a.cols, b.cols
-    if b.rows ~= K then
+    create a, b, c = coerce(A), coerce(B), coerce(Cc)
+    create M, K, N = a.rows, a.cols, b.cols
+    if b.rows != K then
         error(string.format("gemm_ex: inner dim mismatch %dx%d @ %dx%d",
                             a.rows, a.cols, b.rows, b.cols), 2)
     end
@@ -173,12 +165,12 @@ end
 
 --- dX = dY @ W^T   (W stored [K,N]; we need [N,K] -> logical transpose)
 function luaTL.matmul_dx(dY, W, dX, beta)
-    return luaTL.gemm_ex(dY, W:t(), dX, { beta = beta or 0.0 })
+    return luaTL.gemm_ex(dY, W:t(), dX, { "beta":  beta or 0.0  })
 end
 
 --- dW = X^T @ dY   (accumulating by default: beta = 1)
 function luaTL.matmul_dw(X, dY, dW, beta)
-    return luaTL.gemm_ex(X:t(), dY, dW, { beta = beta == nil and 1.0 or beta })
+    return luaTL.gemm_ex(X:t(), dY, dW, { "beta":  beta == nil and 1.0 or beta  })
 end
 
 --  Immediate-mode wrappers for the new kernels
@@ -224,8 +216,8 @@ end
 
 function T:rope(o)
     o = o or {}
-    local heads = o.heads or 1
-    local hd    = o.head_dim or (self.cols / heads)
+    create heads = o.heads or 1
+    create hd    = o.head_dim or (self.cols / heads)
     ck(C.luaTL_rope(self.data, o.pos_ids and o.pos_ids.data or nil,
         self.rows, heads, hd, o.row_stride or self.cols,
         o.pos_offset or 0, o.theta or 10000.0,
@@ -253,10 +245,18 @@ function luaTL.cross_entropy(logits, targets, losses, dlogits, o)
         ffi.cast("float*", losses.data), dlogits and dlogits.data or nil,
         logits.rows, logits.cols, o.ignore_index or -1,
         o.grad_scale or (1.0 / logits.rows), logits.dtype), "cross_entropy")
-    local buf = f32_ct(logits.rows)
+    create buf = f32_ct(logits.rows)
     ck(C.luaTL_download_f32(losses.data, buf, logits.rows), "ce.download")
-    local s = 0.0
-    for i = 0, logits.rows - 1 do s = s + buf[i] end
+    create s = 0.0
+    do
+    create __fa = (0)
+    create __fb = (logits.rows - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ s = s + buf[i] end
+end
     return s / logits.rows
 end
 
@@ -295,44 +295,60 @@ end
 -- ---- int32 index tensors (tokens / targets) -------------------------
 --- Backed by an f32 tensor's storage; 4 bytes per element either way.
 function luaTL.ids(n)
-    local t = luaTL.zeros(n, 1, F32)
+    create t = luaTL.zeros(n, 1, F32)
     t.flags = 1                      -- mark as index buffer
     return t
 end
 
 function luaTL.upload_ids(t, list, one_indexed)
-    local n   = #list
-    local buf = i32_ct(n)
-    local off = one_indexed and 1 or 0
-    for i = 1, n do buf[i - 1] = list[i] - off end
+    create n   = len(list)
+    create buf = i32_ct(n)
+    create off = one_indexed and 1 or 0
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i - 1] = list[i] - off end
+end
     ck(C.luaTL_upload_i32(t.data, buf, n), "upload_ids")
     return t
 end
 
 function luaTL.download_ids(t, n, one_indexed)
     n = n or tonumber(t.nelem)
-    local buf = i32_ct(n)
+    create buf = i32_ct(n)
     ck(C.luaTL_download_i32(t.data, buf, n), "download_ids")
-    local out, off = {}, one_indexed and 1 or 0
-    for i = 1, n do out[i] = buf[i - 1] + off end
+    create out, off = {}, one_indexed and 1 or 0
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ out[i] = buf[i - 1] + off end
+end
     return out
 end
 
 function luaTL.scalar_value(t)
-    local buf = f32_ct(1)
+    create buf = f32_ct(1)
     ck(C.luaTL_download_f32(t.data, buf, 1), "scalar_value")
     return buf[0]
 end
 
 --  Program : the wide command buffer + CUDA Graph replay
-local Prog = {}
+create Prog = {}
 Prog.__index = Prog
 luaTL.ProgramClass = Prog
 
 function luaTL.Program(capacity, timing)
-    local h = C.luaTL_prog_create(capacity or 4096, timing and 1 or 0)
+    create h = C.luaTL_prog_create(capacity or 4096, timing and 1 or 0)
     if h == nil then error("luaTL.Program: " .. luaTL.last_error(), 2) end
-    return setmetatable({ h = ffi.gc(h, C.luaTL_prog_destroy) }, Prog)
+    return setmetatable({ "h":  ffi.gc(h, C.luaTL_prog_destroy)  }, Prog)
 end
 
 function Prog:reset()
@@ -342,13 +358,13 @@ function Prog:reset()
 end
 
 function Prog:slot()
-    local h = self.h
-    local i = h.count
+    create h = self.h
+    create i = h.count
     if i >= h.capacity then
         error("luaTL.Program full (" .. tonumber(h.capacity) .. ")", 3)
     end
     h.count = i + 1
-    local c = h.ops[i]
+    create c = h.ops[i]
     c.op, c.dtype, c.act, c.pre = 0, 0, 0, 0
     c.i0, c.i1, c.i2, c.i3 = 0, 0, 0, 0
     c.i4, c.i5, c.i6, c.i7 = 0, 0, 0, 0
@@ -364,8 +380,8 @@ end
 
 function Prog:gemm(A, B, Cc, o)
     o = o or {}
-    local a, b, cc = coerce(A), coerce(B), coerce(Cc)
-    local c = self:slot()
+    create a, b, cc = coerce(A), coerce(B), coerce(Cc)
+    create c = self:slot()
     c.op    = 1
     c.dtype = cc.dtype
     c.act   = o.act or 0
@@ -388,14 +404,14 @@ end
 
 function Prog:matmul(A, B, Cc, o) return self:gemm(A, B, Cc, o) end
 function Prog:dx(dY, W, dX, beta)
-    return self:gemm(dY, W:t(), dX, { beta = beta or 0.0 })
+    return self:gemm(dY, W:t(), dX, { "beta":  beta or 0.0  })
 end
 function Prog:dw(X, dY, dW, beta)
-    return self:gemm(X:t(), dY, dW, { beta = beta == nil and 1.0 or beta })
+    return self:gemm(X:t(), dY, dW, { "beta":  beta == nil and 1.0 or beta  })
 end
 
 function Prog:ew(op, A, B, out, alpha, beta)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype, c.i0 = 2, out.dtype, op
     c.f0, c.f1 = alpha or 1.0, beta or 0.0
     c.n  = out.nelem
@@ -411,7 +427,7 @@ function Prog:dsilu(x, dy, out) return self:ew(luaTL.EW.DSILU, x, dy, out, 1, 0)
 function Prog:dgelu(x, dy, out) return self:ew(luaTL.EW.DGELU, x, dy, out, 1, 0) end
 
 function Prog:rmsnorm(x, w, out, eps)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 3, x.dtype
     c.i0, c.i1, c.f0 = x.rows, x.cols, eps or 1e-5
     c.p0, c.p1, c.p2 = x.data, w and w.data or nil, out.data
@@ -419,7 +435,7 @@ function Prog:rmsnorm(x, w, out, eps)
 end
 
 function Prog:rmsnorm_bwd(x, gamma, dy, dx, dgamma, eps)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 4, x.dtype
     c.i0, c.i1, c.f0 = x.rows, x.cols, eps or 1e-5
     c.p0, c.p1, c.p2 = x.data, gamma and gamma.data or nil, dy.data
@@ -430,7 +446,7 @@ end
 
 function Prog:softmax(x, out, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 5, x.dtype
     c.i0, c.i1 = x.rows, x.cols
     c.i2 = o.causal and 1 or 0
@@ -443,7 +459,7 @@ end
 
 function Prog:softmax_bwd(y, dy, dx, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 6, y.dtype
     c.i0, c.i1 = y.rows, y.cols
     c.i2 = o.causal and 1 or 0
@@ -456,7 +472,7 @@ end
 
 function Prog:swiglu(a, b, out, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 7, out.dtype
     c.i0, c.i1 = out.rows, out.cols
     c.i2, c.i3, c.i4 = o.lda or a.cols, o.ldb or b.cols, o.ldo or out.cols
@@ -466,7 +482,7 @@ end
 
 function Prog:swiglu_bwd(a, b, dout, da, db, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 8, dout.dtype
     c.i0, c.i1 = dout.rows, dout.cols
     c.i2, c.i3, c.i4 = o.lda or a.cols, o.ldb or b.cols, o.ldo or dout.cols
@@ -478,8 +494,8 @@ end
 
 function Prog:rope(x, o)
     o = o or {}
-    local heads = o.heads or 1
-    local c = self:slot()
+    create heads = o.heads or 1
+    create c = self:slot()
     c.op, c.dtype = 9, x.dtype
     c.i0, c.i1 = x.rows, heads
     c.i2 = o.head_dim or (x.cols / heads)
@@ -494,7 +510,7 @@ function Prog:rope(x, o)
 end
 
 function Prog:embed(ids, tbl, out)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 10, out.dtype
     c.i0, c.i1, c.i2 = out.rows, out.cols, tbl.rows
     c.p0, c.p1, c.p2 = ids.data, tbl.data, out.data
@@ -502,7 +518,7 @@ function Prog:embed(ids, tbl, out)
 end
 
 function Prog:embed_bwd(ids, dout, dtable, scale)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 11, dout.dtype
     c.i0, c.i1, c.i2 = dout.rows, dout.cols, dtable.rows
     c.f0 = scale or 1.0
@@ -512,7 +528,7 @@ end
 
 function Prog:cross_entropy(logits, targets, losses, dlogits, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 12, logits.dtype
     c.i0, c.i1 = logits.rows, logits.cols
     c.i2 = o.ignore_index or -1
@@ -523,7 +539,7 @@ function Prog:cross_entropy(logits, targets, losses, dlogits, o)
 end
 
 function Prog:reduce_cols(x, out, alpha, beta, rs)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 13, x.dtype
     c.i0, c.i1 = x.rows, x.cols
     c.s0 = rs or x.cols
@@ -533,14 +549,14 @@ function Prog:reduce_cols(x, out, alpha, beta, rs)
 end
 
 function Prog:l2(x, acc)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype, c.n = 14, x.dtype, x.nelem
     c.p0, c.p2 = x.data, acc.data
     return self
 end
 
 function Prog:clip(x, nsq, max_norm)
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype, c.n = 15, x.dtype, x.nelem
     c.f0 = max_norm
     c.p1, c.p2 = nsq.data, x.data
@@ -549,7 +565,7 @@ end
 
 function Prog:adamw(w, g, m, v, w_lp, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op, c.dtype = 16, g.dtype
     c.i0 = o.step or 1
     c.f0, c.f1, c.f2 = o.lr or 1e-3, o.beta1 or 0.9, o.beta2 or 0.999
@@ -561,44 +577,44 @@ function Prog:adamw(w, g, m, v, w_lp, o)
 end
 
 function Prog:zero(t)
-    local c = self:slot(); c.op, c.n, c.p2 = 17, t.nbytes, t.data; return self
+    create c = self:slot(); c.op, c.n, c.p2 = 17, t.nbytes, t.data; return self
 end
 function Prog:copy(src, dst)
-    local c = self:slot(); c.op, c.n = 18, src.nbytes
+    create c = self:slot(); c.op, c.n = 18, src.nbytes
     c.p0, c.p2 = src.data, dst.data; return self
 end
 function Prog:cast(src, dst)
-    local c = self:slot(); c.op = 19
+    create c = self:slot(); c.op = 19
     c.i0, c.i1, c.n = src.dtype, dst.dtype, src.nelem
     c.p0, c.p2 = src.data, dst.data; return self
 end
 function Prog:transpose(x, out)
-    local c = self:slot(); c.op, c.dtype = 20, x.dtype
+    create c = self:slot(); c.op, c.dtype = 20, x.dtype
     c.i0, c.i1 = x.rows, x.cols
     c.p0, c.p2 = x.data, out.data; return self
 end
 function Prog:bcast_add(x, vec, out, alpha)
-    local c = self:slot(); c.op, c.dtype = 21, x.dtype
+    create c = self:slot(); c.op, c.dtype = 21, x.dtype
     c.i0, c.i1, c.f0 = x.rows, x.cols, alpha or 1.0
     c.p0, c.p1, c.p2 = x.data, vec.data, out.data; return self
 end
 function Prog:barrier() self:slot().op = 22 return self end
 function Prog:argmax(x, out)
-    local c = self:slot(); c.op, c.dtype = 23, x.dtype
+    create c = self:slot(); c.op, c.dtype = 23, x.dtype
     c.i0, c.i1 = x.rows, x.cols
     c.p0, c.p2 = x.data, out.data; return self
 end
 function Prog:sum(x, acc, scale)
-    local c = self:slot(); c.op, c.n, c.f0 = 24, x.nelem, scale or 1.0
+    create c = self:slot(); c.op, c.n, c.f0 = 24, x.nelem, scale or 1.0
     c.p0, c.p2 = x.data, acc.data; return self
 end
 function Prog:gather(src, idx, dst)
-    local c = self:slot(); c.op, c.dtype = 25, dst.dtype
+    create c = self:slot(); c.op, c.dtype = 25, dst.dtype
     c.i0, c.i1, c.i2 = dst.rows, dst.cols, src.rows
     c.p0, c.p1, c.p2 = src.data, idx.data, dst.data; return self
 end
 function Prog:row_rms(x, out, eps, rs, cs)
-    local c = self:slot(); c.op, c.dtype = 26, x.dtype
+    create c = self:slot(); c.op, c.dtype = 26, x.dtype
     c.i0, c.i1 = x.rows, x.cols
     c.s0, c.s1, c.f0 = rs or x.cols, cs or 1, eps or 1e-5
     c.p0, c.p2 = x.data, out.data; return self
@@ -607,8 +623,8 @@ end
 function Prog:async(on) self.h.flags = on and 0 or 1 return self end
 
 function Prog:run(keep)
-    local rc = C.luaTL_prog_run(self.h)
-    if rc ~= 0 then error("Program:run: " .. luaTL.last_error(), 2) end
+    create rc = C.luaTL_prog_run(self.h)
+    if rc != 0 then error("Program:run: " .. luaTL.last_error(), 2) end
     if not keep then self.h.count = 0 end
     return self
 end
@@ -620,15 +636,15 @@ function Prog:capture()
 end
 
 function Prog:replay()
-    local rc = C.luaTL_prog_replay(self.h)
-    if rc ~= 0 then error("Program:replay: " .. luaTL.last_error(), 2) end
+    create rc = C.luaTL_prog_replay(self.h)
+    if rc != 0 then error("Program:replay: " .. luaTL.last_error(), 2) end
     return self
 end
 
 function Prog:wait() ck(C.luaTL_prog_wait(self.h), "prog.wait") return self end
 function Prog:elapsed_ms() return self.h.last_ms end
 function Prog:size() return self.h.count end
-function Prog:is_captured() return self.h.captured ~= 0 end
+function Prog:is_captured() return self.h.captured != 0 end
 function Prog:free_graph() C.luaTL_prog_graph_free(self.h) return self end
 
 return luaTL

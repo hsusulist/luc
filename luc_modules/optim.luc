@@ -1,20 +1,40 @@
-local optim = {}
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
+
+create optim = {}
 
 function optim.SGD(parameters, lr)
-    local self = {}
+    create self = {}
     self.parameters = parameters
     self.lr = lr or 0.01
 
     function self.step()
-        for _, p in ipairs(self.parameters) do
+        do
+    create __L = (self.parameters)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create p = __at(__L, __i + 1)
+
             p.data = p.data - self.lr * p.grad
         end
+end
     end
 
     function self.zero_grad()
-        for _, p in ipairs(self.parameters) do
+        do
+    create __L = (self.parameters)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create p = __at(__L, __i + 1)
+
             p.grad = 0
         end
+end
     end
 
     return self

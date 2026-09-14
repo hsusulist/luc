@@ -1,28 +1,5 @@
-/*
-** ============================================================================
-**  LUC 0.1  --  an independent, register-based scripting language
-**
-**  luc.h  --  shared header: the contract between luc_core.c and the libs
-**
-**  Layout of the project:
-**    luc_core.c        language core: platform, values, GC, tables, lexer,
-**                      parser, compiler, VM, coroutines, scheduler, driver
-**    luc_lib_base.c    base library  (print, pcall, require, xpcall, ...)
-**    luc_lib_string.c  string library + Lua-style pattern matching
-**    luc_lib_list.c    list methods + table library
-**    luc_lib_math.c    math library + bit32
-**    luc_lib_os.c      os library
-**    luc_lib_io.c      io library + file methods
-**    luc_lib_buffer.c  buffer library
-**    luc_lib_coro.c    coroutine + task libraries
-**    luc_lib_json.c    json module          (require "json")
-**    luc_lib_window.c  window module (SDL2) (require "window", -DLUC_WINDOW)
-**
-**  Each lib exports exactly ONE entry point: lucL_open_xxx() (or
-**  lucL_xxx_module() for require-only modules).  Everything else inside a
-**  lib file stays static.
-** ============================================================================
-*/
+/* luc.h - shared header: the contract between luc_core.c and the merged libs */
+/* update 2026-09-01: comment cleanup */
 #ifndef LUC_H
 #define LUC_H
 
@@ -45,9 +22,7 @@
 #define LUC_MAXSTACK  1000000
 #define LUC_YIELDCODE (-1)
 
-/* ==========================================================================
-** 1. values & objects
-** ========================================================================== */
+/* 1. values & objects */
 
 typedef struct Obj      Obj;
 typedef struct Str      Str;
@@ -140,9 +115,7 @@ extern Value NIL;
 #define AS_CO(v)    ((LucState*)(v).u.o)
 #define AS_FILE(v)  ((FileH*)(v).u.o)
 
-/* ==========================================================================
-** 2. global VM state (defined in luc_core.c)
-** ========================================================================== */
+/* 2. global VM state (defined in luc_core.c) */
 
 typedef struct ErrJmp { jmp_buf jb; struct ErrJmp *prev; } ErrJmp;
 
@@ -156,6 +129,8 @@ typedef struct LucV {
 
     Table *globals;
     Table *stringlib, *listmeta, *bufferlib, *filelib;
+    Table *listcore;         /* core list methods that shadow listmeta (remove) */
+    Table *tabmeta;          /* dict methods reachable through dot access */
 
     LucState *mainco, *cur;
 
@@ -173,9 +148,7 @@ extern LucV V;
 typedef struct YieldPt { jmp_buf jb; struct YieldPt *prev; LucState *co; int cdepth; } YieldPt;
 extern YieldPt *g_yp;
 
-/* ==========================================================================
-** core functions shared with the libs
-** ========================================================================== */
+/* core functions shared with the libs */
 
 /* platform (luc_core.c) */
 double luc_now(void);
@@ -239,9 +212,10 @@ void sched_add(LucState *co,double wake);
 void sched_remove(int i);
 void sched_run(void);
 
-/* compiler + module system (used by require) */
+/* compiler + module system (used by require/import) */
 Closure *luc_compile(const char *src,int len,const char *chunkname);
 char *find_module(const char *name,int *len,char *found,size_t fcap);
+char *find_system_module(const char *name,int *len,char *found,size_t fcap);
 
 /* library registration helpers (defined in luc_core.c) */
 void   reg(Table *t,const char *name,CFn fn);
@@ -255,9 +229,7 @@ Table   *checktab (LucState *L,int base,int nargs,int i,const char *fn);
 Buffer  *checkbuf (LucState *L,int base,int nargs,int i,const char *fn);
 uint32_t checku32 (LucState *L,int base,int nargs,int i,const char *fn);
 
-/* ==========================================================================
-** lib-side helpers
-** ========================================================================== */
+/* lib-side helpers */
 
 #define LFN(name) static int name(LucState *L,int base,int nargs,CFunc *self)
 #define UNUSED_SELF (void)self
@@ -271,9 +243,7 @@ static inline Value argv_(LucState *L,int base,int nargs,int i){
 /* shared across base <-> table libs (defined in luc_lib_base.c) */
 int f_unpack(LucState *L,int base,int nargs,CFunc *self);
 
-/* ==========================================================================
-** module entry points (each lib exports exactly one)
-** ========================================================================== */
+/* module entry points (each lib exports exactly one) */
 
 void  lucL_open_base(void);                 /* luc_lib_base.c   */
 void  lucL_open_string(void);               /* luc_lib_string.c */

@@ -1,16 +1,24 @@
--- keep just for fun
-local Value = require("tensor")
-local nn = require("nn")
-local optim = require("optim")
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
 
-local Train = {}
+-- keep just for fun
+create Value = require("tensor")
+create nn = require("nn")
+create optim = require("optim")
+
+create Train = {}
 Train.__index = Train
 
 function Train.new(opts)
     opts = opts or {}
-    local self = setmetatable({}, Train)
+    create self = setmetatable({}, Train)
 
-    self.layers    = opts.layers or {4, 8, 3}
+    self.layers    = opts.layers or { 1: 4, 2:  8, 3:  3 }
     self.lr        = opts.lr or 0.05
     self.epochs    = opts.epochs or 200
     self.log_every = opts.log_every or 20
@@ -31,7 +39,7 @@ end
 
 function Train:config(opts)
     opts = opts or {}
-    for key, val in pairs(opts) do
+    repeat key, val in opts do
         self[key] = val
     end
 
@@ -46,12 +54,18 @@ function Train:config(opts)
     return self
 end
 
-local function mse_loss(out, target)
-    local loss = Value.new(0)
-    for i, target_val in ipairs(target) do
-        local diff = out[i] + Value.new(-target_val)
+create function mse_loss(out, target)
+    create loss = Value.new(0)
+    do
+    create __L = (target)
+    repeat 1, len(__L) as __i do
+        create i = __i + 1
+        create target_val = __at(__L, __i + 1)
+
+        create diff = out[i] + Value.new(-target_val)
         loss = loss + diff ^ 2
     end
+end
     return loss
 end
 
@@ -59,12 +73,12 @@ function Train:log(msg)
     if self.verbose then print(msg) end
 end
 
-local function default_on_log(info)
-    local bar_len = 20
-    local filled = math.floor(info.progress * bar_len)
-    local bar = string.rep("#", filled) .. string.rep("-", bar_len - filled)
+create function default_on_log(info)
+    create bar_len = 20
+    create filled = math.floor(info.progress * bar_len)
+    create bar = string.rep("#", filled) .. string.rep("-", bar_len - filled)
 
-    local marker = info.is_best and " (best)" or ""
+    create marker = info.is_best and " (best)" or ""
     print(string.format(
         "[%s] Epoch %d/%d | Loss: %.5f%s",
         bar, info.epoch, info.total_epochs, info.loss, marker
@@ -75,19 +89,12 @@ end
 function Train:report(epoch, loss)
     table.insert(self.loss_history, loss)
 
-    local is_best = loss < self.best_loss
+    create is_best = loss < self.best_loss
     if is_best then self.best_loss = loss end
 
     if not self.verbose then return end
 
-    local info = {
-        epoch        = epoch,
-        total_epochs = self.epochs,
-        loss         = loss,
-        progress     = epoch / self.epochs,
-        is_best      = is_best,
-        history      = self.loss_history,
-    }
+    create info = { "epoch":  epoch, "total_epochs":  self.epochs, "loss":  loss, "progress":  epoch / self.epochs, "is_best":  is_best, "history":  self.loss_history }
 
     if self.on_log then
         self.on_log(info)
@@ -97,24 +104,43 @@ function Train:report(epoch, loss)
 end
 
 function Train:run()
-    assert(#self.data > 0, "train: no data set, use train:config{data = {...}}")
+    assert(len(self.data) > 0, "train: no data set, use train:config{data = {...}}")
 
     self:log("Model layers: " .. table.concat(self.layers, " -> "))
-    self:log("Total parameters: " .. #self.params)
+    self:log("Total parameters: " .. len(self.params))
 
-    for epoch = 1, self.epochs do
-        local total_loss = Value.new(0)
+    do
+    create __fa = (1)
+    create __fb = (self.epochs )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create epoch = __fa + __j * __fs
 
-        for _, sample in ipairs(self.data) do
-            local x = {}
-            for i, v in ipairs(sample.input) do
+        create total_loss = Value.new(0)
+
+        do
+    create __L = (self.data)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create sample = __at(__L, __i + 1)
+
+            create x = {}
+            do
+    create __L = (sample.input)
+    repeat 1, len(__L) as __i do
+        create i = __i + 1
+        create v = __at(__L, __i + 1)
+
                 x[i] = Value.new(v)
             end
+end
 
-            local out = self.model:call(x)
-            local loss = mse_loss(out, sample.target)
+            create out = self.model:call(x)
+            create loss = mse_loss(out, sample.target)
             total_loss = total_loss + loss
         end
+end
 
         self.optim.zero_grad()
         total_loss:backward()
@@ -124,29 +150,53 @@ function Train:run()
             self:report(epoch, total_loss.data)
         end
     end
+end
 
     return self.model
 end
 
 function Train:evaluate(data)
     data = data or self.data
-    for _, sample in ipairs(data) do
-        local x = {}
-        for i, v in ipairs(sample.input) do
+    do
+    create __L = (data)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create sample = __at(__L, __i + 1)
+
+        create x = {}
+        do
+    create __L = (sample.input)
+    repeat 1, len(__L) as __i do
+        create i = __i + 1
+        create v = __at(__L, __i + 1)
+
             x[i] = Value.new(v)
         end
-        local out = self.model:call(x)
+end
+        create out = self.model:call(x)
 
         io.write("Input: ")
-        for _, v in ipairs(sample.input) do io.write(v .. " ") end
+        do
+    create __L = (sample.input)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create v = __at(__L, __i + 1)
+ io.write(v .. " ") end
+end
         io.write("-> Output: ")
-        for _, o in ipairs(out) do io.write(string.format("%.3f ", o.data)) end
+        do
+    create __L = (out)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create o = __at(__L, __i + 1)
+ io.write(string.format("%.3f ", o.data)) end
+end
         print()
     end
 end
+end
 
-setmetatable(Train, {
-    __call = function(_, ...) return Train.new(...) end
-})
+setmetatable(Train, { "__call":  function(_, ...) return Train.new(...) end
+ })
 
 return Train

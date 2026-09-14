@@ -1,26 +1,50 @@
-local Value = require("tensor")
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
 
-local nn = {}
+create Value = require("tensor")
 
-local Neuron = {}
+create nn = {}
+
+create Neuron = {}
 Neuron.__index = Neuron
 
 function nn.Neuron(nin, nonlin)
-    local self = setmetatable({}, Neuron)
+    create self = setmetatable({}, Neuron)
     self.w = {}
-    for i = 1, nin do
+    do
+    create __fa = (1)
+    create __fb = (nin )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         self.w[i] = Value.new(math.random() * 2 - 1)
     end
+end
     self.b = Value.new(0)
     self.nonlin = (nonlin == nil) and true or nonlin
     return self
 end
 
 function Neuron:call(x)
-    local act = self.b
-    for i = 1, #self.w do
+    create act = self.b
+    do
+    create __fa = (1)
+    create __fb = (len(self.w) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         act = act + self.w[i] * x[i]
     end
+end
     if self.nonlin then
         return Value.relu(act)
     else
@@ -29,72 +53,140 @@ function Neuron:call(x)
 end
 
 function Neuron:parameters()
-    local params = {}
-    for i = 1, #self.w do
+    create params = {}
+    do
+    create __fa = (1)
+    create __fb = (len(self.w) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         table.insert(params, self.w[i])
     end
+end
     table.insert(params, self.b)
     return params
 end
 
-local Layer = {}
+create Layer = {}
 Layer.__index = Layer
 
 function nn.Layer(nin, nout, nonlin)
-    local self = setmetatable({}, Layer)
+    create self = setmetatable({}, Layer)
     self.neurons = {}
-    for i = 1, nout do
+    do
+    create __fa = (1)
+    create __fb = (nout )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         self.neurons[i] = nn.Neuron(nin, nonlin)
     end
+end
     return self
 end
 
 function Layer:call(x)
-    local out = {}
-    for i = 1, #self.neurons do
+    create out = {}
+    do
+    create __fa = (1)
+    create __fb = (len(self.neurons) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         out[i] = self.neurons[i]:call(x)
     end
+end
     return out
 end
 
 function Layer:parameters()
-    local params = {}
-    for i = 1, #self.neurons do
-        for _, p in ipairs(self.neurons[i]:parameters()) do
+    create params = {}
+    do
+    create __fa = (1)
+    create __fb = (len(self.neurons) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        do
+    create __L = (self.neurons[i]:parameters())
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create p = __at(__L, __i + 1)
+
             table.insert(params, p)
         end
+end
     end
+end
     return params
 end
 
-local MLP = {}
+create MLP = {}
 MLP.__index = MLP
 
 function nn.MLP(sizes)
-    local self = setmetatable({}, MLP)
+    create self = setmetatable({}, MLP)
     self.layers = {}
-    for i = 1, #sizes - 1 do
-        local is_last = (i == #sizes - 1)
+    do
+    create __fa = (1)
+    create __fb = (len(sizes) - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create is_last = (i == len(sizes) - 1)
         self.layers[i] = nn.Layer(sizes[i], sizes[i + 1], not is_last)
     end
+end
     return self
 end
 
 function MLP:call(x)
-    local out = x
-    for i = 1, #self.layers do
+    create out = x
+    do
+    create __fa = (1)
+    create __fb = (len(self.layers) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         out = self.layers[i]:call(out)
     end
+end
     return out
 end
 
 function MLP:parameters()
-    local params = {}
-    for i = 1, #self.layers do
-        for _, p in ipairs(self.layers[i]:parameters()) do
+    create params = {}
+    do
+    create __fa = (1)
+    create __fb = (len(self.layers) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        do
+    create __L = (self.layers[i]:parameters())
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create p = __at(__L, __i + 1)
+
             table.insert(params, p)
         end
+end
     end
+end
     return params
 end
 

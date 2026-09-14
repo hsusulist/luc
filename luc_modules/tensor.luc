@@ -1,19 +1,19 @@
-local Value = {}
+create Value = {}
 Value.__index = Value
 
-local exp, log, sqrt, huge = math.exp, math.log, math.sqrt, math.huge
+create exp, log, sqrt, huge = math.exp, math.log, math.sqrt, math.huge
 
-local function wrap(x)
+create function wrap(x)
     if type(x) == "number" then return Value.new(x) end
     if type(x) == "table" and getmetatable(x) == Value then return x end
     error("Value: expected a number or a Value, got " .. type(x), 3)
 end
 
 function Value.new(data, children, op)
-    if type(data) ~= "number" then
+    if type(data) != "number" then
         error("Value.new: data must be a number, got " .. type(data), 2)
     end
-    local self = setmetatable({}, Value)
+    create self = setmetatable({}, Value)
     self.data = data
     self.grad = 0
     self.children = children or {}
@@ -28,7 +28,7 @@ end
 
 Value.__add = function(a, b)
     a, b = wrap(a), wrap(b)
-    local out = Value.new(a.data + b.data, { a, b }, "+")
+    create out = Value.new(a.data + b.data, { 1:  a, 2:  b  }, "+")
     out.backward_fn = function()
         a.grad = a.grad + out.grad
         b.grad = b.grad + out.grad
@@ -38,7 +38,7 @@ end
 
 Value.__sub = function(a, b)
     a, b = wrap(a), wrap(b)
-    local out = Value.new(a.data - b.data, { a, b }, "-")
+    create out = Value.new(a.data - b.data, { 1:  a, 2:  b  }, "-")
     out.backward_fn = function()
         a.grad = a.grad + out.grad
         b.grad = b.grad - out.grad
@@ -48,7 +48,7 @@ end
 
 Value.__mul = function(a, b)
     a, b = wrap(a), wrap(b)
-    local out = Value.new(a.data * b.data, { a, b }, "*")
+    create out = Value.new(a.data * b.data, { 1:  a, 2:  b  }, "*")
     out.backward_fn = function()
         a.grad = a.grad + b.data * out.grad
         b.grad = b.grad + a.data * out.grad
@@ -61,7 +61,7 @@ Value.__div = function(a, b)
     if b.data == 0 then
         error("Value./: division by zero", 2)
     end
-    local out = Value.new(a.data / b.data, { a, b }, "/")
+    create out = Value.new(a.data / b.data, { 1:  a, 2:  b  }, "/")
     out.backward_fn = function()
         a.grad = a.grad + (1 / b.data) * out.grad
         b.grad = b.grad - (a.data / (b.data * b.data)) * out.grad
@@ -71,7 +71,7 @@ end
 
 Value.__unm = function(a)
     a = wrap(a)
-    local out = Value.new(-a.data, { a }, "neg")
+    create out = Value.new(-a.data, { 1:  a  }, "neg")
     out.backward_fn = function()
         a.grad = a.grad - out.grad
     end
@@ -81,10 +81,10 @@ end
 Value.__pow = function(a, b)
     if type(b) == "number" then
         a = wrap(a)
-        if a.data < 0 and b ~= math.floor(b) then
+        if a.data < 0 and b != math.floor(b) then
             error("Value.^: negative base with a fractional exponent is not real", 2)
         end
-        local out = Value.new(a.data ^ b, { a }, "^" .. b)
+        create out = Value.new(a.data ^ b, { 1:  a  }, "^" .. b)
         out.backward_fn = function()
             a.grad = a.grad + (b * a.data ^ (b - 1)) * out.grad
         end
@@ -94,8 +94,8 @@ Value.__pow = function(a, b)
     if a.data <= 0 then
         error("Value.^: base must be positive when the exponent is a Value", 2)
     end
-    local val = a.data ^ b.data
-    local out = Value.new(val, { a, b }, "^")
+    create val = a.data ^ b.data
+    create out = Value.new(val, { 1:  a, 2:  b  }, "^")
     out.backward_fn = function()
         a.grad = a.grad + b.data * a.data ^ (b.data - 1) * out.grad
         b.grad = b.grad + val * log(a.data) * out.grad
@@ -108,7 +108,7 @@ Value.__le = function(a, b) return wrap(a).data <= wrap(b).data end
 
 function Value.relu(a)
     a = wrap(a)
-    local out = Value.new(a.data > 0 and a.data or 0, { a }, "relu")
+    create out = Value.new(a.data > 0 and a.data or 0, { 1:  a  }, "relu")
     out.backward_fn = function()
         a.grad = a.grad + (a.data > 0 and 1 or 0) * out.grad
     end
@@ -116,8 +116,8 @@ function Value.relu(a)
 end
 
 function Value:exp()
-    local val = exp(self.data)
-    local out = Value.new(val, { self }, "exp")
+    create val = exp(self.data)
+    create out = Value.new(val, { 1:  self  }, "exp")
     out.backward_fn = function()
         self.grad = self.grad + val * out.grad
     end
@@ -128,8 +128,8 @@ function Value:log()
     if self.data <= 0 then
         error("Value:log: log is undefined for " .. tostring(self.data), 2)
     end
-    local d = self.data
-    local out = Value.new(log(d), { self }, "log")
+    create d = self.data
+    create out = Value.new(log(d), { 1:  self  }, "log")
     out.backward_fn = function()
         self.grad = self.grad + (1 / d) * out.grad
     end
@@ -140,10 +140,10 @@ function Value:sqrt()
     if self.data < 0 then
         error("Value:sqrt: sqrt is undefined for " .. tostring(self.data), 2)
     end
-    local val = sqrt(self.data)
-    local out = Value.new(val, { self }, "sqrt")
+    create val = sqrt(self.data)
+    create out = Value.new(val, { 1:  self  }, "sqrt")
     out.backward_fn = function()
-        if val ~= 0 then
+        if val != 0 then
             self.grad = self.grad + (0.5 / val) * out.grad
         end
     end
@@ -151,15 +151,15 @@ function Value:sqrt()
 end
 
 function Value:tanh()
-    local d = self.data
-    local t
+    create d = self.data
+    create t
     if d > 20 then t = 1
     elseif d < -20 then t = -1
     else
-        local e = exp(2 * d)
+        create e = exp(2 * d)
         t = (e - 1) / (e + 1)
     end
-    local out = Value.new(t, { self }, "tanh")
+    create out = Value.new(t, { 1:  self  }, "tanh")
     out.backward_fn = function()
         self.grad = self.grad + (1 - t * t) * out.grad
     end
@@ -167,15 +167,15 @@ function Value:tanh()
 end
 
 function Value:sigmoid()
-    local d = self.data
-    local s
+    create d = self.data
+    create s
     if d >= 0 then
         s = 1 / (1 + exp(-d))
     else
-        local z = exp(d)
+        create z = exp(d)
         s = z / (1 + z)
     end
-    local out = Value.new(s, { self }, "sigmoid")
+    create out = Value.new(s, { 1:  self  }, "sigmoid")
     out.backward_fn = function()
         self.grad = self.grad + s * (1 - s) * out.grad
     end
@@ -183,15 +183,15 @@ function Value:sigmoid()
 end
 
 function Value:silu()
-    local d = self.data
-    local s
+    create d = self.data
+    create s
     if d >= 0 then
         s = 1 / (1 + exp(-d))
     else
-        local z = exp(d)
+        create z = exp(d)
         s = z / (1 + z)
     end
-    local out = Value.new(d * s, { self }, "silu")
+    create out = Value.new(d * s, { 1:  self  }, "silu")
     out.backward_fn = function()
         self.grad = self.grad + s * (1 + d * (1 - s)) * out.grad
     end
@@ -211,17 +211,17 @@ function Value:zero_grad()
     return self
 end
 
-local function topo_sort(root)
-    local topo, ntopo = {}, 0
-    local visited = {}
-    local stack_node, stack_i = { root }, { 1 }
-    local sp = 1
+create function topo_sort(root)
+    create topo, ntopo = {}, 0
+    create visited = {}
+    create stack_node, stack_i = { 1:  root  }, { 1:  1  }
+    create sp = 1
     visited[root] = true
     while sp > 0 do
-        local v = stack_node[sp]
-        local idx = stack_i[sp]
-        local child = v.children and v.children[idx] or nil
-        if child ~= nil then
+        create v = stack_node[sp]
+        create idx = stack_i[sp]
+        create child = v.children and v.children[idx] or nil
+        if child != nil then
             stack_i[sp] = idx + 1
             if not visited[child] then
                 visited[child] = true
@@ -240,24 +240,48 @@ local function topo_sort(root)
 end
 
 function Value:zero_grad_graph()
-    local topo, ntopo = topo_sort(self)
-    for i = 1, ntopo do topo[i].grad = 0 end
+    create topo, ntopo = topo_sort(self)
+    do
+    create __fa = (1)
+    create __fb = (ntopo )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ topo[i].grad = 0 end
+end
     return self
 end
 
 function Value:backward(accumulate)
-    local topo, ntopo = topo_sort(self)
+    create topo, ntopo = topo_sort(self)
     if not accumulate then
-        for i = 1, ntopo do
-            local v = topo[i]
-            if v.op ~= "leaf" then v.grad = 0 end
+        do
+    create __fa = (1)
+    create __fb = (ntopo )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create v = topo[i]
+            if v.op != "leaf" then v.grad = 0 end
         end
+end
     end
     self.grad = 1
-    for i = ntopo, 1, -1 do
-        local f = topo[i].backward_fn
+    do
+    create __fa = (ntopo)
+    create __fb = (1)
+    create __fs = (-1 )
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create f = topo[i].backward_fn
         if f then f() end
     end
+end
     return self
 end
 

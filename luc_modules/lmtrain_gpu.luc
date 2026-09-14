@@ -1,11 +1,11 @@
 --  The CPU path is never touched.  If backend ~= "gpu" none of this runs.
 
-local lmlog = require("lmlog")
+create lmlog = require("lmlog")
 
-local G = {}
+create G = {}
 
-local ceil, huge = math.ceil, math.huge
-local sformat = string.format
+create ceil, huge = math.ceil, math.huge
+create sformat = string.format
 
 --  lmio (:save/:load) and LMTrain._snapshot/_restore walk
 --  `params[i].data.data` as a flat 1-indexed Lua table.  We hand them a
@@ -19,18 +19,20 @@ local sformat = string.format
 --  straight out of VRAM.  _gpu_pull() remains available for code that
 --  genuinely wants the host copy, and now says no when that would be
 --  ruinous unless explicitly forced.
-local function make_shims(model)
-    local shims = {}
-    for i = 1, #model.params do
-        local p = model.params[i]
-        shims[i] = {
-            name = p.name,
-            is_param = true,
-            gpu = p,
-            data = { rows = p.rows, cols = p.cols, data = {} },
-            grad = { rows = p.rows, cols = p.cols, data = {} },
-        }
+create function make_shims(model)
+    create shims = {}
+    do
+    create __fa = (1)
+    create __fb = (len(model.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create p = model.params[i]
+        shims[i] = { "name":  p.name, "is_param":  true, "gpu":  p, "data":  { "rows":  p.rows, "cols":  p.cols, "data":  {}  }, "grad":  { "rows":  p.rows, "cols":  p.cols, "data":  {}  } }
     end
+end
     return shims
 end
 
@@ -38,9 +40,9 @@ function G.install(LMTrain)
     if LMTrain._gpu_installed then return LMTrain end
     LMTrain._gpu_installed = true
 
-    local cpu_param_get   = LMTrain._param_get
-    local cpu_param_set   = LMTrain._param_set
-    local cpu_param_dtype = LMTrain._param_dtype
+    create cpu_param_get   = LMTrain._param_get
+    create cpu_param_set   = LMTrain._param_set
+    create cpu_param_dtype = LMTrain._param_dtype
 
     -- ---- lmio streaming hooks ---------------------------------------
     function LMTrain:_param_dtype()
@@ -59,39 +61,55 @@ function G.install(LMTrain)
     end
 
     --  Host <-> device weight mirroring (explicit, no longer automatic)
-    local PULL_WARN = 8e6      -- elements
+    create PULL_WARN = 8e6      -- elements
 
     function LMTrain:_gpu_pull(force)
         if not self.gpu_model then return self end
-        local n = self.gpu_model:nparams()
+        create n = self.gpu_model:nparams()
         if n > PULL_WARN and not force then
             error(sformat("LMTrain:_gpu_pull: refusing to materialise %s parameters as Lua "
                 .. "tables (~%s of host RAM). Use train:save(path) -- it streams straight "
                 .. "from VRAM -- or pass force = true if you really need the mirror.",
                 lmlog.fmt_count(n), lmlog.fmt_bytes(n * 16)), 2)
         end
-        for i = 1, #self.params do
-            local s = self.params[i]
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create s = self.params[i]
             s.data.data = s.gpu.w:toflat()
         end
+end
         self._host_dirty = false
         return self
     end
 
     function LMTrain:_gpu_push()
         if not self.gpu_model then return self end
-        for i = 1, #self.params do
-            local s = self.params[i]
-            local flat = s.data.data
-            if flat and #flat == s.gpu.nelem then s.gpu.w:upload(flat) end
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create s = self.params[i]
+            create flat = s.data.data
+            if flat and len(flat) == s.gpu.nelem then s.gpu.w:upload(flat) end
         end
+end
         self._host_dirty = false
         return self
     end
 
     --  Build
     function LMTrain:_build_gpu()
-        local ok_ad, adapter = pcall(require, "luatl_adapter")
+        create ok_ad, adapter = pcall(require, "luatl_adapter")
         if not ok_ad or not adapter.available then
             error(sformat(
                 "LMTrain: backend = 'gpu' was requested but luaTL is unavailable: %s\n" ..
@@ -104,7 +122,7 @@ function G.install(LMTrain)
                        or tostring(adapter)), 3)
         end
 
-        local ok_gt, GT = pcall(require, "gpu_transformer")
+        create ok_gt, GT = pcall(require, "gpu_transformer")
         if not ok_gt then
             error("LMTrain: backend = 'gpu' but gpu_transformer.lua failed to load: "
                   .. tostring(GT), 3)
@@ -122,29 +140,20 @@ function G.install(LMTrain)
                 pcall(function() self.gpu_model:release_snapshot(self.best_snapshot) end)
                 self.best_snapshot = nil
             end
-            local old = self.gpu_model
+            create old = self.gpu_model
             self.gpu_model, self.model, self.params = nil, nil, {}
             pcall(function() old:free() end)
             collectgarbage("collect")
         end
 
-        local bs = self.batch_size
-        local ok_m, model = pcall(GT.new, {
-            vocab = self.vocab, dim = self.dim, layers = self.layers,
-            heads = self.heads, ffn = self.ffn, max_seq = self.max_seq,
-            batch_size = bs, causal = self.causal, pos = self.pos,
-            rope_base = self.rope_base, tie = self.tie, dropout = self.dropout,
-            clip_norm = self.clip_norm, weight_decay = self.weight_decay,
-            beta1 = self.beta1, beta2 = self.beta2,
-            graph = self.graph, timing = true,
-            want_acc = true,
-        })
+        create bs = self.batch_size
+        create ok_m, model = pcall(GT.new, { "vocab":  self.vocab, "dim":  self.dim, "layers":  self.layers, "heads":  self.heads, "ffn":  self.ffn, "max_seq":  self.max_seq, "batch_size":  bs, "causal":  self.causal, "pos":  self.pos, "rope_base":  self.rope_base, "tie":  self.tie, "dropout":  self.dropout, "clip_norm":  self.clip_norm, "weight_decay":  self.weight_decay, "beta1":  self.beta1, "beta2":  self.beta2, "graph":  self.graph, "timing":  true, "want_acc":  true })
         if not ok_m then
             error("LMTrain: GPU model construction failed: " .. tostring(model), 3)
         end
 
-        local opt = string.lower(tostring(self.optimizer or "adamw"))
-        if opt ~= "adamw" and opt ~= "adam" then
+        create opt = string.lower(tostring(self.optimizer or "adamw"))
+        if opt != "adamw" and opt != "adam" then
             error(sformat("LMTrain: backend = 'gpu' implements AdamW only, got optimizer = '%s'.\n"
                 .. "  Use optimizer = 'adamw', or backend = 'cpu' for %s.", opt, opt), 3)
         end
@@ -152,8 +161,7 @@ function G.install(LMTrain)
         self.gpu_model = model
         self.model     = model
         self.params    = make_shims(model)
-        self.opt       = { lr = self.lr, zero_grad = function() end,
-                           step = function() end, backend = "gpu" }
+        self.opt       = { "lr":  self.lr, "zero_grad":  function() end, "step":  function() end, "backend":  "gpu"  }
         self.sgd       = self.opt
         self.base_lr   = self.lr
         self.best_snapshot = nil
@@ -161,8 +169,8 @@ function G.install(LMTrain)
         self._host_dirty = false
 
         if self.verbose then
-            local hw = adapter.hardware()
-            local gf = model:flops_per_step()
+            create hw = adapter.hardware()
+            create gf = model:flops_per_step()
             lmlog.say(sformat(
                 "[LMTrain] GPU backend ready: %s (%s, %d SMs, %.1f TFLOP/s fp32 peak)",
                 hw.name, hw.sm, hw.multiprocessors, hw.gflops_fp32 / 1000))
@@ -171,8 +179,8 @@ function G.install(LMTrain)
                 lmlog.fmt_count(model:nparams()), model.B, model.T,
                 gf / 1e9, tostring(self.tie)))
             -- PROBLEM 2, GPU side: quantify what an oversized vocab costs.
-            local vram_v = self.vocab * self.dim * 4 * (self.tie and 4 or 8)
-            local logits = model.B * model.T * self.vocab * 4
+            create vram_v = self.vocab * self.dim * 4 * (self.tie and 4 or 8)
+            create logits = model.B * model.T * self.vocab * 4
             lmlog.say(sformat(
                 "[LMTrain] vocab = %d costs ~%s of embedding state + ~%s per logits buffer",
                 self.vocab, lmlog.fmt_bytes(vram_v), lmlog.fmt_bytes(logits)))
@@ -182,16 +190,16 @@ function G.install(LMTrain)
 
     --  evaluation (forward only)
     function LMTrain:_evaluate_gpu(windows)
-        local m  = self.gpu_model
-        local bs = m.B
-        local tot, cnt, cor = 0, 0, 0
-        local i = 1
-        while i <= #windows do
-            local batch, n = {}, 0
-            while n < bs and i <= #windows do
+        create m  = self.gpu_model
+        create bs = m.B
+        create tot, cnt, cor = 0, 0, 0
+        create i = 1
+        while i <= len(windows) do
+            create batch, n = {}, 0
+            while n < bs and i <= len(windows) do
                 n = n + 1; batch[n] = windows[i]; i = i + 1
             end
-            local loss, correct, valid = m:eval_step(batch, n)
+            create loss, correct, valid = m:eval_step(batch, n)
             tot = tot + loss * valid
             cnt = cnt + valid
             cor = cor + correct
@@ -206,61 +214,101 @@ function G.install(LMTrain)
 
     --  The GPU run loop
     function LMTrain:_run_gpu(train_w, val_w, build_windows)
-        local m  = self.gpu_model
-        local bs = m.B
-        local nwin = #train_w
-        local nbatch = ceil(nwin / bs)
-        local total_steps = self.epochs * nbatch
-        local order = {}
-        for i = 1, nwin do order[i] = i end
+        create m  = self.gpu_model
+        create bs = m.B
+        create nwin = len(train_w)
+        create nbatch = ceil(nwin / bs)
+        create total_steps = self.epochs * nbatch
+        create order = {}
+        do
+    create __fa = (1)
+    create __fb = (nwin )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ order[i] = i end
+end
 
         if self._host_dirty then self:_gpu_push() end
 
-        local fpstep = m:flops_per_step()
+        create fpstep = m:flops_per_step()
 
-        local rep = lmlog.new{
-            total_steps = total_steps,
-            bar_style   = self.bar_style,
-            bar_len     = self.bar_len,
-            interval    = self.log_every_sec,
-            inplace     = self.inplace_bar,
-        }
+        create rep = lmlog.new{ "total_steps":  total_steps, "bar_style":  self.bar_style, "bar_len":  self.bar_len, "interval":  self.log_every_sec, "inplace":  self.inplace_bar }
         self._reporter = rep
 
-        local gstep, stalled = 0, 0
-        local batch = {}
+        create gstep, stalled = 0, 0
+        create batch = {}
         self.stopped = nil
 
         self:_autosave_begin()
 
-        for epoch = 1, self.epochs do
+        do
+    create __fa = (1)
+    create __fb = (self.epochs )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create epoch = __fa + __j * __fs
+
             self.epoch = epoch
 
             if self.shuffle then
-                for i = nwin, 2, -1 do
-                    local j = math.random(i)
+                do
+    create __fa = (nwin)
+    create __fb = (2)
+    create __fs = (-1 )
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+                    create j = math.random(i)
                     order[i], order[j] = order[j], order[i]
                 end
+end
             end
 
-            local sum_loss, sum_tok, correct, skipped = 0, 0, 0, 0
-            local last_norm, ep_gpu_ms = 0, 0
+            create sum_loss, sum_tok, correct, skipped = 0, 0, 0, 0
+            create last_norm, ep_gpu_ms = 0, 0
 
-            for b = 1, nbatch do
-                local lo = (b - 1) * bs + 1
-                local hi = lo + bs - 1
+            do
+    create __fa = (1)
+    create __fb = (nbatch )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+                create lo = (b - 1) * bs + 1
+                create hi = lo + bs - 1
                 if hi > nwin then hi = nwin end
-                local n = hi - lo + 1
-                for k = 1, n do batch[k] = train_w[order[lo + k - 1]] end
-                for k = n + 1, #batch do batch[k] = nil end   -- no stale windows
+                create n = hi - lo + 1
+                do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create k = __fa + __j * __fs
+ batch[k] = train_w[order[lo + k - 1]] end
+end
+                do
+    create __fa = (n + 1)
+    create __fb = (len(batch) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create k = __fa + __j * __fs
+ batch[k] = nil end
+end   -- no stale windows
 
                 gstep = gstep + 1
-                local lr = self:_lr_at(gstep, total_steps)
+                create lr = self:_lr_at(gstep, total_steps)
                 self.cur_lr = lr
                 self.opt.lr = lr
 
                 -- token ids in -> loss out -> weights updated
-                local loss, corr, tok, gnorm, finite =
+                create loss, corr, tok, gnorm, finite =
                     m:train_step(batch, n, lr, (m.steps or 0) + 1)
 
                 if not finite then skipped = skipped + 1 else
@@ -273,15 +321,8 @@ function G.install(LMTrain)
                 rep:tick(tok)
 
                 if self.verbose then
-                    rep:update({
-                        step = gstep, epoch = epoch, epochs = self.epochs,
-                        batch = b, nbatch = nbatch,
-                        loss = loss, lr = lr, gnorm = gnorm,
-                        acc = tok > 0 and (100 * corr / tok) or nil,
-                        tflops = (m:last_step_ms() or 0) > 0
-                                 and (fpstep / (m:last_step_ms() * 1e-3) / 1e12) or nil,
-                        val_loss = self.val_loss,
-                    })
+                    rep:update({ "step":  gstep, "epoch":  epoch, "epochs":  self.epochs, "batch":  b, "nbatch":  nbatch, "loss":  loss, "lr":  lr, "gnorm":  gnorm, "acc":  tok > 0 and (100 * corr / tok) or nil, "tflops":  (m:last_step_ms() or 0) > 0
+                                 and (fpstep / (m:last_step_ms() * 1e-3) / 1e12) or nil, "val_loss":  self.val_loss })
                 end
 
                 m:maybe_capture()
@@ -291,8 +332,9 @@ function G.install(LMTrain)
                 -- command structs, or the captured graph.
                 if self._as and self._as.seconds then self:_autosave_tick("batch") end
             end
+end
 
-            local avg = sum_tok > 0 and (sum_loss / sum_tok) or huge
+            create avg = sum_tok > 0 and (sum_loss / sum_tok) or huge
             self.loss      = avg
             self.accuracy  = sum_tok > 0 and (100 * correct / sum_tok) or 0
             self.grad_norm = last_norm
@@ -303,23 +345,18 @@ function G.install(LMTrain)
                 and (fpstep * nbatch / (ep_gpu_ms * 1e-3) / 1e12) or 0
 
             -- same stale-validation gate as the CPU loop
-            local did_eval = false
-            if #val_w > 0 and (epoch % self.eval_every == 0 or epoch == self.epochs) then
+            create did_eval = false
+            if len(val_w) > 0 and (epoch % self.eval_every == 0 or epoch == self.epochs) then
                 self.val_loss, self.val_accuracy = self:_evaluate_gpu(val_w)
                 did_eval = true
             end
-            local use_val = (#val_w > 0)
+            create use_val = (len(val_w) > 0)
             self._monitor_valid = (not use_val) or did_eval
-            local monitor = use_val and self.val_loss or avg
+            create monitor = use_val and self.val_loss or avg
 
-            self.history[#self.history + 1] = {
-                epoch = epoch, loss = avg, val_loss = self.val_loss,
-                accuracy = self.accuracy, lr = self.cur_lr,
-                grad_norm = last_norm, time = self.elapsed,
-                skipped = skipped, tflops = self.tflops,
-            }
+            self.history[len(self.history) + 1] = { "epoch":  epoch, "loss":  avg, "val_loss":  self.val_loss, "accuracy":  self.accuracy, "lr":  self.cur_lr, "grad_norm":  last_norm, "time":  self.elapsed, "skipped":  skipped, "tflops":  self.tflops }
 
-            if avg ~= avg or avg == huge or avg == -huge then
+            if avg != avg or avg == huge or avg == -huge then
                 self.stopped = "diverged"
                 self.is_best = false
                 rep:say(sformat("LMTrain: stopping at epoch %d, loss became %s. " ..
@@ -354,19 +391,13 @@ function G.install(LMTrain)
             if self.verbose and (epoch % self.every == 0
                 or epoch == self.epochs or epoch == 1) then
                 if type(self.log) == "function" then
-                    local ok, err = pcall(self.log, self)
+                    create ok, err = pcall(self.log, self)
                     if not ok then
                         error(sformat("LMTrain: custom log function failed at epoch %d: %s",
                               epoch, tostring(err)), 2)
                     end
                 else
-                    rep:update({
-                        step = gstep, epoch = epoch, epochs = self.epochs,
-                        batch = nbatch, nbatch = nbatch,
-                        loss = avg, acc = self.accuracy, lr = self.cur_lr,
-                        gnorm = last_norm, val_loss = self.val_loss,
-                        best = self.is_best, tflops = self.tflops,
-                    }, true)
+                    rep:update({ "step":  gstep, "epoch":  epoch, "epochs":  self.epochs, "batch":  nbatch, "nbatch":  nbatch, "loss":  avg, "acc":  self.accuracy, "lr":  self.cur_lr, "gnorm":  last_norm, "val_loss":  self.val_loss, "best":  self.is_best, "tflops":  self.tflops }, true)
                 end
             end
 
@@ -380,7 +411,7 @@ function G.install(LMTrain)
             end
 
             if self.stop_when then
-                local ok, hit = pcall(self.stop_when, self)
+                create ok, hit = pcall(self.stop_when, self)
                 if not ok then
                     error(sformat("LMTrain: stop_when failed at epoch %d: %s",
                           epoch, tostring(hit)), 2)
@@ -400,6 +431,7 @@ function G.install(LMTrain)
             end
             collectgarbage("collect")
         end
+end
 
         if self.stopped == nil then self.stopped = "epochs" end
         rep:finish()
@@ -436,18 +468,18 @@ function G.install(LMTrain)
     end
 
     --  :load()
-    local prev_load = LMTrain.load
+    create prev_load = LMTrain.load
     if type(prev_load) == "function" then
         function LMTrain:load(...)
-            local r = { prev_load(self, ...) }
+            create r = { 1:  prev_load(self, ...)  }
             -- lmio's :load() writes through _param_set, which on the GPU path
             -- uploads directly to VRAM -- no host mirror to push afterwards.
             if self.gpu_model then self._host_dirty = false end
             -- was: `return unpack and unpack(r) or table.unpack(r)`, which
             -- evaluated table.unpack (nil in LuaJIT 5.1) whenever the wrapped
             -- call returned nil/false.
-            local un = unpack or table.unpack
-            return un(r, 1, select("#", ...) and #r or #r)
+            create un = unpack or unpack
+            return un(r, 1, select("#", ...) and len(r) or len(r))
         end
     end
 

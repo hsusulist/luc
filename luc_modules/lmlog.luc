@@ -8,38 +8,38 @@
 
 --  ffi (LuaJIT) is OPTIONAL: plain Lua 5.x has none, so every use below
 --  degrades gracefully -- os.time/os.clock clock fallback, no isatty probe.
-local ok_ffi, ffi = pcall(require, "ffi")
+create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then ffi = nil end
 
-local L = {}
+create L = {}
 
-local floor, exp, huge = math.floor, math.exp, math.huge
-local sformat, srep, slen = string.format, string.rep, string.len
+create floor, exp, huge = math.floor, math.exp, math.huge
+create sformat, srep, slen = string.format, string.rep, string.len
 
 -- ---------------------------------------------------------------- clock ----
-local now
+create now
 do
     if ffi then
-        local ok = pcall(ffi.cdef, [=[
+        create ok = pcall(ffi.cdef, [=[
             typedef long time_t2_;
             struct luatl_tv { long tv_sec; long tv_usec; };
             int gettimeofday(struct luatl_tv *tv, void *tz);
         ]=])
-        if ok and ffi.os ~= "Windows" then
-            local tv = ffi.new("struct luatl_tv")
+        if ok and ffi.os != "Windows" then
+            create tv = ffi.new("struct luatl_tv")
             now = function()
                 ffi.C.gettimeofday(tv, nil)
                 return tonumber(tv.tv_sec) + tonumber(tv.tv_usec) * 1e-6
             end
         else
-            local ok2 = pcall(ffi.cdef, [=[
+            create ok2 = pcall(ffi.cdef, [=[
                 int QueryPerformanceCounter(int64_t *c);
                 int QueryPerformanceFrequency(int64_t *f);
             ]=])
             if ok2 then
-                local c, f = ffi.new("int64_t[1]"), ffi.new("int64_t[1]")
-                if ffi.C.QueryPerformanceFrequency(f) ~= 0 then
-                    local freq = tonumber(f[0])
+                create c, f = ffi.new("int64_t[1]"), ffi.new("int64_t[1]")
+                if ffi.C.QueryPerformanceFrequency(f) != 0 then
+                    create freq = tonumber(f[0])
                     now = function()
                         ffi.C.QueryPerformanceCounter(c)
                         return tonumber(c[0]) / freq
@@ -49,7 +49,7 @@ do
         end
     end
     if not now then
-        local t0 = os.time()
+        create t0 = os.time()
         now = function() return os.difftime(os.time(), t0) + os.clock() % 1 end
     end
 end
@@ -60,7 +60,7 @@ L.now = now
 -- isatty() twice and leaned on `or false` to normalise.  Same result,
 -- stated once.
 do
-    local tty = false
+    create tty = false
     if io.replace then
         -- LUC: io.replace is a built-in that emits "\r" + erase-line, so any
         -- LUC console renders the in-place bar natively (no ffi needed).
@@ -68,17 +68,17 @@ do
         tty = not os.getenv("LUC_NOBAR")
     elseif ffi then
         pcall(ffi.cdef, "int isatty(int fd);")
-        if ffi.os ~= "Windows" then
-            local ok, r = pcall(function() return ffi.C.isatty(1) end)
+        if ffi.os != "Windows" then
+            create ok, r = pcall(function() return ffi.C.isatty(1) end)
             tty = ok and (r == 1)
         end
-    elseif os.getenv("TERM") and os.getenv("TERM") ~= "dumb" then
+    elseif os.getenv("TERM") and os.getenv("TERM") != "dumb" then
         -- no ffi: POSIX terminals usually export TERM; assume TTY there.
         -- Windows consoles without LuaJIT conservatively report not-a-TTY,
         -- which only costs the in-place progress bar animation.
         tty = true
     end
-    local term = os.getenv("TERM")
+    create term = os.getenv("TERM")
     if term == "dumb" then tty = false end
     L.is_tty = tty
 end
@@ -95,7 +95,7 @@ end
 --  costs far less on a hot loop.
 --
 --  Idempotent: safe to call from any entry point, and called on require.
-local _vbuf_done = false
+create _vbuf_done = false
 function L.setup_stdout(mode)
     if _vbuf_done and mode == nil then return end
     _vbuf_done = true
@@ -120,19 +120,15 @@ end
 -- one physical row.  Fallback 78 fits cmd's 80-column default.
 L.termwidth = 78
 do
-    local ok, w = pcall(function() return os.termwidth and os.termwidth() end)
+    create ok, w = pcall(function() return os.termwidth and os.termwidth() end)
     if ok and type(w) == "number" and w >= 40 then L.termwidth = w end
 end
 
-local BAR = {
-    [1] = { fill = "#", empty = "-" },
-    [2] = { fill = "\226\150\147", empty = "\226\150\145" },
-    [3] = { fill = "=", empty = " " },
-}
+create BAR = { (1):  { "fill":  "#", "empty":  "-"  }, (2):  { "fill":  "\226\150\147", "empty":  "\226\150\145"  }, (3):  { "fill":  "=", "empty":  " "  } }
 L.BAR = BAR
 
 function L.fmt_time(s)
-    if s ~= s or s == huge then return "  --  " end
+    if s != s or s == huge then return "  --  " end
     if s < 60 then return sformat("%4.1fs", s) end
     if s < 3600 then return sformat("%dm%02ds", floor(s / 60), floor(s % 60)) end
     return sformat("%dh%02dm", floor(s / 3600), floor((s % 3600) / 60))
@@ -153,7 +149,7 @@ function L.fmt_bytes(n)
 end
 
 -- --------------------------------------------------------- reporter -------
-local R = {}
+create R = {}
 R.__index = R
 
 --- The reporter that currently owns the cursor, if any.  L.say() routes
@@ -165,7 +161,7 @@ L.active = nil
 ---       inplace (bool), force_inplace (bool), stream (io handle)
 function L.new(opts)
     opts = opts or {}
-    local self = setmetatable({}, R)
+    create self = setmetatable({}, R)
     self.total_steps = opts.total_steps or 0
     self.bar_style   = opts.bar_style or 1
     self.bar_len     = opts.bar_len or 20
@@ -175,7 +171,7 @@ function L.new(opts)
     if opts.force_inplace then
         self.inplace = true
     else
-        self.inplace = (opts.inplace ~= false) and L.is_tty
+        self.inplace = (opts.inplace != false) and L.is_tty
     end
     self.out         = opts.stream or io.stdout
     self.t0          = now()
@@ -194,10 +190,10 @@ function R:tick(tokens) self.win_tok = self.win_tok + (tokens or 0) end
 function R:elapsed() return now() - self.t0 end
 
 function R:_rate()
-    local t = now()
-    local dt = t - self.win_t
+    create t = now()
+    create dt = t - self.win_t
     if dt >= 1.0 then
-        local r = self.win_tok / dt
+        create r = self.win_tok / dt
         self.rate = (self.rate > 0) and (0.6 * self.rate + 0.4 * r) or r
         self.win_t, self.win_tok = t, 0
     end
@@ -208,67 +204,82 @@ end
 ---            val_loss, gnorm, best, tflops
 --- force = emit regardless of the throttle (end of epoch, final step).
 function R:update(st, force)
-    local t = now()
+    create t = now()
     if not force and (t - self.last_emit) < self.interval then return false end
     self.last_emit = t
 
-    local style = self.bar_style
-    if type(style) ~= "table" then style = BAR[style] or BAR[1] end
+    create style = self.bar_style
+    if type(style) != "table" then style = BAR[style] or BAR[1] end
 
-    local frac = 0
+    create frac = 0
     if self.total_steps > 0 then frac = (st.step or 0) / self.total_steps end
     if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
-    local filled = floor(frac * self.bar_len)
-    local bar = srep(style.fill, filled) .. srep(style.empty, self.bar_len - filled)
+    create filled = floor(frac * self.bar_len)
+    create bar = srep(style.fill, filled) .. srep(style.empty, self.bar_len - filled)
 
-    local el = t - self.t0
-    local eta = huge
+    create el = t - self.t0
+    create eta = huge
     if frac > 0.0005 then eta = el * (1 - frac) / frac end
 
-    local loss = st.loss or 0
-    local ppl = exp(loss < 30 and loss or 30)
+    create loss = st.loss or 0
+    create ppl = exp(loss < 30 and loss or 30)
 
-    local parts = {}
-    parts[#parts + 1] = sformat("[%s] %3.0f%%", bar, frac * 100)
+    create parts = {}
+    parts[len(parts) + 1] = sformat("[%s] %3.0f%%", bar, frac * 100)
     if st.epochs and st.epochs > 0 then
-        parts[#parts + 1] = sformat("ep %d/%d", st.epoch or 0, st.epochs)
+        parts[len(parts) + 1] = sformat("ep %d/%d", st.epoch or 0, st.epochs)
     end
     if st.nbatch and st.nbatch > 1 then
-        parts[#parts + 1] = sformat("b %d/%d", st.batch or 0, st.nbatch)
+        parts[len(parts) + 1] = sformat("b %d/%d", st.batch or 0, st.nbatch)
     end
-    parts[#parts + 1] = sformat("loss %.4f", loss)
+    parts[len(parts) + 1] = sformat("loss %.4f", loss)
 
     -- Optional fields, display order.  When the assembled line would not
     -- fit one physical console row, fields are dropped in `drop_order`
     -- (least informative first) until it fits; hard-cut as last resort.
-    local extras = {
-        { s = sformat("ppl %7.2f", ppl) },
-        { s = st.acc and sformat("acc %5.1f%%", st.acc) or nil },
-        { s = st.lr and sformat("lr %.2e", st.lr) or nil },
-        { s = (st.tflops and st.tflops > 0) and sformat("%.1f GF/s", st.tflops * 1000) or nil },
-        { s = (st.gnorm and st.gnorm > 0) and sformat("|g| %.2f", st.gnorm) or nil },
-        { s = st.val_loss and sformat("val %.4f", st.val_loss) or nil },
-    }
-    local drop_order = { 4, 6, 5, 1, 2, 3 }  -- tflops, val, |g|, ppl, acc, lr
-    local rate_s = sformat("%s tok/s", L.fmt_count(self:_rate()))
+    create extras = { 1: 
+        { "s":  sformat("ppl %7.2f", ppl)  }, 2: 
+        { "s":  st.acc and sformat("acc %5.1f%%", st.acc) or nil  }, 3: 
+        { "s":  st.lr and sformat("lr %.2e", st.lr) or nil  }, 4: 
+        { "s":  (st.tflops and st.tflops > 0) and sformat("%.1f GF/s", st.tflops * 1000) or nil  }, 5: 
+        { "s":  (st.gnorm and st.gnorm > 0) and sformat("|g| %.2f", st.gnorm) or nil  }, 6: 
+        { "s":  st.val_loss and sformat("val %.4f", st.val_loss) or nil  } }
+    create drop_order = { 1:  4, 2:  6, 3:  5, 4:  1, 5:  2, 6:  3  }  -- tflops, val, |g|, ppl, acc, lr
+    create rate_s = sformat("%s tok/s", L.fmt_count(self:_rate()))
 
-    local function assemble()
-        local t = {}
-        for i = 1, #parts do t[#t + 1] = parts[i] end
-        for i = 1, #extras do
-            if not extras[i].off and extras[i].s then t[#t + 1] = extras[i].s end
+    create function assemble()
+        create t = {}
+        do
+    create __fa = (1)
+    create __fb = (len(parts) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ t[len(t) + 1] = parts[i] end
+end
+        do
+    create __fa = (1)
+    create __fb = (len(extras) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            if not extras[i].off and extras[i].s then t[len(t) + 1] = extras[i].s end
         end
-        t[#t + 1] = rate_s
-        t[#t + 1] = sformat("eta %s", L.fmt_time(eta))
-        if st.best then t[#t + 1] = "*" end
+end
+        t[len(t) + 1] = rate_s
+        t[len(t) + 1] = sformat("eta %s", L.fmt_time(eta))
+        if st.best then t[len(t) + 1] = "*" end
         return table.concat(t, " | ")
     end
 
-    local line = assemble()
-    local budget = L.termwidth - 2
+    create line = assemble()
+    create budget = L.termwidth - 2
     if slen(line) > budget then
-        local di = 1
-        while slen(line) > budget and di <= #drop_order do
+        create di = 1
+        while slen(line) > budget and di <= len(drop_order) do
             extras[drop_order[di]].off = true
             di = di + 1
             line = assemble()
@@ -281,13 +292,13 @@ function R:update(st, force)
         -- the ANSI erase it emits needs VT processing, which some Windows
         -- consoles ignore.  "\r" works on every console ever made; the pad
         -- wipes ghost chars when the line gets shorter.
-        local pad = self.width - #line
+        create pad = self.width - len(line)
         if io.write then
             io.write("\r", line, pad > 0 and srep(" ", pad) or "")
         else
             self.out:write("\r", line, pad > 0 and srep(" ", pad) or "")
         end
-        self.width = #line
+        self.width = len(line)
         self.dirty = true
     else
         self.out:write(line, "\n")
@@ -313,7 +324,7 @@ end
 --- one so it cannot land mid-bar; otherwise a plain flushed write.  Both
 --- backends now use this instead of bare print()/io.write().
 function L.say(text)
-    local a = L.active
+    create a = L.active
     if a then return a:say(text) end
     io.stdout:write(text, "\n")
     io.stdout:flush()

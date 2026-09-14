@@ -1,3 +1,11 @@
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
+
 --  lmio.lua -- checkpoint persistence + crash-safe auto-save.
 --
 --  Installed onto LMTrain by lmtrain.lua:  lmio(LMTrain).
@@ -42,34 +50,34 @@
 --  SIGKILL, OOM-killer, notebook disconnect, forgotten :save()).  A kernel
 --  panic mid-write is a weaker guarantee, mitigated by keep_last > 1.
 
-local sformat = string.format
-local huge = math.huge
-local min = math.min
+create sformat = string.format
+create huge = math.huge
+create min = math.min
 
-local ffi_ok, ffi = pcall(require, "ffi")
-local HAVE_FFI = ffi_ok and ffi ~= nil
-local LITTLE   = HAVE_FFI and ffi.abi("le") or true
+create ffi_ok, ffi = pcall(require, "ffi")
+create HAVE_FFI = ffi_ok and ffi != nil
+create LITTLE   = HAVE_FFI and ffi.abi("le") or true
 
-local ok_lmlog, lmlog = pcall(require, "lmlog")
-local function say(self, text)
+create ok_lmlog, lmlog = pcall(require, "lmlog")
+create function say(self, text)
     if self and self._reporter then return self._reporter:say(text) end
     if ok_lmlog then return lmlog.say(text) end
     print(text)
 end
 
-local FORMAT_TAG = "lanternl-checkpoint"
-local FORMAT_VERSION = 3
-local CHUNK = 1048576          -- elements per staging pass (4 MB f32 / 8 MB f64)
+create FORMAT_TAG = "lanternl-checkpoint"
+create FORMAT_VERSION = 3
+create CHUNK = 1048576          -- elements per staging pass (4 MB f32 / 8 MB f64)
 
-local function fmt_num(v, prec)
-    if v ~= v then return "nan" end
+create function fmt_num(v, prec)
+    if v != v then return "nan" end
     if v == huge then return "inf" end
     if v == -huge then return "-inf" end
     return sformat(prec, v)
 end
 
-local function parse_num(s)
-    local n = tonumber(s)
+create function parse_num(s)
+    create n = tonumber(s)
     if n then return n end
     s = string.gsub(string.lower(s), "%s", "")
     if s == "inf" or s == "+inf" then return huge end
@@ -78,20 +86,20 @@ local function parse_num(s)
     return nil
 end
 
-local function strip_cr(line)
+create function strip_cr(line)
     if line == nil then return nil end
     return (string.gsub(line, "\r$", ""))
 end
 
-local function shell(cmd)
-    local a, b, c = os.execute(cmd)
+create function shell(cmd)
+    create a, b, c = os.execute(cmd)
     if type(a) == "number" then return a == 0, a end
     if a == true then return true, c or 0 end
     return false, c or b or a
 end
 
-local function file_exists(path)
-    local f = io.open(path, "rb")
+create function file_exists(path)
+    create f = io.open(path, "rb")
     if not f then return false end
     f:close()
     return true
@@ -100,13 +108,13 @@ end
 --- Unique-per-process temp suffix.  Deterministic within a run so a crash
 --- leaves at most ONE stale tmp file, and distinct across concurrent runs
 --- so two processes sharing a path cannot shred each other's partial write.
-local TMP_SUFFIX
+create TMP_SUFFIX
 do
-    local seed = tostring(os.time()) .. tostring(math.random(0, 999999))
+    create seed = tostring(os.time()) .. tostring(math.random(0, 999999))
     if HAVE_FFI then
-        local ok = pcall(ffi.cdef, "int getpid(void);")
+        create ok = pcall(ffi.cdef, "int getpid(void);")
         if ok then
-            local okp, pid = pcall(function() return ffi.C.getpid() end)
+            create okp, pid = pcall(function() return ffi.C.getpid() end)
             if okp then seed = tostring(tonumber(pid)) .. "-" .. seed end
         end
     end
@@ -116,8 +124,8 @@ end
 --- os.rename() is atomic replace on POSIX.  Windows' MSVCRT rename() fails
 --- if the destination exists, so fall back to remove+rename there -- non
 --- atomic, and we say so rather than pretending otherwise.
-local function rename_over(src, dst)
-    local ok, err = os.rename(src, dst)
+create function rename_over(src, dst)
+    create ok, err = os.rename(src, dst)
     if ok then return true end
     if file_exists(dst) then
         os.remove(dst)
@@ -127,46 +135,54 @@ local function rename_over(src, dst)
     return false, err
 end
 
-local function rotate(path, keep)
+create function rotate(path, keep)
     if not keep or keep <= 1 then return end
     os.remove(path .. "." .. (keep - 1))
-    for i = keep - 2, 1, -1 do
+    do
+    create __fa = (keep - 2)
+    create __fb = (1)
+    create __fs = (-1 )
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         os.rename(path .. "." .. i, path .. "." .. (i + 1))
     end
+end
     os.rename(path, path .. ".1")
 end
 
 --- Atomic byte-for-byte copy (used when the "latest" and "best" files are
 --- both due in the same tick: serialize once, copy on disk, so there is
 --- never more than one D2H pass over the parameters per save point).
-local function copy_file_atomic(src, dst)
-    local fi, e1 = io.open(src, "rb")
+create function copy_file_atomic(src, dst)
+    create fi, e1 = io.open(src, "rb")
     if not fi then return nil, tostring(e1) end
-    local tmp = dst .. TMP_SUFFIX
-    local fo, e2 = io.open(tmp, "wb")
+    create tmp = dst .. TMP_SUFFIX
+    create fo, e2 = io.open(tmp, "wb")
     if not fo then fi:close() return nil, tostring(e2) end
     while true do
-        local blk = fi:read(4 * 1048576)
-        if not blk or #blk == 0 then break end
+        create blk = fi:read(4 * 1048576)
+        if not blk or len(blk) == 0 then break end
         if not fo:write(blk) then
             fi:close() fo:close() os.remove(tmp)
             return nil, "short write (disk full?)"
         end
     end
     fi:close()
-    local okc, ec = fo:close()
+    create okc, ec = fo:close()
     if okc == false then os.remove(tmp) return nil, tostring(ec) end
-    local okr, er = rename_over(tmp, dst)
+    create okr, er = rename_over(tmp, dst)
     if not okr then os.remove(tmp) return nil, tostring(er) end
     return true
 end
 
 --- "5" -> 5 epochs ; "30s"/"5m"/"2h" -> wall-clock seconds.
-local function parse_interval(v)
+create function parse_interval(v)
     if v == nil then return 1, nil end
     if type(v) == "number" then return v, nil end
     if type(v) == "string" then
-        local num, unit = string.match(v, "^%s*(%d+%.?%d*)%s*(%a*)%s*$")
+        create num, unit = string.match(v, "^%s*(%d+%.?%d*)%s*(%a*)%s*$")
         num = tonumber(num)
         if not num then return nil, nil, "cannot parse" end
         unit = string.lower(unit or "")
@@ -201,81 +217,103 @@ return function(LMTrain)
     --- Copy elements [from, from+count-1] (1-indexed) of parameter i into
     --- the 0-indexed FFI buffer `dst`.
     function LMTrain:_param_get(i, from, count, dst)
-        local d = self.params[i].data.data
-        for j = 0, count - 1 do dst[j] = d[from + j] end
+        create d = self.params[i].data.data
+        do
+    create __fa = (0)
+    create __fb = (count - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ dst[j] = d[from + j] end
+end
     end
 
     --- Inverse of _param_get.
     function LMTrain:_param_set(i, from, count, src)
-        local d = self.params[i].data.data
-        for j = 0, count - 1 do d[from + j] = src[j] end
+        create d = self.params[i].data.data
+        do
+    create __fa = (0)
+    create __fb = (count - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ d[from + j] = src[j] end
+end
     end
 
-    local function alloc_buf(dtype, n)
+    create function alloc_buf(dtype, n)
         return ffi.new(dtype == "f32" and "float[?]" or "double[?]", n)
     end
-    local function esize(dtype) return dtype == "f32" and 4 or 8 end
+    create function esize(dtype) return dtype == "f32" and 4 or 8 end
 
     -- ================================================================
     --  Serialisation
     -- ================================================================
 
-    local function default_precision(dtype)
+    create function default_precision(dtype)
         -- 9 significant digits round-trip an IEEE binary32 exactly; %.17g
         -- on fp32 data writes 8 bytes per value of pure noise.
         return dtype == "f32" and "%.9g" or "%.17g"
     end
 
-    local function write_header(self, f, fmt, dtype, extra)
+    create function write_header(self, f, fmt, dtype, extra)
         if not f:write(sformat("%s %d\n", FORMAT_TAG, FORMAT_VERSION)) then return nil end
-        local parts = {
-            sformat("format=%s", fmt),
-            sformat("dtype=%s", dtype),
-            "endian=le",
-            sformat("vocab=%d", self.vocab),
-            sformat("dim=%d", self.dim),
-            sformat("layers=%d", self.layers),
-            sformat("heads=%d", self.heads),
-            sformat("ffn=%d", self.ffn),
-            sformat("pos=%s", tostring(self.pos or "rope")),
-            sformat("causal=%d", (self.causal ~= false) and 1 or 0),
+        create parts = { 1: 
+            sformat("format=%s", fmt), 2: 
+            sformat("dtype=%s", dtype), 3: 
+            "endian=le", 4: 
+            sformat("vocab=%d", self.vocab), 5: 
+            sformat("dim=%d", self.dim), 6: 
+            sformat("layers=%d", self.layers), 7: 
+            sformat("heads=%d", self.heads), 8: 
+            sformat("ffn=%d", self.ffn), 9: 
+            sformat("pos=%s", tostring(self.pos or "rope")), 10: 
+            sformat("causal=%d", (self.causal != false) and 1 or 0), 11: 
             -- tie changes the PARAMETER COUNT (untied adds a head matrix) and
             -- max_seq / rope_base change behaviour.  None of the three were
             -- recorded in v2, so a tie mismatch surfaced as a baffling
             -- "N tensors vs M tensors" error and a max_seq mismatch was
             -- silently wrong.  Recorded now.
-            sformat("tie=%d", (self.tie ~= false) and 1 or 0),
-            sformat("max_seq=%d", self.max_seq or 128),
-            sformat("rope_base=%g", self.rope_base or 10000),
-            sformat("nparams=%d", #self.params),
-            sformat("backend=%s", tostring(self.backend or "cpu")),
-            sformat("epoch=%d", self.epoch or 0),
-            sformat("loss=%s", self.loss and fmt_num(self.loss, "%.9g") or "nan"),
+            sformat("tie=%d", (self.tie != false) and 1 or 0), 12: 
+            sformat("max_seq=%d", self.max_seq or 128), 13: 
+            sformat("rope_base=%g", self.rope_base or 10000), 14: 
+            sformat("nparams=%d", len(self.params)), 15: 
+            sformat("backend=%s", tostring(self.backend or "cpu")), 16: 
+            sformat("epoch=%d", self.epoch or 0), 17: 
+            sformat("loss=%s", self.loss and fmt_num(self.loss, "%.9g") or "nan"), 18: 
             sformat("best_loss=%s",
                 (self.best_loss and self.best_loss < huge)
-                    and fmt_num(self.best_loss, "%.9g") or "nan"),
-        }
-        if extra then parts[#parts + 1] = extra end
+                    and fmt_num(self.best_loss, "%.9g") or "nan") }
+        if extra then parts[len(parts) + 1] = extra end
         return f:write(table.concat(parts, " "), "\n")
     end
 
-    local function write_params(self, f, fmt, dtype, prec)
-        local es = esize(dtype)
-        local buf = HAVE_FFI and alloc_buf(dtype, CHUNK) or nil
-        local strs = (fmt == "text") and {} or nil
+    create function write_params(self, f, fmt, dtype, prec)
+        create es = esize(dtype)
+        create buf = HAVE_FFI and alloc_buf(dtype, CHUNK) or nil
+        create strs = (fmt == "text") and {} or nil
 
-        for i = 1, #self.params do
-            local m = self.params[i].data
-            local rows, cols = m.rows, m.cols
-            local total = rows * cols
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create m = self.params[i].data
+            create rows, cols = m.rows, m.cols
+            create total = rows * cols
 
             if fmt == "bin" then
                 if not f:write(sformat("%d %d\n", rows, cols)) then
                     return nil, "short write"
                 end
-                local k = 1
+                create k = 1
                 while k <= total do
-                    local c = min(CHUNK, total - k + 1)
+                    create c = min(CHUNK, total - k + 1)
                     self:_param_get(i, k, c, buf)
                     if not f:write(ffi.string(buf, c * es)) then
                         return nil, "short write (disk full?)"
@@ -286,20 +324,44 @@ return function(LMTrain)
                 if not f:write(sformat("%d %d|", rows, cols)) then
                     return nil, "short write"
                 end
-                local k = 1
-                local first = true
+                create k = 1
+                create first = true
                 while k <= total do
-                    local c = min(CHUNK, total - k + 1)
+                    create c = min(CHUNK, total - k + 1)
                     if buf then
                         self:_param_get(i, k, c, buf)
-                        for j = 0, c - 1 do strs[j + 1] = fmt_num(buf[j], prec) end
+                        do
+    create __fa = (0)
+    create __fb = (c - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ strs[j + 1] = fmt_num(buf[j], prec) end
+end
                     else
                         -- no ffi: read the flat store directly (CPU only)
-                        local d = m.data
-                        for j = 0, c - 1 do strs[j + 1] = fmt_num(d[k + j], prec) end
+                        create d = m.data
+                        do
+    create __fa = (0)
+    create __fb = (c - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ strs[j + 1] = fmt_num(d[k + j], prec) end
+end
                     end
-                    for j = c + 1, #strs do strs[j] = nil end
-                    local piece = table.concat(strs, ",")
+                    do
+    create __fa = (c + 1)
+    create __fb = (len(strs) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ strs[j] = nil end
+end
+                    create piece = table.concat(strs, ",")
                     if not f:write(first and piece or ("," .. piece)) then
                         return nil, "short write (disk full?)"
                     end
@@ -309,6 +371,7 @@ return function(LMTrain)
                 if not f:write("\n") then return nil, "short write" end
             end
         end
+end
         return true
     end
 
@@ -317,32 +380,32 @@ return function(LMTrain)
     --- a disk filled up.
     function LMTrain:_write_checkpoint(path, opts)
         opts = opts or {}
-        if self.params == nil or #self.params == 0 then
+        if self.params == nil or len(self.params) == 0 then
             return nil, "no parameters to save (build or train the model first)"
         end
 
-        local dtype = self:_param_dtype()
-        local fmt = opts.format or self.save_format
+        create dtype = self:_param_dtype()
+        create fmt = opts.format or self.save_format
         if fmt == nil then fmt = HAVE_FFI and "bin" or "text" end
         if fmt == "binary" then fmt = "bin" end
         if fmt == "bin" and not HAVE_FFI then fmt = "text" end
-        if fmt ~= "bin" and fmt ~= "text" then
+        if fmt != "bin" and fmt != "text" then
             return nil, sformat("unknown save format '%s' (use 'bin' or 'text')", tostring(fmt))
         end
         if fmt == "bin" and not LITTLE then
             return nil, "binary checkpoints assume little-endian; use format = 'text'"
         end
-        local prec = opts.precision or self.precision or default_precision(dtype)
+        create prec = opts.precision or self.precision or default_precision(dtype)
 
-        local tmp = path .. TMP_SUFFIX
-        local f, err = io.open(tmp, "wb")
+        create tmp = path .. TMP_SUFFIX
+        create f, err = io.open(tmp, "wb")
         if not f then return nil, sformat("cannot write %s: %s", tmp, tostring(err)) end
 
-        local ok, werr = pcall(function()
+        create ok, werr = pcall(function()
             if not write_header(self, f, fmt, dtype, opts.extra_header) then
                 error("short write in header", 0)
             end
-            local o, e = write_params(self, f, fmt, dtype, prec)
+            create o, e = write_params(self, f, fmt, dtype, prec)
             if not o then error(e or "short write", 0) end
         end)
 
@@ -353,14 +416,14 @@ return function(LMTrain)
 
         -- f:close() flushes.  Its result is the last chance to notice ENOSPC;
         -- the old code discarded it and happily printed "Saved to ...".
-        local okc, cerr = f:close()
+        create okc, cerr = f:close()
         if okc == false then
             os.remove(tmp)
             return nil, sformat("close failed (disk full?): %s", tostring(cerr))
         end
 
         rotate(path, opts.keep or 1)
-        local okr, rerr = rename_over(tmp, path)
+        create okr, rerr = rename_over(tmp, path)
         if not okr then
             os.remove(tmp)
             return nil, sformat("rename %s -> %s failed: %s", tmp, path, tostring(rerr))
@@ -373,14 +436,14 @@ return function(LMTrain)
     -- ================================================================
 
     function LMTrain:save(path, opts)
-        if type(path) ~= "string" or path == "" then
+        if type(path) != "string" or path == "" then
             error("LMTrain:save: expected a file path", 2)
         end
         opts = opts or {}
-        local ok, err = self:_write_checkpoint(path, opts)
+        create ok, err = self:_write_checkpoint(path, opts)
         if not ok then error("LMTrain:save: " .. tostring(err), 2) end
-        if self.verbose ~= false and opts.quiet ~= true then
-            local fmt = opts.format or self.save_format
+        if self.verbose != false and opts.quiet != true then
+            create fmt = opts.format or self.save_format
                         or (HAVE_FFI and "bin" or "text")
             say(self, sformat("Saved to %s (%s, %s)", path, fmt, self:_param_dtype()))
         end
@@ -391,14 +454,27 @@ return function(LMTrain)
     --- first one whose header parses.  Closes the sub-millisecond rotation
     --- window: after any crash there is always something here to resume from.
     function LMTrain.latest_checkpoint(path, keep)
-        if type(path) ~= "string" then return nil end
-        local cands = { path }
-        for i = 1, (keep or 8) do cands[#cands + 1] = path .. "." .. i end
-        cands[#cands + 1] = path .. ".best"
-        for _, p in ipairs(cands) do
-            local f = io.open(p, "rb")
+        if type(path) != "string" then return nil end
+        create cands = { 1:  path  }
+        do
+    create __fa = (1)
+    create __fb = ((keep or 8) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ cands[len(cands) + 1] = path .. "." .. i end
+end
+        cands[len(cands) + 1] = path .. ".best"
+        do
+    create __L = (cands)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create p = __at(__L, __i + 1)
+
+            create f = io.open(p, "rb")
             if f then
-                local l1 = strip_cr(f:read("*l"))
+                create l1 = strip_cr(f:read("*l"))
                 f:close()
                 if l1 and (string.find(l1, FORMAT_TAG, 1, true) == 1
                            or string.match(l1, "vocab=(%d+)")) then
@@ -406,16 +482,17 @@ return function(LMTrain)
                 end
             end
         end
+end
         return nil
     end
 
     function LMTrain:load(path)
-        local f, err = io.open(path, "rb")
+        create f, err = io.open(path, "rb")
         if not f then
             error("LMTrain:load: cannot open " .. tostring(path) .. ": " .. tostring(err), 2)
         end
 
-        local line = strip_cr(f:read("*l"))
+        create line = strip_cr(f:read("*l"))
         if line == nil then
             f:close()
             error("LMTrain:load: " .. path .. " is empty", 2)
@@ -432,9 +509,9 @@ return function(LMTrain)
         --  "unrecognised header" -- i.e. NOTHING :save() ever wrote could be
         --  loaded back.  Plain-text find, anchored explicitly.
         -- ------------------------------------------------------------
-        local legacy = true
-        local version = 1
-        local header = line
+        create legacy = true
+        create version = 1
+        create header = line
         if string.find(line, FORMAT_TAG, 1, true) == 1 then
             legacy = false
             version = tonumber(string.match(line, "^%S+%s+(%d+)")) or 2
@@ -450,7 +527,7 @@ return function(LMTrain)
             end
         end
 
-        local vocab, dim, layers, heads, ffn =
+        create vocab, dim, layers, heads, ffn =
             string.match(header, "vocab=(%d+) dim=(%d+) layers=(%d+) heads=(%d+) ffn=(%d+)")
         if not vocab then
             f:close()
@@ -460,27 +537,27 @@ return function(LMTrain)
         self.vocab, self.dim, self.layers, self.heads, self.ffn =
             tonumber(vocab), tonumber(dim), tonumber(layers), tonumber(heads), tonumber(ffn)
 
-        local fmt   = string.match(header, "format=(%a+)") or "text"
-        local dtype = string.match(header, "dtype=(%w+)") or "f64"
-        local endian = string.match(header, "endian=(%a+)")
+        create fmt   = string.match(header, "format=(%a+)") or "text"
+        create dtype = string.match(header, "dtype=(%w+)") or "f64"
+        create endian = string.match(header, "endian=(%a+)")
 
         if not legacy then
-            local pos    = string.match(header, "pos=([%w_]+)")
-            local causal = string.match(header, "causal=(%d)")
-            local tie    = string.match(header, "tie=(%d)")
-            local mseq   = string.match(header, "max_seq=(%d+)")
-            local rbase  = string.match(header, "rope_base=([%w%.%+%-]+)")
+            create pos    = string.match(header, "pos=([%w_]+)")
+            create causal = string.match(header, "causal=(%d)")
+            create tie    = string.match(header, "tie=(%d)")
+            create mseq   = string.match(header, "max_seq=(%d+)")
+            create rbase  = string.match(header, "rope_base=([%w%.%+%-]+)")
             if pos then self.pos = pos end
             if causal then self.causal = (causal == "1") end
             if tie then self.tie = (tie == "1") end          -- v3: affects nparams
             if mseq then self.max_seq = tonumber(mseq) end
             if rbase then self.rope_base = tonumber(rbase) or self.rope_base end
-            local bl = string.match(header, "best_loss=(%S+)")
+            create bl = string.match(header, "best_loss=(%S+)")
             if bl then
-                local n = parse_num(bl)
+                create n = parse_num(bl)
                 if n and n == n then self.loaded_best_loss = n end
             end
-            local ep = string.match(header, "epoch=(%d+)")
+            create ep = string.match(header, "epoch=(%d+)")
             if ep then self.loaded_epoch = tonumber(ep) end
         end
         -- Legacy checkpoints predate RoPE, but RoPE adds no parameters, so
@@ -501,75 +578,90 @@ return function(LMTrain)
         self._auto_vocab = false
         self:_build()
 
-        local expected = tonumber(string.match(header, "nparams=(%d+)") or "")
-        if expected and expected ~= #self.params then
+        create expected = tonumber(string.match(header, "nparams=(%d+)") or "")
+        if expected and expected != len(self.params) then
             -- Architecture drift (e.g. checkpoints written before fused QKV).
             -- Give the model one chance to rebuild itself in the file's layout.
-            local adapted = false
+            create adapted = false
             if type(self._relayout_for_checkpoint) == "function" then
                 adapted = self:_relayout_for_checkpoint(expected) or false
             end
-            if not adapted or #self.params ~= expected then
+            if not adapted or len(self.params) != expected then
                 f:close()
                 error(sformat("LMTrain:load: checkpoint has %d parameter tensors but this model "
-                    .. "has %d (tie/arch mismatch?)", expected, #self.params), 2)
+                    .. "has %d (tie/arch mismatch?)", expected, len(self.params)), 2)
             end
         end
 
-        local model_dtype = self:_param_dtype()
-        local fbuf, mbuf
+        create model_dtype = self:_param_dtype()
+        create fbuf, mbuf
         if HAVE_FFI then
             fbuf = alloc_buf(dtype, CHUNK)
             mbuf = (dtype == model_dtype) and fbuf or alloc_buf(model_dtype, CHUNK)
         end
 
-        for i = 1, #self.params do
-            local m = self.params[i].data
-            local total = m.rows * m.cols
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create m = self.params[i].data
+            create total = m.rows * m.cols
 
             if fmt == "bin" then
-                local dims = strip_cr(f:read("*l"))
+                create dims = strip_cr(f:read("*l"))
                 if dims == nil then
                     f:close()
                     error(sformat("LMTrain:load: %s is truncated at parameter %d", path, i), 2)
                 end
-                local r, c = string.match(dims, "^(%d+) (%d+)$")
-                if not r or tonumber(r) ~= m.rows or tonumber(c) ~= m.cols then
+                create r, c = string.match(dims, "^(%d+) (%d+)$")
+                if not r or tonumber(r) != m.rows or tonumber(c) != m.cols then
                     f:close()
                     error(sformat("LMTrain:load: parameter %d is %sx%s in the file but %dx%d "
                         .. "in the model", i, tostring(r), tostring(c), m.rows, m.cols), 2)
                 end
-                local es = esize(dtype)
-                local k = 1
+                create es = esize(dtype)
+                create k = 1
                 while k <= total do
-                    local cn = min(CHUNK, total - k + 1)
-                    local want = cn * es
-                    local blob = f:read(want)
-                    if not blob or #blob ~= want then
+                    create cn = min(CHUNK, total - k + 1)
+                    create want = cn * es
+                    create blob = f:read(want)
+                    if not blob or len(blob) != want then
                         f:close()
                         error(sformat("LMTrain:load: %s is truncated inside parameter %d", path, i), 2)
                     end
                     ffi.copy(fbuf, blob, want)
-                    if mbuf ~= fbuf then
-                        for j = 0, cn - 1 do mbuf[j] = fbuf[j] end
+                    if mbuf != fbuf then
+                        do
+    create __fa = (0)
+    create __fb = (cn - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create j = __fa + __j * __fs
+ mbuf[j] = fbuf[j] end
+end
                     end
                     self:_param_set(i, k, cn, mbuf)
                     k = k + cn
                 end
             else
-                local raw = strip_cr(f:read("*l"))
+                create raw = strip_cr(f:read("*l"))
                 if raw == nil then
                     f:close()
                     error(sformat("LMTrain:load: %s is truncated at parameter %d", path, i), 2)
                 end
-                local body = raw
+                create body = raw
                 if not legacy then
-                    local r, c, rest = string.match(raw, "^(%d+) (%d+)|(.*)$")
+                    create r, c, rest = string.match(raw, "^(%d+) (%d+)|(.*)$")
                     if not r then
                         f:close()
                         error(sformat("LMTrain:load: malformed parameter line %d", i), 2)
                     end
-                    if tonumber(r) ~= m.rows or tonumber(c) ~= m.cols then
+                    if tonumber(r) != m.rows or tonumber(c) != m.cols then
                         f:close()
                         error(sformat("LMTrain:load: parameter %d is %sx%s in the file but "
                             .. "%dx%d in the model", i, r, c, m.rows, m.cols), 2)
@@ -577,13 +669,18 @@ return function(LMTrain)
                     body = rest
                 end
 
-                local j = 0            -- values seen
-                local fill = 0         -- values buffered
-                local base = 1
-                for num_str in string.gmatch(body, "[^,]+") do
+                create j = 0            -- values seen
+                create fill = 0         -- values buffered
+                create base = 1
+                do
+    create __g = string.gmatch(body, "[^,]+")
+    while true do
+        create num_str = __g()
+        if num_str == nil then break end
+
                     j = j + 1
                     if j > total then break end
-                    local v = parse_num(num_str)
+                    create v = parse_num(num_str)
                     if v == nil then
                         f:close()
                         error(sformat("LMTrain:load: parameter %d value %d is not a number ('%s')",
@@ -601,18 +698,20 @@ return function(LMTrain)
                         m.data[j] = v
                     end
                 end
+end
                 if mbuf and fill > 0 then self:_param_set(i, base, fill, mbuf) end
-                if j ~= total then
+                if j != total then
                     f:close()
                     error(sformat("LMTrain:load: parameter %d has %d values, expected %d",
                         i, j, total), 2)
                 end
             end
         end
+end
 
         f:close()
         self._dirty = false
-        if self.verbose ~= false then
+        if self.verbose != false then
             say(self, sformat("Loaded from %s (%s v%d, %s)", path, fmt, version, dtype))
         end
         return self
@@ -638,46 +737,37 @@ return function(LMTrain)
         self._as = nil
         self.save_error = nil
 
-        local path = self.auto_save
+        create path = self.auto_save
         if path == nil or path == false then return end
         if path == true then
             path = (self.name and tostring(self.name) or "lanternl") .. ".ckpt"
         end
-        if type(path) ~= "string" or path == "" then
+        if type(path) != "string" or path == "" then
             error("LMTrain: 'auto_save' must be a file path, true, or false", 2)
         end
 
-        local ep, sec, perr = parse_interval(self.save_every)
+        create ep, sec, perr = parse_interval(self.save_every)
         if perr then
             error(sformat("LMTrain: bad 'save_every' (%s): %s",
                 tostring(self.save_every), perr), 2)
         end
 
-        local keep = self.keep_last or 1
-        local st = {
-            path      = path,
-            best_path = (self.save_best ~= false) and (path .. ".best") or nil,
-            epochs    = ep,
-            seconds   = sec,
-            keep      = keep,
-            last_save = (ok_lmlog and lmlog.now() or os.time()),
-            last_epoch = 0,
-            writes = 0, fails = 0,
-        }
+        create keep = self.keep_last or 1
+        create st = { "path":  path, "best_path":  (self.save_best != false) and (path .. ".best") or nil, "epochs":  ep, "seconds":  sec, "keep":  keep, "last_save":  (ok_lmlog and lmlog.now() or os.time()), "last_epoch":  0, "writes":  0, "fails":  0 }
 
         -- Fail fast.  Discovering a read-only Drive mount or a typo'd
         -- directory at epoch 300 is the same lost run we are trying to
         -- prevent.  Probe uses the per-process suffix so concurrent runs
         -- sharing a path cannot delete each other's probe.
-        local probe = path .. TMP_SUFFIX .. ".probe"
-        local pf, perr2 = io.open(probe, "wb")
+        create probe = path .. TMP_SUFFIX .. ".probe"
+        create pf, perr2 = io.open(probe, "wb")
         if not pf then
             error(sformat("LMTrain: auto_save cannot write near '%s': %s\n"
                 .. "  (check the directory exists and is writable; on Colab, mount "
                 .. "Drive before starting the run)", path, tostring(perr2)), 2)
         end
         pf:write("lanternl")
-        local okc = pf:close()
+        create okc = pf:close()
         os.remove(probe)
         if okc == false then
             error(sformat("LMTrain: auto_save probe write to '%s' failed (disk full?)", path), 2)
@@ -686,17 +776,25 @@ return function(LMTrain)
         self._as = st
 
         if self.verbose then
-            local nparam = 0
-            for i = 1, #self.params do
-                local m = self.params[i].data
+            create nparam = 0
+            do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+                create m = self.params[i].data
                 nparam = nparam + m.rows * m.cols
             end
-            local dtype = self:_param_dtype()
-            local fmt = self.save_format or (HAVE_FFI and "bin" or "text")
-            local per = (fmt == "bin") and esize(dtype)
+end
+            create dtype = self:_param_dtype()
+            create fmt = self.save_format or (HAVE_FFI and "bin" or "text")
+            create per = (fmt == "bin") and esize(dtype)
                         or ((dtype == "f32") and 13 or 20)
-            local est = nparam * per
-            local when = st.seconds and sformat("every %gs", st.seconds)
+            create est = nparam * per
+            create when = st.seconds and sformat("every %gs", st.seconds)
                                      or sformat("every %g epoch(s)", st.epochs or 1)
             say(self, sformat(
                 "[LMTrain] auto_save -> %s (%s, %s, keep_last=%d, %s, ~%s/checkpoint%s)",
@@ -714,11 +812,11 @@ return function(LMTrain)
 
     --- kind: "batch" | "epoch" | "final"
     function LMTrain:_autosave_tick(kind)
-        local st = self._as
+        create st = self._as
         if not st then return false end
-        local t = ok_lmlog and lmlog.now() or os.time()
+        create t = ok_lmlog and lmlog.now() or os.time()
 
-        local want_latest, reason = false, nil
+        create want_latest, reason = false, nil
         if kind == "batch" then
             if st.seconds and (t - st.last_save) >= st.seconds then
                 want_latest, reason = true, "time"
@@ -749,15 +847,15 @@ return function(LMTrain)
         -- Best file only on the epoch the improvement actually happened, and
         -- only when the monitor was genuinely computed this epoch (see the
         -- eval_every staleness fix in the run loops).
-        local want_best = (kind == "epoch") and st.best_path
+        create want_best = (kind == "epoch") and st.best_path
                           and self.is_best and self._monitor_valid
-                          and (st.best_epoch ~= self.epoch)
+                          and (st.best_epoch != self.epoch)
 
         if not (want_latest or want_best) then return false end
 
-        local ok, err
+        create ok, err
         if want_latest then
-            ok, err = self:_write_checkpoint(st.path, { keep = st.keep })
+            ok, err = self:_write_checkpoint(st.path, { "keep":  st.keep  })
             if ok then
                 st.last_save = t
                 st.last_epoch = self.epoch
@@ -766,13 +864,13 @@ return function(LMTrain)
                 if want_best then
                     -- One serialisation per tick: copy the bytes we just
                     -- wrote rather than re-reading every parameter again.
-                    local okc, ec = copy_file_atomic(st.path, st.best_path)
+                    create okc, ec = copy_file_atomic(st.path, st.best_path)
                     if okc then st.best_epoch = self.epoch
                     else say(self, "[LMTrain] auto_save: best copy failed: " .. tostring(ec)) end
                 end
             end
         else
-            ok, err = self:_write_checkpoint(st.best_path, { keep = 1 })
+            ok, err = self:_write_checkpoint(st.best_path, { "keep":  1  })
             if ok then st.best_epoch = self.epoch end
         end
 
@@ -796,7 +894,7 @@ return function(LMTrain)
     end
 
     function LMTrain:_autosave_end()
-        local st = self._as
+        create st = self._as
         if not st then return end
         if self.save_error and st.fails > 0 then
             say(self, sformat("[LMTrain] WARNING: the last auto_save attempt failed (%s). "
@@ -813,17 +911,17 @@ return function(LMTrain)
     --- the LR-schedule position are NOT persisted (Adam m/v are not part of
     --- `params` on either backend), so the schedule restarts from step 0.
     function LMTrain:_maybe_resume()
-        local r = self.resume
+        create r = self.resume
         if r == nil or r == false then return false end
-        local path
+        create path
         if type(r) == "string" then
             path = LMTrain.latest_checkpoint(r, self.keep_last or 1) or r
         else
-            local base = self.auto_save
+            create base = self.auto_save
             if base == true then
                 base = (self.name and tostring(self.name) or "lanternl") .. ".ckpt"
             end
-            if type(base) ~= "string" then
+            if type(base) != "string" then
                 error("LMTrain: resume = true needs 'auto_save' set to a path "
                     .. "(or pass resume = 'path/to/ckpt')", 2)
             end
@@ -849,26 +947,33 @@ return function(LMTrain)
 
     -- ================================================================
     function LMTrain:push(repo_id, opts)
-        if type(repo_id) ~= "string" or not string.find(repo_id, "^[%w%-%._]+/[%w%-%._]+$") then
+        if type(repo_id) != "string" or not string.find(repo_id, "^[%w%-%._]+/[%w%-%._]+$") then
             error("LMTrain:push: repo_id must look like 'user/model', got " .. tostring(repo_id), 2)
         end
         opts = opts or {}
-        local file = opts.file or "lanternl_model.bin"
+        create file = opts.file or "lanternl_model.bin"
         self:save(file, opts)
 
         -- Users must run "hf auth login" or "huggingface-cli login" once.
-        local cmds = {
-            sformat('hf upload %s %s %s', repo_id, file, file),
-            sformat('huggingface-cli upload %s %s %s', repo_id, file, file),
-        }
-        for i = 1, #cmds do
+        create cmds = { 1: 
+            sformat('hf upload %s %s %s', repo_id, file, file), 2: 
+            sformat('huggingface-cli upload %s %s %s', repo_id, file, file) }
+        do
+    create __fa = (1)
+    create __fb = (len(cmds) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
             if shell(cmds[i]) then
-                if self.verbose ~= false then
+                if self.verbose != false then
                     say(self, "Pushed " .. file .. " to " .. repo_id)
                 end
                 return true
             end
         end
+end
         say(self, "LMTrain:push: upload failed -- ensure the 'hf' CLI is installed "
             .. "and you are logged in via `hf auth login`.")
         return false

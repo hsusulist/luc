@@ -1,13 +1,13 @@
-local ok_ffi, ffi = pcall(require, "ffi")
+create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then
-    return { available = false }
+    return { "available":  false  }
 end
 
-local ok_cudart, cudart = pcall(ffi.load, "cudart")
-local ok_cublas, cublas_lib = pcall(ffi.load, "cublas")
+create ok_cudart, cudart = pcall(ffi.load, "cudart")
+create ok_cublas, cublas_lib = pcall(ffi.load, "cublas")
 
 if not ok_cudart or not ok_cublas then
-    return { available = false }
+    return { "available":  false  }
 end
 
 ffi.cdef[=[
@@ -31,28 +31,44 @@ int cublasSgemm_v2(cublasHandle_t handle,
                     float *C, int ldc);
 ]=]
 
-local handle_ptr = ffi.new("cublasHandle_t[1]")
-local status = cublas_lib.cublasCreate_v2(handle_ptr)
-if status ~= 0 then
-    return { available = false }
+create handle_ptr = ffi.new("cublasHandle_t[1]")
+create status = cublas_lib.cublasCreate_v2(handle_ptr)
+if status != 0 then
+    return { "available":  false  }
 end
-local handle = handle_ptr[0]
+create handle = handle_ptr[0]
 
-local gpu = { available = true }
+create gpu = { "available":  true  }
 
 function gpu.matmul(a_flat, m, k, b_flat, n)
-    local size_a = m * k * ffi.sizeof("float")
-    local size_b = k * n * ffi.sizeof("float")
-    local size_c = m * n * ffi.sizeof("float")
+    create size_a = m * k * ffi.sizeof("float")
+    create size_b = k * n * ffi.sizeof("float")
+    create size_c = m * n * ffi.sizeof("float")
 
-    local h_a = ffi.new("float[?]", m * k)
-    local h_b = ffi.new("float[?]", k * n)
-    for i = 0, m * k - 1 do h_a[i] = a_flat[i + 1] end
-    for i = 0, k * n - 1 do h_b[i] = b_flat[i + 1] end
+    create h_a = ffi.new("float[?]", m * k)
+    create h_b = ffi.new("float[?]", k * n)
+    do
+    create __fa = (0)
+    create __fb = (m * k - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ h_a[i] = a_flat[i + 1] end
+end
+    do
+    create __fa = (0)
+    create __fb = (k * n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ h_b[i] = b_flat[i + 1] end
+end
 
-    local d_a = ffi.new("void*[1]")
-    local d_b = ffi.new("void*[1]")
-    local d_c = ffi.new("void*[1]")
+    create d_a = ffi.new("void*[1]")
+    create d_b = ffi.new("void*[1]")
+    create d_c = ffi.new("void*[1]")
 
     cudart.cudaMalloc(d_a, size_a)
     cudart.cudaMalloc(d_b, size_b)
@@ -61,8 +77,8 @@ function gpu.matmul(a_flat, m, k, b_flat, n)
     cudart.cudaMemcpy(d_a[0], h_a, size_a, 1)
     cudart.cudaMemcpy(d_b[0], h_b, size_b, 1)
 
-    local alpha = ffi.new("float[1]", 1.0)
-    local beta = ffi.new("float[1]", 0.0)
+    create alpha = ffi.new("float[1]", 1.0)
+    create beta = ffi.new("float[1]", 0.0)
 
     cublas_lib.cublasSgemm_v2(
         handle, 0, 0,
@@ -74,15 +90,23 @@ function gpu.matmul(a_flat, m, k, b_flat, n)
         ffi.cast("float*", d_c[0]), n
     )
 
-    local h_c = ffi.new("float[?]", m * n)
+    create h_c = ffi.new("float[?]", m * n)
     cudart.cudaMemcpy(h_c, d_c[0], size_c, 2)
 
     cudart.cudaFree(d_a[0])
     cudart.cudaFree(d_b[0])
     cudart.cudaFree(d_c[0])
 
-    local result = {}
-    for i = 0, m * n - 1 do result[i + 1] = h_c[i] end
+    create result = {}
+    do
+    create __fa = (0)
+    create __fb = (m * n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ result[i + 1] = h_c[i] end
+end
     return result
 end
 

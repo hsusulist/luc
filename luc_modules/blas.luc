@@ -1,11 +1,11 @@
-local ok_ffi, ffi = pcall(require, "ffi")
+create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then
-    return { available = false }
+    return { "available":  false  }
 end
 
-local ok_lib, openblas = pcall(ffi.load, "openblas")
+create ok_lib, openblas = pcall(ffi.load, "openblas")
 if not ok_lib then
-    return { available = false }
+    return { "available":  false  }
 end
 
 ffi.cdef[=[
@@ -16,18 +16,34 @@ void cblas_sgemm(int Order, int TransA, int TransB,
                   float beta, float *C, int ldc);
 ]=]
 
-local CblasRowMajor = 101
-local CblasNoTrans  = 111
+create CblasRowMajor = 101
+create CblasNoTrans  = 111
 
-local blas = { available = true }
+create blas = { "available":  true  }
 
 function blas.matmul(a_flat, m, k, b_flat, n)
-    local A = ffi.new("float[?]", m * k)
-    local B = ffi.new("float[?]", k * n)
-    local C = ffi.new("float[?]", m * n)
+    create A = ffi.new("float[?]", m * k)
+    create B = ffi.new("float[?]", k * n)
+    create C = ffi.new("float[?]", m * n)
 
-    for i = 0, m * k - 1 do A[i] = a_flat[i + 1] end
-    for i = 0, k * n - 1 do B[i] = b_flat[i + 1] end
+    do
+    create __fa = (0)
+    create __fb = (m * k - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ A[i] = a_flat[i + 1] end
+end
+    do
+    create __fa = (0)
+    create __fb = (k * n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ B[i] = b_flat[i + 1] end
+end
 
     openblas.cblas_sgemm(
         CblasRowMajor, CblasNoTrans, CblasNoTrans,
@@ -37,8 +53,16 @@ function blas.matmul(a_flat, m, k, b_flat, n)
         0.0, C, n
     )
 
-    local result = {}
-    for i = 0, m * n - 1 do result[i + 1] = C[i] end
+    create result = {}
+    do
+    create __fa = (0)
+    create __fb = (m * n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ result[i + 1] = C[i] end
+end
     return result
 end
 

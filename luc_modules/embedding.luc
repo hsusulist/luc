@@ -1,10 +1,18 @@
-local Value = require("tensor")
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
 
-local embedding = {}
+create Value = require("tensor")
+
+create embedding = {}
 embedding.__index = embedding
 
 function embedding.new(config)
-    local self = setmetatable({}, embedding)
+    create self = setmetatable({}, embedding)
 
     self.vocab_size = config.vocab_size
     self.dim = config.dim
@@ -12,12 +20,28 @@ function embedding.new(config)
     assert(self.dim, "embedding: need config.dim")
 
     self.table = {}
-    for id = 1, self.vocab_size do
+    do
+    create __fa = (1)
+    create __fb = (self.vocab_size )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create id = __fa + __j * __fs
+
         self.table[id] = {}
-        for d = 1, self.dim do
+        do
+    create __fa = (1)
+    create __fb = (self.dim )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create d = __fa + __j * __fs
+
             self.table[id][d] = Value.new(math.random() * 0.2 - 0.1)
         end
+end
     end
+end
 
     return self
 end
@@ -27,27 +51,55 @@ function embedding:lookup(token_id)
 end
 
 function embedding:lookup_all(token_ids)
-    local out = {}
-    for i, id in ipairs(token_ids) do
+    create out = {}
+    do
+    create __L = (token_ids)
+    repeat 1, len(__L) as __i do
+        create i = __i + 1
+        create id = __at(__L, __i + 1)
+
         out[i] = self:lookup(id)
     end
+end
     return out
 end
 
 function embedding:parameters()
-    local params = {}
-    for id = 1, self.vocab_size do
-        for d = 1, self.dim do
+    create params = {}
+    do
+    create __fa = (1)
+    create __fb = (self.vocab_size )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create id = __fa + __j * __fs
+
+        do
+    create __fa = (1)
+    create __fb = (self.dim )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create d = __fa + __j * __fs
+
             table.insert(params, self.table[id][d])
         end
+end
     end
+end
     return params
 end
 
 function embedding:print(vec)
-    for _, v in ipairs(vec) do
+    do
+    create __L = (vec)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create v = __at(__L, __i + 1)
+
         io.write(string.format("%.3f ", v.data))
     end
+end
     print()
 end
 

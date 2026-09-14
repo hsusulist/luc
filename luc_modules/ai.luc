@@ -1,39 +1,52 @@
-local ai = {}
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
 
-local function safe_require(name)
-    local ok, lib = pcall(require, name)
+create ai = {}
+
+create function safe_require(name)
+    create ok, lib = pcall(require, name)
     if ok then return lib end
     return nil
 end
 
 -- Order matters for some modules, but pcall makes it safe
-local modules = {
-    {"Matrix", "matrix"},
-    {"Tensor", "tensor"},
-    {"Tensor2", "tensor2"},
-    {"LmLog", "lmlog"},           -- NEW: Logger utility
-    {"Tokenizer", "tokenizer"},
-    {"Data", "data"},
-    {"Embedding", "embedding"},
-    {"Positional", "positional"},
-    {"RoPE", "rope"},
-    {"Transformer", "transformer"},
-    {"NN", "nn"},
-    {"Forge", "forge"},       -- FULL CONTROL branch: PyTorch-style modules
-    {"Optim", "optim"},
-    {"Optim2", "optim2"},
-    {"Train", "train"},
-    {"LMTrain", "lmtrain"},
-    {"LMTrainGPU", "lmtrain_gpu"}, -- NEW: GPU plugin for LMTrain
-    {"GPU", "gpu"},
-    {"BLAS", "blas"},
-    {"LuaTL", "luatl_adapter"},
-    {"GPUTransformer", "gpu_transformer"} -- NEW: GPU model architecture
-}
+create modules = { 1: 
+    { 1: "Matrix", 2:  "matrix" }, 2: 
+    { 1: "Tensor", 2:  "tensor" }, 3: 
+    { 1: "Tensor2", 2:  "tensor2" }, 4: 
+    { 1: "LmLog", 2:  "lmlog" }, 5:            -- NEW: Logger utility
+    { 1: "Tokenizer", 2:  "tokenizer" }, 6: 
+    { 1: "Data", 2:  "data" }, 7: 
+    { 1: "Embedding", 2:  "embedding" }, 8: 
+    { 1: "Positional", 2:  "positional" }, 9: 
+    { 1: "RoPE", 2:  "rope" }, 10: 
+    { 1: "Transformer", 2:  "transformer" }, 11: 
+    { 1: "NN", 2:  "nn" }, 12: 
+    { 1: "Forge", 2:  "forge" }, 13:        -- FULL CONTROL branch: PyTorch-style modules
+    { 1: "Optim", 2:  "optim" }, 14: 
+    { 1: "Optim2", 2:  "optim2" }, 15: 
+    { 1: "Train", 2:  "train" }, 16: 
+    { 1: "LMTrain", 2:  "lmtrain" }, 17: 
+    { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- NEW: GPU plugin for LMTrain
+    { 1: "GPU", 2:  "gpu" }, 19: 
+    { 1: "BLAS", 2:  "blas" }, 20: 
+    { 1: "LuaTL", 2:  "luatl_adapter" }, 21: 
+    { 1: "GPUTransformer", 2:  "gpu_transformer" } -- NEW: GPU model architecture
+ }
 
-for _, m in ipairs(modules) do
-    local upper_name, file_name = m[1], m[2]
-    local lib = safe_require(file_name)
+do
+    create __L = (modules)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create m = __at(__L, __i + 1)
+
+    create upper_name, file_name = m[1], m[2]
+    create lib = safe_require(file_name)
     if lib then
         ai[upper_name] = lib
         ai[file_name]  = lib
@@ -42,6 +55,7 @@ for _, m in ipairs(modules) do
         -- But print a warning so users know if a file is missing/broken
         -- print("[LanternL] Warning: Failed to load module '" .. file_name .. "'")
     end
+end
 end
 
 --- ================================================================
@@ -55,7 +69,7 @@ end
 ---    same autograd engine -- and NOTHING else is automatic.  You write
 ---    the training loop yourself, exactly like torch.
 ---
----  Returns the toolbox table; pass { quiet = true } to skip the banner.
+---  Returns the toolbox table; pass { "quiet": true } to skip the banner.
 function ai.forge(opts)
     opts = opts or {}
     if not ai.Forge then
@@ -68,15 +82,15 @@ function ai.forge(opts)
 |  LanternL FORGE -- full control mode unlocked            |
 |                                                          |
 |  Nothing is automatic here.  You get raw modules:        |
-|      local F = ai.forge{ quiet = true }                  |
-|      local m   = F.Sequential(                           |
+|      create F = ai.forge({ "quiet": true })              |
+|      create m = F.Sequential(                            |
 |          F.Linear(2, 32), F.ReLU(),                      |
 |          F.Linear(32, 1))                                |
-|      local opt = F.optim.AdamW(m:parameters(),           |
-|                                { lr = 1e-3 })            |
+|      create opt = F.optim.AdamW(m:parameters(),          |
+|                                 { "lr": 1e-3 })          |
 |                                                          |
 |  Your loop, your rules:                                  |
-|      local loss = F.mse(m(x), y)                         |
+|      create loss = F.mse(m(x), y)                        |
 |      opt.zero_grad(); loss:backward(); opt.step()        |
 |                                                          |
 |  See examples/full_control.lua                           |
@@ -90,13 +104,13 @@ ai.hardcoding = ai.forge
 ai.fullcontrol = ai.forge
 
 function ai.profile()
-    local luaTL = ai.LuaTL
+    create luaTL = ai.LuaTL
     if not luaTL or not luaTL.available then
         print("Profiling: luaTL (GPU) is not active. Running in pure CPU mode.")
         return
     end
 
-    local p = luaTL.get_profile()
+    create p = luaTL.get_profile()
     print("  luaTL GPU Profiler")
     print(string.format("  VRAM Allocations : %d", p.allocs))
     print(string.format("  Host -> Device   : %.4f sec", p.h2d))
@@ -110,28 +124,28 @@ function ai.profile()
 end
 
 function ai.benchmark()
-    local matrix = ai.Matrix
+    create matrix = ai.Matrix
     print("  LanternL CPU/GPU Benchmark")
     
     -- 512x512 matrices (roughly 2MB each as f64)
-    local size = 512 
+    create size = 512 
     print("Generating " .. size .. "x" .. size .. " matrices...")
-    local A = matrix.random(size, size)
-    local B = matrix.random(size, size)
+    create A = matrix.random(size, size)
+    create B = matrix.random(size, size)
     
     -- 1. CPU Benchmark
     matrix.use("lua")
-    local t0 = os.clock()
-    local C_cpu = matrix.multiply(A, B)
-    local cpu_time = os.clock() - t0
+    create t0 = os.clock()
+    create C_cpu = matrix.multiply(A, B)
+    create cpu_time = os.clock() - t0
     print(string.format("  CPU (Pure LuaJIT) : %.4f sec", cpu_time))
     
     -- 2. GPU Benchmark (if available)
-    local gpu_time = "N/A"
+    create gpu_time = "N/A"
     if ai.LuaTL and ai.LuaTL.available then
         matrix.use("luatl_adapter")
-        local t1 = os.clock()
-        local C_gpu = matrix.multiply(A, B)
+        create t1 = os.clock()
+        create C_gpu = matrix.multiply(A, B)
         gpu_time = os.clock() - t1
         print(string.format("  GPU (luaTL)       : %.4f sec", gpu_time))
         
@@ -149,14 +163,14 @@ end
 
 function ai.help()
     print([=[
-1. QUICKSTART (Text to AI in 5 lines)
-local ai = require("ai")
+ 1. QUICKSTART (Text to AI in 5 lines)
+import ai
 
-local model = ai.LMTrain {
-    data = "hello world, this is lua ai!",
-    preset = "auto",   -- Auto-sizes the model dimensions
-    epochs = 300
-}
+create model = ai.LMTrain({
+    "data": "hello world, this is luc ai!",
+    "preset": "auto",   -- Auto-sizes the model dimensions
+    "epochs": 300,
+})
 
 model:run()             -- Watch the progress bar!
 print(model:generate("hello", 10)) -- Generate text!
@@ -164,45 +178,45 @@ print(model:generate("hello", 10)) -- Generate text!
 
 2. GPU-RESIDENT TRAINING (Massive Speedup)
 -- If you have compiled luaTL.so, add backend = "gpu"!
-local model = ai.LMTrain {
-    data = "your long text here",
-    preset = "auto",
-    epochs = 1000,
-    backend = "gpu",     -- Uses gpu_transformer.lua & luaTL
-    graph = true,        -- Enables CUDA Graphs for near-zero overhead
-    optimizer = "adamw"  -- AdamW is supported on GPU
-}
+create model = ai.LMTrain({
+    "data": "your long text here",
+    "preset": "auto",
+    "epochs": 1000,
+    "backend": "gpu",     -- Uses gpu_transformer.lua & luaTL
+    "graph": true,        -- Enables CUDA Graphs for near-zero overhead
+    "optimizer": "adamw"  -- AdamW is supported on GPU
+})
 model:run()
 
 
 3. TRAINING WITH A TOKENIZER (For larger texts)
 -- Train a BPE Tokenizer on your text
-local tok = ai.Tokenizer.new { text = "your long text here", vocab_size = 500 }
+create tok = ai.Tokenizer.new({ "text": "your long text here", "vocab_size": 500 })
 tok:train()
 
 -- Pass the tokenizer to LMTrain! It handles encoding/decoding automatically.
-local trainer = ai.LMTrain {
-    data = "your long text here",
-    tokenizer = tok,
-    epochs = 100
-}
+create trainer = ai.LMTrain({
+    "data": "your long text here",
+    "tokenizer": tok,
+    "epochs": 100,
+})
 trainer:run()
 print(trainer:generate("your", 20))
 
 
 4. DOWNLOADING DATASETS (HuggingFace)
 -- Auto-discovers files, parses Parquet/CSV/TXT, limits to 500MB
-local dataset = ai.Data("your_username/your_dataset", "500MB")
+create dataset = ai.Data("your_username/your_dataset", "500MB")
 
-local tok = ai.Tokenizer.new { text_file = dataset.files[1], vocab_size = 1000 }
+create tok = ai.Tokenizer.new({ "text_file": dataset.files[1], "vocab_size": 1000 })
 tok:train()
 
-dataset:config { batch_size = 8, tokenizer = tok }
-local batches = dataset:batches()
+dataset:config({ "batch_size": 8, "tokenizer": tok })
+create batches = dataset:batches()
 
 
 5. ADVANCED TRAINING & EARLY STOPPING
-local trainer = ai.LMTrain {
+create trainer = ai.LMTrain({
     data = "your data here",
     epochs = 1000,
     lr = 0.01,           -- Learning rate
@@ -211,14 +225,14 @@ local trainer = ai.LMTrain {
     patience = 50,       -- Stop if no improvement for 50 epochs
     max_seq = 256,       -- Context window size
     bar_style = 2        -- 1=#, 2=blocks, 3==
-}
+})
 
 -- Custom Logging (access internal state)
-trainer:config {
-    log = function(t)
+trainer:config({
+    "log": function(t)
         print(string.format("Epoch %d | Acc: %.1f%%", t.epoch, t.accuracy))
-    end
-}
+    end,
+})
 
 trainer:run()
 
@@ -231,9 +245,9 @@ trainer:load("my_lua_model.txt")
 trainer:push("your_username/your_model_repo")
 
 
-7. CHECK GPU / HARDWARE STATUS
-for _, b in ipairs(ai.Matrix.backends()) do
-    print(string.format("Backend: %-15s | Available: %-5s | Reason: %s", 
+ 7. CHECK GPU / HARDWARE STATUS
+repeat b, i in ai.Matrix.backends() do
+    print(string.format("Backend: %-15s | Available: %-5s | Reason: %s",
           b.name, tostring(b.available), b.reason))
 end
 
@@ -248,19 +262,20 @@ end
   ai.Optim2         : Optimizers (SGD, AdamW)
 
 
-9. TWO DOORS -- EASY vs FULL CONTROL
+ 9. TWO DOORS -- EASY vs FULL CONTROL
   EASY (default, everything automatic):
-    local t = ai.LMTrain{ data = "...", epochs = 300 }
+    create t = ai.LMTrain({ "data": "...", "epochs": 300 })
     t:run()
 
   FULL CONTROL (PyTorch-style, you write the loop):
-    local F = ai.forge()          -- or ai.hardcoding(), same thing
-    local m   = F.Sequential(
+    create F = ai.forge()          -- or ai.hardcoding(), same thing
+    create m = F.Sequential(
         F.Linear(2, 32), F.GELU(),
         F.Linear(32, 1))
-    local opt = F.optim.AdamW(m:parameters(), { lr = 1e-3 })
-    for step = 1, 500 do
-        local loss = F.mse(m(x), y)
+    create opt = F.optim.AdamW(m:parameters(), { "lr": 1e-3 })
+    repeat 1, 500 as s0 do
+        create step = s0 + 1
+        create loss = F.mse(m(x), y)
         opt.zero_grad(); loss:backward(); opt.step()
     end
 

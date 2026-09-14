@@ -1,4 +1,5 @@
-# LUC - build the Inno Setup installer (PREBUILT binaries, setup v3)
+# LUC 0.1 - build the Inno Setup installer (PREBUILT binaries)
+# update 2026-09-01: -lwinhttp for both builds, no installer\sdl2 fallback
 #
 # The installer ships READY-TO-RUN exes + SDL2.dll. The USER'S PC needs
 # nothing at all: no compiler, no MSYS2, no downloads during setup -
@@ -49,9 +50,10 @@ function Test-LucExe {
 }
 
 function Get-Sdl2Layout {
-    # Returns $true and fills $SDLInc/$SDLLib/$SDLDll when SDL2 dev files exist
+    # Returns $true and fills $SDLInc/$SDLLib/$SDLDll when the MSYS2 SDL2
+    # dev package exists (the only SDL2 source: the MSYS2 dev package
+    # and the old v1/v2 helpers were removed from the repo)
     $cands = @(
-        @{ Inc = Join-Path $ProjectDir 'installer\sdl2\include'; Lib = Join-Path $ProjectDir 'installer\sdl2\lib'; Dll = Join-Path $ProjectDir 'installer\sdl2\bin\SDL2.dll' },
         @{ Inc = 'C:\msys64\mingw64\include'; Lib = 'C:\msys64\mingw64\lib'; Dll = 'C:\msys64\mingw64\bin\SDL2.dll' }
     )
     foreach ($c in $cands) {
@@ -65,7 +67,8 @@ function Get-Sdl2Layout {
 function Build-Console {
     param([string]$Gcc)
     Write-Host 'Building luc-core.exe (console)...'
-    & $Gcc -O2 -s -std=c99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs -lm
+    # -lwinhttp: HTTP client used by the built-in 'luc install' command
+    & $Gcc -O2 -s -std=c99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs -lm -lwinhttp
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-core.exe failed.' }
 }
 
@@ -74,18 +77,40 @@ function Build-Window {
     $ok, $sdlInc, $sdlLib, $sdlDll = Get-Sdl2Layout
     if (-not $ok) {
         throw @'
-SDL2 dev files not found. Either:
-  - pacman -S mingw-w64-x86_64-SDL2 in an MSYS2 MinGW64 shell, or
-  - put the SDL2 mingw dev package in installer\sdl2\ (include\, lib\, bin\SDL2.dll)
+SDL2 dev files not found. Install them in an MSYS2 MinGW64 shell:
+  pacman -S mingw-w64-x86_64-SDL2 mingw-w64-x86_64-SDL2_ttf mingw-w64-x86_64-SDL2_mixer
 '@
     }
-    Write-Host 'Building luc-win.exe (window, SDL2)...'
+    Write-Host 'Building luc-win.exe (window: SDL2 + TTF/image/mixer via runtime binding)...'
+    # NOTE: no -lSDL2_ttf/-lSDL2_image/-lSDL2_mixer here on purpose: the satellite
+    # DLLs bind at RUNTIME (LoadLibrary), so the exe starts without them.
+    # -lwinhttp: HTTP client used by the built-in 'luc install' command
     & $Gcc -O2 -s -std=c99 -static-libgcc `
         -o (Join-Path $AppDir 'luc-win.exe') $SrcCore $SrcLibs `
-        -DLUC_WINDOW -DLUC_NO_TTF -DLUC_NO_IMAGE `
-        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -mwindows
+        -DLUC_WINDOW `
+        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -lwinhttp -mwindows
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-win.exe failed.' }
     Copy-Item $sdlDll (Join-Path $AppDir 'SDL2.dll') -Force
+    # minimal SDL2_image/SDL2_mixer (PNG/JPG/GIF + WAV/MP3/OGG/FLAC/OPUS, ~2MB
+    # instead of ~30MB of AV1/JPEG-XL/MOD codecs) built from source:
+    powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectDir 'tools\build_sdl_min.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'Build of minimal SDL2_image/SDL2_mixer failed.' }
+    # stock SDL2_ttf + runtime closure of every satellite DLL + default font:
+    $satBin = 'C:\msys64\mingw64\bin'
+    $satDlls = @('SDL2_ttf.dll','libfreetype-6.dll','libharfbuzz-0.dll','libbz2-1.dll',
+        'libpng16-16.dll','zlib1.dll','libbrotlidec.dll','libbrotlicommon.dll',
+        'libgraphite2.dll','libglib-2.0-0.dll','libintl-8.dll','libpcre2-8-0.dll',
+        'libiconv-2.dll','libjpeg-8.dll','libmpg123-0.dll','libogg-0.dll',
+        'libopus-0.dll','libopusfile-0.dll','libvorbis-0.dll','libvorbisfile-3.dll',
+        'libFLAC.dll','libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll')
+    foreach ($d in $satDlls) {
+        $src = Join-Path $satBin $d
+        if (-not (Test-Path $src)) { throw "satellite DLL missing: $src" }
+        Copy-Item $src (Join-Path $AppDir $d) -Force
+    }
+    $fontSrc = 'C:\msys64\mingw64\share\fonts\TTF\DejaVuSans.ttf'
+    if (-not (Test-Path $fontSrc)) { throw "default font missing: $fontSrc (pacman -S mingw-w64-x86_64-ttf-dejavu)" }
+    Copy-Item $fontSrc (Join-Path $AppDir 'DejaVuSans.ttf') -Force
 }
 
 $winExe = Join-Path $AppDir 'luc-win.exe'
@@ -127,6 +152,12 @@ gcc: MSYS2 MinGW64 shell -> pacman -S mingw-w64-x86_64-gcc
     }
 }
 
+# pack packages\ai.lucpkg so "luc install ai" also works offline
+if (Test-Path (Join-Path $ProjectDir 'luc_modules')) {
+    Write-Host 'Packing packages\ai.lucpkg (offline source for luc install ai)...'
+    & (Join-Path $ProjectDir 'tools\make_pkg.ps1')
+}
+
 $iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $iscc) {
     $isccCandidates = @(
@@ -148,4 +179,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host 'Installer created successfully: dist\luc-installer.exe'
-Write-Host 'Welcome page should say "Setup v3" - if not, the old .iss is being used.'
+Write-Host 'Welcome page should say "LUC 0.1" - if not, the old .iss is being used.'

@@ -1,15 +1,15 @@
 --  lanternl <-> luaTL bridge
 
-local M = { name = "luatl", priority = 100, available = false }
+create M = { "name":  "luatl", "priority":  100, "available":  false  }
 
-local ok, luaTL = pcall(require, "luaTL")
+create ok, luaTL = pcall(require, "luaTL")
 if not ok then M.error = tostring(luaTL) return M end
-local ok2, err2 = pcall(require, "luaTL_train")
+create ok2, err2 = pcall(require, "luaTL_train")
 if not ok2 then M.error = tostring(err2) return M end
 
-local ffi = require("ffi")
+create ffi = require("ffi")
 
-local okinit, initerr = pcall(function() luaTL.init(0) end)
+create okinit, initerr = pcall(function() luaTL.init(0) end)
 if not okinit then M.error = tostring(initerr) return M end
 
 M.available = true
@@ -17,13 +17,13 @@ M.device    = luaTL.device
 M.luaTL     = luaTL
 M.C         = luaTL.C
 
-local F32     = luaTL.F32
-local f32_ct  = ffi.typeof("float[?]")
-local i32_ct  = ffi.typeof("int32_t[?]")
+create F32     = luaTL.F32
+create f32_ct  = ffi.typeof("float[?]")
+create i32_ct  = ffi.typeof("int32_t[?]")
 
 --  Cached host staging buffers (stops per-call cdata churn)
-local stage, stage_n = {}, {}
-local function host_buf(slot, n)
+create stage, stage_n = {}, {}
+create function host_buf(slot, n)
     if not stage[slot] or stage_n[slot] < n then
         stage[slot]   = f32_ct(n)
         stage_n[slot] = n
@@ -32,10 +32,10 @@ local function host_buf(slot, n)
 end
 
 --  Cached device scratch, keyed by "rows x cols" (pool-backed)
-local scratch = {}
-local function dev_scratch(slot, rows, cols)
-    local key = slot .. ":" .. rows .. "x" .. cols
-    local t = scratch[key]
+create scratch = {}
+create function dev_scratch(slot, rows, cols)
+    create key = slot .. ":" .. rows .. "x" .. cols
+    create t = scratch[key]
     if not t then
         t = luaTL.new(rows, cols, F32)
         scratch[key] = t
@@ -44,30 +44,37 @@ local function dev_scratch(slot, rows, cols)
 end
 
 --  Handles: a persistent GPU tensor exposed to lanternl
-local Handle = {}
+create Handle = {}
 Handle.__index = Handle
 M.HandleClass = Handle
 
-local function is_handle(x)
+create function is_handle(x)
     return type(x) == "table" and getmetatable(x) == Handle
 end
 M.is_handle = is_handle
 
-local function new_handle(t, rows, cols)
-    return setmetatable({ t = t, rows = rows, cols = cols,
-                          __luatl_handle = true }, Handle)
+create function new_handle(t, rows, cols)
+    return setmetatable({ "t":  t, "rows":  rows, "cols":  cols, "__luatl_handle":  true  }, Handle)
 end
 M.new_handle = new_handle
 
 --- Upload a flat Lua array once and keep it resident.
 function M.pin(flat, rows, cols)
-    local n = rows * cols
-    if #flat ~= n then
-        error(("luatl.pin: %d elements != %dx%d"):format(#flat, rows, cols), 2)
+    create n = rows * cols
+    if len(flat) != n then
+        error(("luatl.pin: %d elements != %dx%d"):format(len(flat), rows, cols), 2)
     end
-    local buf = host_buf("pin", n)
-    for i = 1, n do buf[i - 1] = flat[i] end
-    local t = luaTL.new(rows, cols, F32)
+    create buf = host_buf("pin", n)
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i - 1] = flat[i] end
+end
+    create t = luaTL.new(rows, cols, F32)
     t:upload(buf, n)
     return new_handle(t, rows, cols)
 end
@@ -78,18 +85,34 @@ function M.alloc(rows, cols)
 end
 
 function Handle:toflat()
-    local n   = self.rows * self.cols
-    local buf = host_buf("dl", n)
+    create n   = self.rows * self.cols
+    create buf = host_buf("dl", n)
     self.t:download(buf, n)
-    local out = {}
-    for i = 1, n do out[i] = buf[i - 1] end
+    create out = {}
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ out[i] = buf[i - 1] end
+end
     return out
 end
 
 function Handle:upload(flat)
-    local n = self.rows * self.cols
-    local buf = host_buf("ul", n)
-    for i = 1, n do buf[i - 1] = flat[i] end
+    create n = self.rows * self.cols
+    create buf = host_buf("ul", n)
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i - 1] = flat[i] end
+end
     self.t:upload(buf, n)
     return self
 end
@@ -100,61 +123,77 @@ function Handle:tensor() return self.t end
 function Handle:shape() return self.rows, self.cols end
 
 --  Upload helper: accept a handle OR a flat table
-local function as_tensor(x, rows, cols, slot)
+create function as_tensor(x, rows, cols, slot)
     if is_handle(x) then return x.t, true end
-    local n = rows * cols
-    if #x < n then
-        error(("luatl adapter: expected %d elements, got %d"):format(n, #x), 3)
+    create n = rows * cols
+    if len(x) < n then
+        error(("luatl adapter: expected %d elements, got %d"):format(n, len(x)), 3)
     end
-    local buf = host_buf(slot, n)
-    for i = 1, n do buf[i - 1] = x[i] end
-    local t = dev_scratch(slot, rows, cols)
+    create buf = host_buf(slot, n)
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i - 1] = x[i] end
+end
+    create t = dev_scratch(slot, rows, cols)
     t:upload(buf, n)
     return t, false
 end
 
-local function emit(t, rows, cols, resident)
+create function emit(t, rows, cols, resident)
     if resident then return new_handle(t, rows, cols) end
-    local n   = rows * cols
-    local buf = host_buf("out", n)
+    create n   = rows * cols
+    create buf = host_buf("out", n)
     t:download(buf, n)
-    local out = {}
-    for i = 1, n do out[i] = buf[i - 1] end
+    create out = {}
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ out[i] = buf[i - 1] end
+end
     return out
 end
 
 --  LEGACY-COMPATIBLE ENTRY POINTS  (signatures unchanged)
 
 function M.matmul(a, m, k, b, n)
-    local A, ah = as_tensor(a, m, k, "A")
-    local B, bh = as_tensor(b, k, n, "B")
-    local resident = ah and bh
-    local Cc = resident and luaTL.new(m, n, F32) or dev_scratch("C", m, n)
+    create A, ah = as_tensor(a, m, k, "A")
+    create B, bh = as_tensor(b, k, n, "B")
+    create resident = ah and bh
+    create Cc = resident and luaTL.new(m, n, F32) or dev_scratch("C", m, n)
     luaTL.gemm_ex(A, B, Cc)
     return emit(Cc, m, n, resident)
 end
 
 function M.rmsnorm(x, rows, cols, w, eps)
-    local X, xh = as_tensor(x, rows, cols, "A")
-    local W = nil
+    create X, xh = as_tensor(x, rows, cols, "A")
+    create W = nil
     if w then W = (as_tensor(w, 1, cols, "B")) end
-    local O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
+    create O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
     luaTL.check(luaTL.C.luaTL_rmsnorm(X.data, W and W.data or nil, O.data,
         rows, cols, eps or 1e-5, F32), "adapter.rmsnorm")
     return emit(O, rows, cols, xh)
 end
 
 function M.softmax(x, rows, cols)
-    local X, xh = as_tensor(x, rows, cols, "A")
-    local O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
+    create X, xh = as_tensor(x, rows, cols, "A")
+    create O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
     X:softmax_ex(O, {})
     return emit(O, rows, cols, xh)
 end
 
 function M.softmax_causal(x, rows, cols, scale, group)
-    local X, xh = as_tensor(x, rows, cols, "A")
-    local O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
-    X:softmax_ex(O, { causal = true, scale = scale or 1.0, group = group or 0 })
+    create X, xh = as_tensor(x, rows, cols, "A")
+    create O = xh and luaTL.new(rows, cols, F32) or dev_scratch("C", rows, cols)
+    X:softmax_ex(O, { "causal":  true, "scale":  scale or 1.0, "group":  group or 0  })
     return emit(O, rows, cols, xh)
 end
 
@@ -198,8 +237,7 @@ end
 --- Explicit stride view for gemm_ex / Program:gemm.
 --- rs = row stride, cs = col stride, bs = batch stride (all in elements).
 function M.view(ptr, rows, cols, rs, cs, bs)
-    return { data = ptr, rows = rows, cols = cols,
-             rs = rs, cs = cs, bs = bs or 0, dtype = F32 }
+    return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  F32  }
 end
 
 --- Column-slice view of a handle/tensor, keeping the parent leading dim.
@@ -213,7 +251,7 @@ function M.wrap(ptr, rows, cols) return luaTL.wrap(ptr, rows, cols, F32) end
 
 --- int32 index buffer backed by f32-sized storage (4 bytes either way).
 function M.ids(n)
-    local h = M.alloc(n, 1)
+    create h = M.alloc(n, 1)
     h.is_ids = true
     return h
 end
@@ -233,7 +271,7 @@ function M.download_f32(ptr, cbuf, n)
 end
 
 --- Read one float out of a device tensor (used for the loss / grad norm).
-local one = ffi.new("float[1]")
+create one = ffi.new("float[1]")
 function M.scalar(t)
     if is_handle(t) then t = t.t end
     luaTL.check(luaTL.C.luaTL_download_f32(t.data, one, 1), "adapter.scalar")
@@ -241,7 +279,7 @@ function M.scalar(t)
 end
 
 function M.mem()
-    local f, t = luaTL.mem_info()
+    create f, t = luaTL.mem_info()
     return f, t
 end
 

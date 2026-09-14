@@ -26,26 +26,26 @@
 --    command structs to 1/valid_tokens, so the reported loss and the
 --    gradient magnitude are exact, not approximate.
 
-local ffi = require("ffi")
+create ffi = require("ffi")
 
-local adapter = require("luatl_adapter")
+create adapter = require("luatl_adapter")
 
-local GT = {}
+create GT = {}
 GT.__index = GT
 
-local Model = {}
+create Model = {}
 Model.__index = Model
 GT.Model = Model
 
-local sqrt, log, cos, sin, pi = math.sqrt, math.log, math.cos, math.sin, math.pi
-local floor, min, max, huge = math.floor, math.min, math.max, math.huge
-local sformat = string.format
+create sqrt, log, cos, sin, pi = math.sqrt, math.log, math.cos, math.sin, math.pi
+create floor, min, max, huge = math.floor, math.min, math.max, math.huge
+create sformat = string.format
 
 --  Bindings (resolved lazily so that requiring this file on a CPU-only
 --  box does not explode; construction is what fails loudly).
-local luaTL, C, F32
+create luaTL, C, F32
 
-local function bind()
+create function bind()
     if luaTL then return end
     if not adapter.available then
         error("gpu_transformer: luaTL is not available (" ..
@@ -66,31 +66,30 @@ GT.adapter   = adapter
 --  Small helpers
 
 --- Byte-offset pointer into a tensor's storage, in ELEMENTS (f32).
-local function poff(t, elems)
+create function poff(t, elems)
     return ffi.cast("char*", t.data) + elems * 4
 end
 
 --- Stride view: the six numbers gemm_ex needs, plus a batch stride.
-local function sv(ptr, rows, cols, rs, cs, bs)
-    return { data = ptr, rows = rows, cols = cols,
-             rs = rs, cs = cs, bs = bs or 0, dtype = F32 }
+create function sv(ptr, rows, cols, rs, cs, bs)
+    return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  F32  }
 end
 
 --- Grab the command struct that was just queued, so we can patch scalars
 --- (grad_scale, lr, step) later without re-queueing the whole program.
-local function last_op(p)
+create function last_op(p)
     return p.h.ops[p.h.count - 1]
 end
 
-local function normal_fill(t, std)
-    local n = t.rows * t.cols
-    local buf = ffi.new("float[?]", n)
-    local i = 0
+create function normal_fill(t, std)
+    create n = t.rows * t.cols
+    create buf = ffi.new("float[?]", n)
+    create i = 0
     while i < n do
-        local u1 = math.random()
-        local u2 = math.random()
+        create u1 = math.random()
+        create u2 = math.random()
         if u1 < 1e-12 then u1 = 1e-12 end
-        local r = sqrt(-2.0 * log(u1)) * std
+        create r = sqrt(-2.0 * log(u1)) * std
         buf[i] = r * cos(2 * pi * u2); i = i + 1
         if i < n then buf[i] = r * sin(2 * pi * u2); i = i + 1 end
     end
@@ -99,9 +98,9 @@ end
 
 --  Construction
 
-local function need(cfg, key)
-    local v = cfg[key]
-    if type(v) ~= "number" or v ~= floor(v) or v < 1 then
+create function need(cfg, key)
+    create v = cfg[key]
+    if type(v) != "number" or v != floor(v) or v < 1 then
         error(sformat("gpu_transformer: '%s' must be a positive integer, got %s",
                       key, tostring(v)), 3)
     end
@@ -112,7 +111,7 @@ function GT.new(cfg)
     bind()
     cfg = cfg or {}
 
-    local self = setmetatable({}, Model)
+    create self = setmetatable({}, Model)
 
     self.vocab   = need(cfg, "vocab")
     self.dim     = need(cfg, "dim")
@@ -122,17 +121,17 @@ function GT.new(cfg)
     self.T       = need(cfg, "max_seq")
     self.B       = need(cfg, "batch_size")
 
-    if self.dim % self.heads ~= 0 then
+    if self.dim % self.heads != 0 then
         error(sformat("gpu_transformer: dim (%d) must be divisible by heads (%d)",
                       self.dim, self.heads), 2)
     end
     self.hd = self.dim / self.heads
-    if self.hd % 2 ~= 0 then
+    if self.hd % 2 != 0 then
         error(sformat("gpu_transformer: head_dim (dim/heads = %d) must be even for RoPE",
                       self.hd), 2)
     end
 
-    local pos = string.lower(tostring(cfg.pos or "rope"))
+    create pos = string.lower(tostring(cfg.pos or "rope"))
     if pos == "rope" or pos == "rotary" then
         self.use_rope = true
     elseif pos == "none" or pos == "off" then
@@ -149,8 +148,8 @@ function GT.new(cfg)
               cfg.dropout), 2)
     end
 
-    self.causal      = (cfg.causal ~= false)
-    self.tie         = (cfg.tie ~= false)
+    self.causal      = (cfg.causal != false)
+    self.tie         = (cfg.tie != false)
     self.eps         = cfg.eps or 1e-5
     self.rope_base   = cfg.rope_base or 10000
     self.clip_norm   = cfg.clip_norm or 0
@@ -158,7 +157,7 @@ function GT.new(cfg)
     self.beta1       = cfg.beta1 or 0.9
     self.beta2       = cfg.beta2 or 0.95
     self.adam_eps    = cfg.adam_eps or 1e-8
-    self.want_acc    = (cfg.want_acc ~= false)
+    self.want_acc    = (cfg.want_acc != false)
     self.use_graph   = (cfg.graph == true)
     self.timing      = (cfg.timing == true)
 
@@ -178,39 +177,31 @@ end
 --  Handles (adapter.alloc / adapter.pin) own the storage and anchor it
 --  against the GC; `self._keep` anchors the non-owning wrap views.
 function Model:_alloc()
-    local B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
-    local F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
-    local D3, F2         = 3 * D, 2 * F
-    local keep           = self._keep
+    create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
+    create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
+    create D3, F2         = 3 * D, 2 * F
+    create keep           = self._keep
 
-    local function A(rows, cols)                 -- zeroed activation buffer
-        local h = adapter.alloc(rows, cols)
-        keep[#keep + 1] = h
+    create function A(rows, cols)                 -- zeroed activation buffer
+        create h = adapter.alloc(rows, cols)
+        keep[len(keep) + 1] = h
         return h.t
     end
-    local function W(ptr, rows, cols)            -- non-owning column view
-        local t = luaTL.wrap(ptr, rows, cols, F32)
-        keep[#keep + 1] = t
+    create function W(ptr, rows, cols)            -- non-owning column view
+        create t = luaTL.wrap(ptr, rows, cols, F32)
+        keep[len(keep) + 1] = t
         return t
     end
 
-    local function param(name, rows, cols, init, decay)
-        local h = adapter.alloc(rows, cols)
+    create function param(name, rows, cols, init, decay)
+        create h = adapter.alloc(rows, cols)
         if init == "ones" then
             h.t:fill(1.0)
         elseif type(init) == "number" then
             normal_fill(h.t, init)
         end
-        local p = {
-            name = name, rows = rows, cols = cols,
-            w = h,
-            g = adapter.alloc(rows, cols),
-            m = adapter.alloc(rows, cols),
-            v = adapter.alloc(rows, cols),
-            decay = decay and true or false,
-            nelem = rows * cols,
-        }
-        self.params[#self.params + 1] = p
+        create p = { "name":  name, "rows":  rows, "cols":  cols, "w":  h, "g":  adapter.alloc(rows, cols), "m":  adapter.alloc(rows, cols), "v":  adapter.alloc(rows, cols), "decay":  decay and true or false, "nelem":  rows * cols }
+        self.params[len(self.params) + 1] = p
         return p
     end
 
@@ -218,13 +209,20 @@ function Model:_alloc()
     -- GPT-2 style init: 0.02 everywhere, residual-output projections
     -- scaled by 1/sqrt(2L) so the residual stream does not blow up with
     -- depth.  No weight decay on 1-D norm gains.
-    local std  = 0.02
-    local rstd = std / sqrt(2 * L)
+    create std  = 0.02
+    create rstd = std / sqrt(2 * L)
 
     self.emb = param("tok_emb", V, D, std, true)
     self.lyr = {}
-    for l = 1, L do
-        local ly = {}
+    do
+    create __fa = (1)
+    create __fb = (L )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create l = __fa + __j * __fs
+
+        create ly = {}
         ly.ln1  = param(sformat("l%d.ln1",  l), 1, D,   "ones", false)
         ly.wqkv = param(sformat("l%d.wqkv", l), D, D3,  std,    true)
         ly.wo   = param(sformat("l%d.wo",   l), D, D,   rstd,   true)
@@ -233,6 +231,7 @@ function Model:_alloc()
         ly.w2   = param(sformat("l%d.w2",   l), F, D,   rstd,   true)
         self.lyr[l] = ly
     end
+end
     self.lnf = param("lnf", 1, D, "ones", false)
     if not self.tie then
         self.wout = param("head", D, V, std, true)
@@ -247,17 +246,32 @@ function Model:_alloc()
     self.h_tgt  = ffi.new("int32_t[?]", N)
     self.h_pred = ffi.new("int32_t[?]", N)
     self.h_pos  = ffi.new("int32_t[?]", N)
-    for r = 0, N - 1 do self.h_pos[r] = r % T end
+    do
+    create __fa = (0)
+    create __fb = (N - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+ self.h_pos[r] = r % T end
+end
     luaTL.check(C.luaTL_upload_i32(self.pos.data, self.h_pos, N), "pos.upload")
 
     -- ---- residual stream + per-layer saved activations ---
-    self.res  = { [0] = A(N, D) }      -- res[l]  : output of layer l
+    self.res  = { (0):  A(N, D)  }      -- res[l]  : output of layer l
     self.mid  = {}                     -- mid[l]  : after attention residual
     self.h1, self.qkv, self.sc, self.attn = {}, {}, {}, {}
     self.h2, self.h13, self.hs            = {}, {}, {}
     self.qv, self.kv, self.h13a, self.h13b = {}, {}, {}, {}
 
-    for l = 1, L do
+    do
+    create __fa = (1)
+    create __fb = (L )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create l = __fa + __j * __fs
+
         self.res[l]  = A(N, D)
         self.mid[l]  = A(N, D)
         self.h1[l]   = A(N, D)
@@ -274,6 +288,7 @@ function Model:_alloc()
         self.h13a[l] = W(poff(self.h13[l], 0), N, F)
         self.h13b[l] = W(poff(self.h13[l], F), N, F)
     end
+end
 
     self.hf     = A(N, D)
     self.logits = A(N, V)          -- dlogits aliases this (saves N*V floats)
@@ -307,68 +322,90 @@ end
 --- dlogits (in place over the logits) or leaves the logits intact so
 --- that :generate() can read them.
 function Model:_queue_forward(p, grad)
-    local B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
-    local F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
-    local D3, F2         = 3 * D, 2 * F
-    local eps            = self.eps
-    local TT             = T * T
-    local HTT            = H * TT
+    create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
+    create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
+    create D3, F2         = 3 * D, 2 * F
+    create eps            = self.eps
+    create TT             = T * T
+    create HTT            = H * TT
 
     p:zero(self.lossacc)
     p:embed(self.ids, self.emb.w.t, self.res[0])
 
-    for l = 1, L do
-        local ly   = self.lyr[l]
-        local xin  = self.res[l - 1]
-        local mid  = self.mid[l]
-        local xout = self.res[l]
-        local qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
+    do
+    create __fa = (1)
+    create __fb = (L )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create l = __fa + __j * __fs
+
+        create ly   = self.lyr[l]
+        create xin  = self.res[l - 1]
+        create mid  = self.mid[l]
+        create xout = self.res[l]
+        create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
         -- pre-attention norm + fused QKV projection
         p:rmsnorm(xin, ly.ln1.w.t, self.h1[l], eps)
         p:gemm(self.h1[l], ly.wqkv.w.t, qkv)
 
         if self.use_rope then
-            local ro = { heads = H, head_dim = hd, row_stride = D3,
-                         pos_ids = self.pos, theta = self.rope_base }
+            create ro = { "heads":  H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base  }
             p:rope(self.qv[l], ro)
             p:rope(self.kv[l], ro)
         end
 
         -- S = Q Kt   (batched over heads, looped over sequences)
-        for b = 0, B - 1 do
-            local qb = b * T * D3
+        do
+    create __fa = (0)
+    create __fb = (B - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+            create qb = b * T * D3
             p:gemm(sv(poff(qkv, qb),         T, hd, D3, 1,  hd),   -- Q  [T,hd]
                    sv(poff(qkv, qb + D),     hd, T,  1, D3, hd),   -- Kt [hd,T]
                    sv(poff(sc,  b * HTT),    T,  T,  T, 1,  TT),   -- S  [T,T]
-                   { batch = H })
+                   { "batch":  H  })
         end
+end
 
         -- one launch masks + softmaxes every (sequence, head) row block
-        p:softmax(sc, sc, { causal = self.causal, group = T,
-                            scale = self.attn_scale })
+        p:softmax(sc, sc, { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
         -- ctx = P V
-        for b = 0, B - 1 do
-            local qb = b * T * D3
+        do
+    create __fa = (0)
+    create __fb = (B - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+            create qb = b * T * D3
             p:gemm(sv(poff(sc,  b * HTT),    T, T,  T,  1, TT),
                    sv(poff(qkv, qb + 2 * D), T, hd, D3, 1, hd),
                    sv(poff(at,  b * T * D),  T, hd, D,  1, hd),
-                   { batch = H })
+                   { "batch":  H  })
         end
+end
 
         -- residual: mid = xin + ctx @ Wo   (add fused into the epilogue)
         p:copy(xin, mid)
-        p:gemm(at, ly.wo.w.t, mid, { beta = 1.0 })
+        p:gemm(at, ly.wo.w.t, mid, { "beta":  1.0  })
 
         -- SwiGLU feed-forward
         p:rmsnorm(mid, ly.ln2.w.t, self.h2[l], eps)
         p:gemm(self.h2[l], ly.w13.w.t, self.h13[l])
         p:swiglu(self.h13a[l], self.h13b[l], self.hs[l],
-                 { lda = F2, ldb = F2, ldo = F })
+                 { "lda":  F2, "ldb":  F2, "ldo":  F  })
         p:copy(mid, xout)
-        p:gemm(self.hs[l], ly.w2.w.t, xout, { beta = 1.0 })
+        p:gemm(self.hs[l], ly.w2.w.t, xout, { "beta":  1.0  })
     end
+end
 
     -- final norm + output head
     p:rmsnorm(self.res[L], self.lnf.w.t, self.hf, eps)
@@ -383,26 +420,26 @@ function Model:_queue_forward(p, grad)
 
     p:cross_entropy(self.logits, self.tgt, self.losses,
                     grad and self.logits or nil,
-                    { ignore_index = -1, grad_scale = 1.0 / self.N })
-    self._ce_ops[#self._ce_ops + 1] = last_op(p)
+                    { "ignore_index":  -1, "grad_scale":  1.0 / self.N  })
+    self._ce_ops[len(self._ce_ops) + 1] = last_op(p)
 
     p:sum(self.losses, self.lossacc, 1.0 / self.N)
-    self._sum_ops[#self._sum_ops + 1] = last_op(p)
+    self._sum_ops[len(self._sum_ops) + 1] = last_op(p)
 end
 
 function Model:_queue_backward(p)
-    local B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
-    local F, L, N        = self.ffn, self.layers, self.N
-    local D3, F2         = 3 * D, 2 * F
-    local eps            = self.eps
-    local TT             = T * T
-    local HTT            = H * TT
-    local dl             = self.logits          -- dlogits, written in place
+    create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
+    create F, L, N        = self.ffn, self.layers, self.N
+    create D3, F2         = 3 * D, 2 * F
+    create eps            = self.eps
+    create TT             = T * T
+    create HTT            = H * TT
+    create dl             = self.logits          -- dlogits, written in place
 
     -- ---- output head ----
     if self.tie then
         -- d(tok_emb) += dlogits^T @ hf     ([V,N] @ [N,D] -> [V,D])
-        p:gemm(dl:t(), self.hf, self.emb.g.t, { beta = 1.0 })
+        p:gemm(dl:t(), self.hf, self.emb.g.t, { "beta":  1.0  })
         -- dhf = dlogits @ tok_emb          ([N,V] @ [V,D] -> [N,D])
         p:gemm(dl, self.emb.w.t, self.dhf)
     else
@@ -413,18 +450,25 @@ function Model:_queue_backward(p)
                   self.lnf.g.t, eps)
 
     -- ---- layers, top down ----
-    for l = L, 1, -1 do
-        local ly  = self.lyr[l]
-        local xin = self.res[l - 1]
-        local mid = self.mid[l]
-        local qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
+    do
+    create __fa = (L)
+    create __fb = (1)
+    create __fs = (-1 )
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create l = __fa + __j * __fs
+
+        create ly  = self.lyr[l]
+        create xin = self.res[l - 1]
+        create mid = self.mid[l]
+        create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
         -- ---- feed-forward ----
         p:dx(self.dres, ly.w2.w.t, self.dhs)          -- dhs  = dres @ W2^T
         p:dw(self.hs[l], self.dres, ly.w2.g.t)        -- dW2 += hs^T @ dres
         p:swiglu_bwd(self.h13a[l], self.h13b[l], self.dhs,
                      self.dh13a, self.dh13b,
-                     { lda = F2, ldb = F2, ldo = F })
+                     { "lda":  F2, "ldb":  F2, "ldo":  F  })
         p:dw(self.h2[l], self.dh13, ly.w13.g.t)
         p:dx(self.dh13, ly.w13.w.t, self.dh2)
         p:rmsnorm_bwd(mid, ly.ln2.w.t, self.dh2, self.dbr, ly.ln2.g.t, eps)
@@ -434,45 +478,58 @@ function Model:_queue_backward(p)
         p:dx(self.dres, ly.wo.w.t, self.dattn)
         p:dw(at, self.dres, ly.wo.g.t)
 
-        for b = 0, B - 1 do
-            local qb = b * T * D3
-            local dA = sv(poff(self.dattn, b * T * D), T, hd, D, 1, hd)
+        do
+    create __fa = (0)
+    create __fb = (B - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+            create qb = b * T * D3
+            create dA = sv(poff(self.dattn, b * T * D), T, hd, D, 1, hd)
             -- dP = dctx @ V^T
             p:gemm(dA,
                    sv(poff(qkv, qb + 2 * D), hd, T, 1, D3, hd),
                    sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),
-                   { batch = H })
+                   { "batch":  H  })
             -- dV = P^T @ dctx
             p:gemm(sv(poff(sc, b * HTT), T, T, 1, T, TT),
                    dA,
                    sv(poff(self.dqkv, qb + 2 * D), T, hd, D3, 1, hd),
-                   { batch = H })
+                   { "batch":  H  })
         end
+end
 
         -- dS = softmax'(P) . dP   (aliases dP; safe, the row reduction
         -- completes behind a __syncthreads before any store)
         p:softmax_bwd(sc, self.dsc, self.dsc,
-                      { causal = self.causal, group = T,
-                        scale = self.attn_scale })
+                      { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
-        for b = 0, B - 1 do
-            local qb = b * T * D3
+        do
+    create __fa = (0)
+    create __fb = (B - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+            create qb = b * T * D3
             -- dQ = dS @ K
             p:gemm(sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),
                    sv(poff(qkv, qb + D), T, hd, D3, 1, hd),
                    sv(poff(self.dqkv, qb), T, hd, D3, 1, hd),
-                   { batch = H })
+                   { "batch":  H  })
             -- dK = dS^T @ Q
             p:gemm(sv(poff(self.dsc, b * HTT), T, T, 1, T, TT),
                    sv(poff(qkv, qb), T, hd, D3, 1, hd),
                    sv(poff(self.dqkv, qb + D), T, hd, D3, 1, hd),
-                   { batch = H })
+                   { "batch":  H  })
         end
+end
 
         if self.use_rope then
-            local ro = { heads = H, head_dim = hd, row_stride = D3,
-                         pos_ids = self.pos, theta = self.rope_base,
-                         inverse = true }
+            create ro = { "heads":  H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base, "inverse":  true  }
             p:rope(self.dqv, ro)
             p:rope(self.dkv, ro)
         end
@@ -482,46 +539,71 @@ function Model:_queue_backward(p)
         p:rmsnorm_bwd(xin, ly.ln1.w.t, self.dh1, self.dbr, ly.ln1.g.t, eps)
         p:axpy(self.dres, self.dbr, 1.0)
     end
+end
 
     -- ---- embedding scatter-add (accumulates on top of the tied head) --
     p:embed_bwd(self.ids, self.dres, self.emb.g.t, 1.0)
 end
 
 function Model:_queue_zero(p)
-    for i = 1, #self.params do p:zero(self.params[i].g.t) end
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ p:zero(self.params[i].g.t) end
+end
 end
 
 function Model:_queue_opt(p)
-    local clip = self.clip_norm or 0
+    create clip = self.clip_norm or 0
     if clip > 0 then
         p:zero(self.nsq)
-        for i = 1, #self.params do p:l2(self.params[i].g.t, self.nsq) end
-        for i = 1, #self.params do
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ p:l2(self.params[i].g.t, self.nsq) end
+end
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
             p:clip(self.params[i].g.t, self.nsq, clip)
         end
+end
     end
     self._adam_ops = {}
-    for i = 1, #self.params do
-        local pp = self.params[i]
-        p:adamw(pp.w.t, pp.g.t, pp.m.t, pp.v.t, nil, {
-            lr    = 1e-3,                 -- patched every step
-            beta1 = self.beta1,
-            beta2 = self.beta2,
-            eps   = self.adam_eps,
-            wd    = pp.decay and self.weight_decay or 0.0,
-            step  = 1,                    -- patched every step
-            clip  = 0.0,
-        })
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create pp = self.params[i]
+        p:adamw(pp.w.t, pp.g.t, pp.m.t, pp.v.t, nil, { "lr":  1e-3, "beta1":  self.beta1, "beta2":  self.beta2, "eps":  self.adam_eps, "wd":  pp.decay and self.weight_decay or 0.0, "step":  1, "clip":  0.0 })
         self._adam_ops[i] = last_op(p)
     end
 end
+end
 
 function Model:_build_programs()
-    local L, B = self.layers, self.B
-    local nparam = #self.params
+    create L, B = self.layers, self.B
+    create nparam = len(self.params)
 
     -- generous, computed capacity: fwd ~ (10 + 2B)/layer, bwd ~ (16 + 4B)
-    local cap = 256 + L * (48 + 8 * B) + nparam * 8
+    create cap = 256 + L * (48 + 8 * B) + nparam * 8
 
     self._ce_ops, self._sum_ops = {}, {}
 
@@ -547,17 +629,41 @@ function Model:_set_valid(valid)
     if valid < 1 then valid = 1 end
     if self._valid == valid then return end
     self._valid = valid
-    local s = 1.0 / valid
-    for i = 1, #self._ce_ops  do self._ce_ops[i].f0  = s end
-    for i = 1, #self._sum_ops do self._sum_ops[i].f0 = s end
+    create s = 1.0 / valid
+    do
+    create __fa = (1)
+    create __fb = (len(self._ce_ops)  )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ self._ce_ops[i].f0  = s end
+end
+    do
+    create __fa = (1)
+    create __fb = (len(self._sum_ops) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ self._sum_ops[i].f0 = s end
+end
 end
 
 function Model:_set_hparams(lr, step)
-    local ops = self._adam_ops
-    for i = 1, #ops do
+    create ops = self._adam_ops
+    do
+    create __fa = (1)
+    create __fb = (len(ops) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         ops[i].f0 = lr
         ops[i].i0 = step
     end
+end
 end
 
 --  Host <-> device: the ONLY two places that touch the CPU
@@ -565,19 +671,33 @@ end
 --- Pack up to B windows into the static [B, T] id/target block.
 --- Returns the number of valid (non-padding) target positions.
 function Model:_upload(windows, nwin)
-    local B, T, N = self.B, self.T, self.N
-    local ib, tb  = self.h_ids, self.h_tgt
-    local V       = self.vocab
-    local valid   = 0
+    create B, T, N = self.B, self.T, self.N
+    create ib, tb  = self.h_ids, self.h_tgt
+    create V       = self.vocab
+    create valid   = 0
 
-    for b = 0, B - 1 do
-        local base = b * T
-        local w    = (b < (nwin or B)) and windows[b + 1] or nil
+    do
+    create __fa = (0)
+    create __fb = (B - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create b = __fa + __j * __fs
+
+        create base = b * T
+        create w    = (b < (nwin or B)) and windows[b + 1] or nil
         if w then
-            local inp, tgt, n = w[1], w[2], w[3] or #w[1]
+            create inp, tgt, n = w[1], w[2], w[3] or len(w[1])
             if n > T then n = T end
-            for t = 0, n - 1 do
-                local a, y = inp[t + 1], tgt[t + 1]
+            do
+    create __fa = (0)
+    create __fb = (n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create t = __fa + __j * __fs
+
+                create a, y = inp[t + 1], tgt[t + 1]
                 if a < 1 or a > V or y < 1 or y > V then
                     error(sformat("gpu_transformer: token out of range at window %d, pos %d " ..
                           "(input %s, target %s, vocab %d)",
@@ -586,18 +706,36 @@ function Model:_upload(windows, nwin)
                 ib[base + t] = a - 1        -- lanternl is 1-indexed, CUDA is 0
                 tb[base + t] = y - 1
             end
-            for t = n, T - 1 do
+end
+            do
+    create __fa = (n)
+    create __fb = (T - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create t = __fa + __j * __fs
+
                 ib[base + t] = 0
                 tb[base + t] = -1           -- ignored: loss 0, dlogits 0
             end
+end
             valid = valid + n
         else
-            for t = 0, T - 1 do
+            do
+    create __fa = (0)
+    create __fb = (T - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create t = __fa + __j * __fs
+
                 ib[base + t] = 0
                 tb[base + t] = -1
             end
+end
         end
     end
+end
 
     luaTL.check(C.luaTL_upload_i32(self.ids.data, ib, N), "ids.upload")
     luaTL.check(C.luaTL_upload_i32(self.tgt.data, tb, N), "tgt.upload")
@@ -612,21 +750,29 @@ end
 function Model:_read_gradnorm()
     if (self.clip_norm or 0) <= 0 then return 0 end
     luaTL.check(C.luaTL_download_f32(self.nsq.data, self.f1, 1), "gnorm")
-    local v = self.f1[0]
-    if v ~= v or v < 0 then return v end
+    create v = self.f1[0]
+    if v != v or v < 0 then return v end
     return sqrt(v)
 end
 
 function Model:_count_correct()
     if not self.want_acc then return 0 end
-    local N = self.N
+    create N = self.N
     luaTL.check(C.luaTL_download_i32(self.pred.data, self.h_pred, N), "pred")
-    local pd, td = self.h_pred, self.h_tgt
-    local c = 0
-    for r = 0, N - 1 do
-        local t = td[r]
+    create pd, td = self.h_pred, self.h_tgt
+    create c = 0
+    do
+    create __fa = (0)
+    create __fb = (N - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+        create t = td[r]
         if t >= 0 and pd[r] == t then c = c + 1 end
     end
+end
     return c
 end
 
@@ -635,7 +781,7 @@ end
 --- One optimizer step over up to B windows.
 --- Returns loss (mean over valid tokens), correct, tokens, grad_norm.
 function Model:train_step(windows, nwin, lr, step)
-    local valid = self:_upload(windows, nwin)
+    create valid = self:_upload(windows, nwin)
     self:_set_valid(valid)
 
     self.p_zero:run(true)
@@ -646,12 +792,12 @@ function Model:train_step(windows, nwin, lr, step)
         self.p_step:run(true)
     end
 
-    local loss = self:_read_loss()
-    local correct = self:_count_correct()
+    create loss = self:_read_loss()
+    create correct = self:_count_correct()
 
     -- match the CPU path: never apply a non-finite update
-    local finite = (loss == loss) and loss ~= huge and loss ~= -huge
-    local gnorm = 0
+    create finite = (loss == loss) and loss != huge and loss != -huge
+    create gnorm = 0
     if finite then
         self:_set_hparams(lr, step)
         self.p_opt:run(true)
@@ -664,7 +810,7 @@ end
 
 --- Forward-only loss/accuracy (validation).
 function Model:eval_step(windows, nwin)
-    local valid = self:_upload(windows, nwin)
+    create valid = self:_upload(windows, nwin)
     self:_set_valid(valid)
     self.p_fwd:run(true)
     return self:_read_loss(), self:_count_correct(), valid
@@ -675,37 +821,53 @@ end
 --- Only the final row is materialized -- that is all next-token sampling
 --- reads, and it keeps a 50k-vocab head from creating a 100M-entry table.
 function Model:forward(ids)
-    local T, V, N = self.T, self.vocab, self.N
-    local n = #ids
+    create T, V, N = self.T, self.vocab, self.N
+    create n = len(ids)
     if n < 1 then error("gpu_transformer: forward() needs at least one token", 2) end
     if n > T then
-        local w = {}
-        for i = n - T + 1, n do w[#w + 1] = ids[i] end
+        create w = {}
+        do
+    create __fa = (n - T + 1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ w[len(w) + 1] = ids[i] end
+end
         ids, n = w, T
     end
 
-    local tgt = {}
-    for i = 1, n do tgt[i] = 1 end            -- unused; loss is discarded
-    local valid = self:_upload({ { ids, tgt, n } }, 1)
+    create tgt = {}
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ tgt[i] = 1 end
+end            -- unused; loss is discarded
+    create valid = self:_upload({ 1:  { 1:  ids, 2:  tgt, 3:  n  }  }, 1)
     self:_set_valid(valid)
     self.p_fwd:run(true)
 
     self._row = self._row or ffi.new("float[?]", V)
-    local rowptr = poff(self.logits, (n - 1) * V)
+    create rowptr = poff(self.logits, (n - 1) * V)
     luaTL.check(C.luaTL_download_f32(rowptr, self._row, V), "logits.row")
 
-    local buf  = self._row
-    local base = (n - 1) * V
-    local proxy = setmetatable({}, { __index = function(_, i)
-        local j = i - base
+    create buf  = self._row
+    create base = (n - 1) * V
+    create proxy = setmetatable({}, { "__index":  function(_, i)
+        create j = i - base
         if j < 1 or j > V then
             error("gpu_transformer: forward() materializes only the final " ..
                   "row of the logits (index " .. tostring(i) .. " is outside it)", 2)
         end
         return buf[j - 1]
-    end })
+    end  })
 
-    return { data = { rows = n, cols = V, data = proxy } }
+    return { "data":  { "rows":  n, "cols":  V, "data":  proxy  }  }
 end
 
 --- Capture fwd+bwd as a CUDA graph.  Must be called after at least one
@@ -713,7 +875,7 @@ end
 --- pays off when the valid-token count is stable, which is the common case.
 function Model:capture()
     if self.graph_ready then return true end
-    local ok, err = pcall(function()
+    create ok, err = pcall(function()
         self.p_step:run(true)
         self.p_step:capture()
     end)
@@ -745,50 +907,82 @@ end
 --- the GPU-to-GPU path exists to protect.
 function Model:snapshot(reuse)
     if self.freed then error("gpu_transformer: snapshot() on a freed model", 2) end
-    local snap = reuse
+    create snap = reuse
     -- Only reuse a snapshot whose shapes still match this model.
     if snap then
-        local ok = (snap.owner == self) and (#snap == #self.params)
+        create ok = (snap.owner == self) and (len(snap) == len(self.params))
         if not ok then self:release_snapshot(snap); snap = nil end
     end
     if not snap then
-        snap = { owner = self }
-        for i = 1, #self.params do
-            local p = self.params[i]
+        snap = { "owner":  self  }
+        do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+            create p = self.params[i]
             snap[i] = adapter.alloc(p.rows, p.cols)
         end
+end
     end
-    for i = 1, #self.params do
-        local p = self.params[i]
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create p = self.params[i]
         luaTL.check(C.luaTL_gpu_copy(p.w.t.data, snap[i].t.data, p.nelem), "snapshot copy")
     end
+end
     return snap
 end
 
 function Model:restore(snap)
     if not snap then return false end
     if self.freed then error("gpu_transformer: restore() on a freed model", 2) end
-    if snap.owner ~= nil and snap.owner ~= self then
+    if snap.owner != nil and snap.owner != self then
         error("gpu_transformer: restore() was handed a snapshot taken from a different "
               .. "model instance (its device buffers may already be freed)", 2)
     end
-    for i = 1, #self.params do
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
         if snap[i] then
             luaTL.check(C.luaTL_gpu_copy(snap[i].t.data, self.params[i].w.t.data,
                         self.params[i].nelem), "restore copy")
         end
     end
+end
     return true
 end
 
 --- Deterministically give a snapshot's VRAM back.
 function Model:release_snapshot(snap)
-    if type(snap) ~= "table" then return false end
-    for i = 1, #snap do
-        local h = snap[i]
+    if type(snap) != "table" then return false end
+    do
+    create __fa = (1)
+    create __fb = (len(snap) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create h = snap[i]
         if type(h) == "table" and h.free then pcall(function() h:free() end) end
         snap[i] = nil
     end
+end
     snap.owner = nil
     return true
 end
@@ -798,7 +992,7 @@ end
 --- in constant host memory instead of materialising a giant Lua table.
 function Model:read_param(i, from, count, dst)
     if self.freed then error("gpu_transformer: read_param() on a freed model", 2) end
-    local p = self.params[i]
+    create p = self.params[i]
     if not p then error(sformat("gpu_transformer: no parameter %d", i), 2) end
     if from < 1 or (from + count - 1) > p.nelem then
         error(sformat("gpu_transformer: read_param range %d..%d outside parameter %d (%d elems)",
@@ -812,7 +1006,7 @@ end
 --- luaTL.wrap() for a non-owning view and :upload() for the H2D copy.
 function Model:write_param(i, from, count, src)
     if self.freed then error("gpu_transformer: write_param() on a freed model", 2) end
-    local p = self.params[i]
+    create p = self.params[i]
     if not p then error(sformat("gpu_transformer: no parameter %d", i), 2) end
     if from < 1 or (from + count - 1) > p.nelem then
         error(sformat("gpu_transformer: write_param range %d..%d outside parameter %d (%d elems)",
@@ -820,7 +1014,7 @@ function Model:write_param(i, from, count, src)
     end
     -- Keep the view in a live local for the whole call: it is non-owning, and
     -- letting it become garbage mid-upload is the classic use-after-free here.
-    local view = luaTL.wrap(poff(p.w.t, from - 1), 1, count, F32)
+    create view = luaTL.wrap(poff(p.w.t, from - 1), 1, count, F32)
     view:upload(src, count)
     -- Loading new weights invalidates any captured graph's assumptions about
     -- nothing else having moved; the graph itself is still valid (it holds
@@ -834,14 +1028,30 @@ function Model:free()
     if self.p_step then pcall(function() self.p_step:free_graph() end) end
     self.p_zero, self.p_fwd, self.p_step, self.p_opt = nil, nil, nil, nil
     self.graph_ready = false
-    for i = 1, #self._keep do
-        local h = self._keep[i]
+    do
+    create __fa = (1)
+    create __fb = (len(self._keep) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create h = self._keep[i]
         if type(h) == "table" and h.free then pcall(function() h:free() end) end
     end
-    for i = 1, #self.params do
-        local pp = self.params[i]
+end
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+
+        create pp = self.params[i]
         pp.w:free(); pp.g:free(); pp.m:free(); pp.v:free()
     end
+end
     self._keep, self.params = {}, {}
 end
 
@@ -849,8 +1059,16 @@ end
 function Model:parameters() return self.params end
 
 function Model:nparams()
-    local n = 0
-    for i = 1, #self.params do n = n + self.params[i].nelem end
+    create n = 0
+    do
+    create __fa = (1)
+    create __fb = (len(self.params) )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ n = n + self.params[i].nelem end
+end
     return n
 end
 
@@ -858,25 +1076,32 @@ end
 --- actually queued above.  Every forward GEMM costs 2*M*N*K; each has
 --- exactly two backward counterparts of the same cost, hence the 3x.
 function Model:flops_per_step()
-    local B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
-    local F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
-    local f = 0
-    for _ = 1, L do
+    create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
+    create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
+    create f = 0
+    do
+    create __fa = (1)
+    create __fb = (L )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create _ = __fa + __j * __fs
+
         f = f + 2 * N * (3 * D) * D          -- qkv
         f = f + 2 * B * H * (2 * T * T * hd) -- QK^T and PV
         f = f + 2 * N * D * D                -- out proj
         f = f + 2 * N * (2 * F) * D          -- w13
         f = f + 2 * N * D * F                -- w2
     end
+end
     f = f + 2 * N * V * D                    -- head
     return 3 * f, f
 end
 
 function Model:vram()
-    local free, total = luaTL.mem_info()
-    local st = luaTL.pool_stats()
-    return { free = free, total = total, pool_in_use = st.in_use,
-             pool_reserved = st.reserved, pool_peak = st.peak }
+    create free, total = luaTL.mem_info()
+    create st = luaTL.pool_stats()
+    return { "free":  free, "total":  total, "pool_in_use":  st.in_use, "pool_reserved":  st.reserved, "pool_peak":  st.peak  }
 end
 
 function Model:last_step_ms()

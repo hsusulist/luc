@@ -1,17 +1,11 @@
-/*
-** luc_libs.c -- ALL standard libraries merged into ONE translation unit
-** (base, buffer, coro, io, json, list, math, os, string, window)
-** Auto-merged from the original luc_lib_*.c files - each original file
-** is delimited by a ==================== banner below.
-*/
+/* luc_libs.c - all standard libraries merged into one translation unit */
+/* update 2026-09-01: comment cleanup */
 #include "luc.h"
 
 
-/* ==================== luc_lib_base.c ==================== */
-/*
-** luc_lib_base.c -- base library: print, tostring, pcall, require, xpcall...
-*/
-/* ---- base ---- */
+/* luc_lib_base.c */
+/* luc_lib_base.c -- base library: print, tostring, pcall, require, xpcall... */
+/* base */
 
 LFN(f_print){ UNUSED_SELF;
     for(int i=0;i<nargs;i++){
@@ -132,8 +126,9 @@ LFN(f_rawset){ UNUSED_SELF; tab_set(checktab(L,base,nargs,0,"rawset"),AR(1),AR(2
 LFN(f_rawequal){ UNUSED_SELF; RET(0,mkbool(val_rawequal(AR(0),AR(1)))); return 1; }
 LFN(f_collectgarbage){ UNUSED_SELF; gc_collect(); RET(0,mknum((double)V.nalloc)); return 1; }
 
-/* ---- require (rewritten: window/json branches now go through the
-        lucL_*_module() entry points, no #ifdef needed here) ------------ */
+/* require loads third-party modules from disk (script dir, cwd, luc_modules, LUC_PATH).
+   The built-in system libraries (window, ai, json) are NOT served here:
+   require("window") always picks up the user's own window module, never the system one. */
 LFN(f_require){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"require");
     Value key=mkobj(LT_STR,name);
@@ -141,11 +136,6 @@ LFN(f_require){ UNUSED_SELF;
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
     if(strcmp(name->s,"json")==0){
         Value m=lucL_json_module();
-        tab_set(V.loaded,key,m);
-        RET(0,m); return 1;
-    }
-    if(strcmp(name->s,"window")==0){
-        Value m=lucL_window_module();      /* throws when built without SDL2 */
         tab_set(V.loaded,key,m);
         RET(0,m); return 1;
     }
@@ -162,6 +152,42 @@ LFN(f_require){ UNUSED_SELF;
     if(res.t==LT_NIL) res=mkbool(1);
     tab_set(V.loaded,key,res);
     RET(0,res); return 1;
+}
+/* import loads the system libraries that ship with LUC itself:
+     import window        import ai        import json
+   plus the short-name form:  import window("w")
+   Third-party modules never go through import - they use require:
+     create mywin = require("mywin")                                     */
+LFN(f_import){ UNUSED_SELF;
+    Str *name=checkstr(L,base,nargs,0,"import");
+    char keybuf[512]; snprintf(keybuf,sizeof keybuf,"system:%s",name->s);
+    Value key=cstrv(keybuf);            /* separate cache slot from require() */
+    Value cached=tab_get(V.loaded,key);
+    if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
+    Value m=NIL;
+    if(strcmp(name->s,"window")==0){
+        m=lucL_window_module();         /* throws when built without SDL2 */
+    }else if(strcmp(name->s,"json")==0){
+        m=lucL_json_module();
+    }else if(strcmp(name->s,"ai")==0){
+        int len=0; char found[1024];
+        char *src=find_system_module(name->s,&len,found,sizeof found);
+        if(!src) luc_error("module 'ai' not found\ninstall it with: luc install ai");
+        int scratch=base+nargs+2;
+        ensure_stack(L,scratch+16);
+        Closure *cl=luc_compile(src,len,found);
+        free(src);
+        L->stack[scratch]=mkobj(LT_FUNC,cl);
+        vm_call(L,scratch,0,1);
+        m=L->stack[scratch];
+        if(m.t==LT_NIL) m=mkbool(1);
+    }else{
+        luc_error("module '%s' is not a LUC system library (system: window, ai, json)\n"
+                  "third-party modules use: create %s = require(\"%s\")",
+                  name->s,name->s,name->s);
+    }
+    tab_set(V.loaded,key,m);
+    RET(0,m); return 1;
 }
 LFN(f_setmetatable){ UNUSED_SELF;
     Value t=AR(0);
@@ -225,7 +251,7 @@ void lucL_open_base(void){
     reg(g,"rawequal",f_rawequal);    reg(g,"rawlen",f_rawlen);
     reg(g,"collectgarbage",f_collectgarbage);
     reg(g,"require",f_require);
-    reg(g,"__import",f_require);
+    reg(g,"__import",f_import);
     reg(g,"setmetatable",f_setmetatable);
     reg(g,"getmetatable",f_getmetatable);
     reg(g,"xpcall",f_xpcall);
@@ -235,11 +261,9 @@ void lucL_open_base(void){
 }
 
 
-/* ==================== luc_lib_buffer.c ==================== */
-/*
-** luc_lib_buffer.c -- buffer library (binary data)
-*/
-/* ---- buffer ---------------------------------------------------------- */
+/* luc_lib_buffer.c */
+/* luc_lib_buffer.c -- buffer library (binary data) */
+/* buffer */
 static void bufrange(Buffer *b,int off,int n){
     if(off<0||n<0||off>b->len-n)
         luc_error("buffer access out of bounds (offset %d, %d byte(s), size %d)",off,n,b->len);
@@ -365,11 +389,9 @@ void lucL_open_buffer(void){
 }
 
 
-/* ==================== luc_lib_coro.c ==================== */
-/*
-** luc_lib_coro.c -- coroutine library + task library
-*/
-/* ---- coroutine ------------------------------------------------------- */
+/* luc_lib_coro.c */
+/* luc_lib_coro.c -- coroutine library + task library */
+/* coroutine */
 LFN(f_co_create){ UNUSED_SELF;
     Value f=AR(0);
     if(f.t!=LT_FUNC&&f.t!=LT_CFUNC)
@@ -434,7 +456,7 @@ LFN(f_co_isyieldable){ UNUSED_SELF; (void)nargs;
     RET(0,mkbool(g_yp && g_yp->co==L)); return 1;
 }
 
-/* ---- task ------------------------------------------------------------ */
+/* task */
 /* trampoline: up[0]=function, up[1..] = captured arguments */
 LFN(f_task_trampoline){
     int n=self->nup-1;
@@ -516,7 +538,7 @@ void lucL_open_coro(void){
     reg(c,"yield",f_co_yield);   reg(c,"status",f_co_status);
     reg(c,"wrap",f_co_wrap);     reg(c,"running",f_co_running);
     reg(c,"isyieldable",f_co_isyieldable);
-    /* --- task --- */
+/* task */
     Table *tk=newlib("task");
     reg(tk,"wait",f_task_wait);   reg(tk,"spawn",f_task_spawn);
     reg(tk,"delay",f_task_delay); reg(tk,"defer",f_task_defer);
@@ -524,11 +546,9 @@ void lucL_open_coro(void){
 }
 
 
-/* ==================== luc_lib_io.c ==================== */
-/*
-** luc_lib_io.c -- io library + file methods (io.popen moved here)
-*/
-/* ---- io -------------------------------------------------------------- */
+/* luc_lib_io.c */
+/* luc_lib_io.c -- io library + file methods (io.popen moved here) */
+/* io */
 static FileH *checkfile(LucState *L,int base,int nargs,int i,const char *fn){
     Value v=AR(i);
     if(v.t!=LT_FILE) luc_error("bad argument #%d to '%s' (file expected, got %s)",
@@ -722,9 +742,7 @@ LFN(f_io_popen){ UNUSED_SELF;
     RET(0,mkobj(LT_FILE,h)); return 1;
 }
 
-/* ==========================================================================
-** 15. library registration
-** ========================================================================== */
+/* 15. library registration */
 
 void lucL_open_io(void){
     Table *io=newlib("io");
@@ -744,11 +762,9 @@ void lucL_open_io(void){
 }
 
 
-/* ==================== luc_lib_json.c ==================== */
-/*
-** luc_lib_json.c -- JSON module (loaded with require "json")
-*/
-/* ---- JSON ---------------------------------------------------------------- */
+/* luc_lib_json.c */
+/* luc_lib_json.c -- JSON module (loaded with require "json") */
+/* JSON */
 typedef struct { char *b; size_t len,cap; } SBuf;
 static void sb_init(SBuf *s){ s->cap=256; s->len=0; s->b=(char*)lmalloc(s->cap); }
 static void sb_put(SBuf *s,const char *p,size_t n){
@@ -953,11 +969,9 @@ Value lucL_json_module(void){
 }
 
 
-/* ==================== luc_lib_list.c ==================== */
-/*
-** luc_lib_list.c -- list methods + table library (they share sort/concat)
-*/
-/* ---- list methods ---------------------------------------------------- */
+/* luc_lib_list.c */
+/* luc_lib_list.c -- list methods + table library (they share sort/concat) */
+/* list methods */
 LFN(f_list_append){ UNUSED_SELF;
     Table *t=checktab(L,base,nargs,0,"append");
     for(int i=1;i<nargs;i++) list_push(t,L->stack[base+i]);
@@ -1033,7 +1047,7 @@ LFN(f_list_tostring){ UNUSED_SELF;
     RET(0,mkobj(LT_STR,tostr(AR(0)))); return 1;
 }
 
-/* ---- table ----------------------------------------------------------- */
+/* table */
 LFN(f_tbl_insert){ UNUSED_SELF;
     Table *t=checktab(L,base,nargs,0,"insert");
     if(nargs>=3){
@@ -1097,7 +1111,7 @@ LFN(f_tbl_move){ UNUSED_SELF;
 }
 
 void lucL_open_list(void){
-    /* list methods double as the method table for [] values */
+/* list methods double as the method table for [] values */
     Table *li=newlib("list"); V.listmeta=li;
     reg(li,"append",f_list_append);   reg(li,"pop",f_list_pop);
     reg(li,"insert",f_list_insert);   reg(li,"remove",f_list_remove);
@@ -1106,7 +1120,7 @@ void lucL_open_list(void){
     reg(li,"extend",f_list_extend);   reg(li,"reverse",f_list_reverse);
     reg(li,"sort",f_list_sort);       reg(li,"concat",f_tbl_concat);
     reg(li,"tostring",f_list_tostring);
-    /* --- table --- */
+/* table */
     Table *t=newlib("table");
     reg(t,"insert",f_tbl_insert);  reg(t,"remove",f_tbl_remove);
     reg(t,"concat",f_tbl_concat);  reg(t,"unpack",f_unpack);
@@ -1115,11 +1129,9 @@ void lucL_open_list(void){
 }
 
 
-/* ==================== luc_lib_math.c ==================== */
-/*
-** luc_lib_math.c -- math library + bit32 (+ RNG seeding, moved from luc_init)
-*/
-/* ---- math ------------------------------------------------------------ */
+/* luc_lib_math.c */
+/* luc_lib_math.c -- math library + bit32 (+ RNG seeding, moved from luc_init) */
+/* math */
 static uint64_t rngstate=0x2545F4914F6CDD1DULL;
 static double rnd(void){
     rngstate^=rngstate>>12; rngstate^=rngstate<<25; rngstate^=rngstate>>27;
@@ -1162,7 +1174,7 @@ LFN(f_m_random){ UNUSED_SELF;
 LFN(f_m_randomseed){ UNUSED_SELF;
     rngstate=(uint64_t)(int64_t)checknum(L,base,nargs,0,"randomseed")|1ULL; return 0; }
 
-/* ---- bit32 ----------------------------------------------------------- */
+/* bit32 */
 LFN(f_b_band){ UNUSED_SELF;
     uint32_t r=0xFFFFFFFFu;
     for(int i=0;i<nargs;i++) r&=checku32(L,base,nargs,i,"band");
@@ -1242,7 +1254,7 @@ void lucL_open_math(void){
     reg(m,"tointeger",f_m_tointeger); reg(m,"type",f_m_type);
     tab_set(m,cstrv("maxinteger"),mknum(9007199254740992.0));
     tab_set(m,cstrv("mininteger"),mknum(-9007199254740992.0));
-    /* --- bit32 --- */
+/* bit32 */
     Table *b=newlib("bit32");
     reg(b,"band",f_b_band);   reg(b,"bor",f_b_bor);     reg(b,"bxor",f_b_bxor);
     reg(b,"bnot",f_b_bnot);   reg(b,"lshift",f_b_lshift);reg(b,"rshift",f_b_rshift);
@@ -1251,11 +1263,9 @@ void lucL_open_math(void){
 }
 
 
-/* ==================== luc_lib_os.c ==================== */
-/*
-** luc_lib_os.c -- os library (os.execute moved here from the window section)
-*/
-/* ---- os -------------------------------------------------------------- */
+/* luc_lib_os.c */
+/* luc_lib_os.c -- os library (os.execute moved here from the window section) */
+/* os */
 #if defined(_WIN32)
 #  include <windows.h>
 #else
@@ -1338,11 +1348,9 @@ void lucL_open_os(void){
 }
 
 
-/* ==================== luc_lib_string.c ==================== */
-/*
-** luc_lib_string.c -- string library + Lua-style pattern matching
-*/
-/* ---- string ----------------------------------------------------------- */
+/* luc_lib_string.c */
+/* luc_lib_string.c -- string library + Lua-style pattern matching */
+/* string */
 static int posrelat(int pos,int len){
     if(pos>=0) return pos;
     if(-pos>len) return 0;
@@ -1397,7 +1405,7 @@ LFN(f_str_byte){ UNUSED_SELF;
     if(i<1)i=1;
     if(j>s->len)j=s->len;
     int n=0;
-    for(int x=i;x<=j;x++){ RET(n,mknum((double)(unsigned char)s->s[x-1])); n++; }  /* RET() expands its index twice — never pass n++ */
+    for(int x=i;x<=j;x++){ RET(n,mknum((double)(unsigned char)s->s[x-1])); n++; }  /* RET() expands its index twice ??? never pass n++ */
     return n;
 }
 LFN(f_str_char){ UNUSED_SELF;
@@ -1466,7 +1474,7 @@ LFN(f_str_format){ UNUSED_SELF;
     #undef OUTS
     return 1;
 }
-/* --- extensions --- */
+/* extensions */
 LFN(f_str_split){ UNUSED_SELF;
     Str *s=checkstr(L,base,nargs,0,"split");
     Str *sep = nargs>=2? checkstr(L,base,nargs,1,"split") : NULL;
@@ -1527,7 +1535,7 @@ LFN(f_str_fromhex){ UNUSED_SELF;
     RET(0,strv(b,s->len/2)); free(b); return 1;
 }
 
-/* ---- Lua-style pattern matching -------------------------------------- */
+/* Lua-style pattern matching */
 #define L_ESC '%'
 #define MAXCAPT 32
 typedef struct MatchState {
@@ -1762,7 +1770,7 @@ LFN(f_str_gsub){ UNUSED_SELF;
         const char *e=do_match(&ms,s1,pp);
         if(e){
             count++;
-            /* build replacement */
+/* build replacement */
             if(repl.t==LT_STR||repl.t==LT_NUM){
                 Str *r=tostr(repl);
                 for(int i=0;i<r->len;i++){
@@ -1822,7 +1830,7 @@ void lucL_open_string(void){
     reg(s,"format",f_str_format);  reg(s,"find",f_str_find);
     reg(s,"match",f_str_match);    reg(s,"gmatch",f_str_gmatch);
     reg(s,"gsub",f_str_gsub);
-    /* LUC extensions */
+/* LUC extensions */
     reg(s,"split",f_str_split);          reg(s,"trim",f_str_trim);
     reg(s,"startswith",f_str_startswith);reg(s,"endswith",f_str_endswith);
     reg(s,"contains",f_str_contains);    reg(s,"tohex",f_str_tohex);
@@ -1830,11 +1838,8 @@ void lucL_open_string(void){
 }
 
 
-/* ==================== luc_lib_window.c ==================== */
-/*
-** luc_lib_window.c -- SDL2 window module (loaded with require "window")
-**                     build with -DLUC_WINDOW (see Makefile target luc-window)
-*/
+/* luc_lib_window.c */
+/* luc_lib_window.c -- SDL2 window module (loaded with require "window") build with -DLUC_WINDOW (see Makefile target luc-window) */
 #ifdef LUC_WINDOW
 #  define SDL_MAIN_HANDLED
 #  include <SDL2/SDL.h>
@@ -1844,13 +1849,100 @@ void lucL_open_string(void){
 #  ifndef LUC_NO_IMAGE
 #    include <SDL2/SDL_image.h>
 #  endif
+#  ifndef LUC_NO_MIXER
+#    include <SDL2/SDL_mixer.h>
+#  endif
+/* Satellite DLLs (SDL2_ttf / SDL2_image / SDL2_mixer) bind at RUNTIME via
+   LoadLibrary/GetProcAddress so the exe starts without them; missing DLLs
+   degrade gracefully (bitmap font, BMP-only, no sound) with clean errors.
+   dlopen fallback for non-Windows builds. */
+#ifdef _WIN32
+#  include <windows.h>
+#  define W_LIB_H  HMODULE
+#  define W_LIB_OPEN(n)  LoadLibraryA(n)
+#  define W_LIB_SYM(h,n) GetProcAddress(h,n)
+#else
+#  include <dlfcn.h>
+#  define W_LIB_H  void*
+#  define W_LIB_OPEN(n)  dlopen(n,RTLD_NOW)
+#  define W_LIB_SYM(h,n) dlsym(h,n)
+#endif
+#ifndef LUC_NO_TTF
+typedef int (*w_TTF_Init_t)(void);
+typedef TTF_Font TTF_Font_opaque;
+typedef TTF_Font_opaque TTF_Font_w;
+typedef TTF_Font_opaque* (*w_TTF_OpenFont_t)(const char*,int);
+typedef void (*w_TTF_CloseFont_t)(TTF_Font_opaque*);
+typedef SDL_Surface SDL_Surface_w;
+typedef SDL_Color SDL_Color_w;
+typedef SDL_Surface_w* (*w_TTF_RenderUTF8_Blended_t)(TTF_Font_opaque*,const char*,SDL_Color_w);
+typedef int (*w_TTF_SizeUTF8_t)(TTF_Font_opaque*,const char*,int*,int*);
+static W_LIB_H w_hTTF=NULL;
+static w_TTF_Init_t pTTF_Init=NULL;
+static w_TTF_OpenFont_t pTTF_OpenFont=NULL;
+static w_TTF_CloseFont_t pTTF_CloseFont=NULL;
+static w_TTF_RenderUTF8_Blended_t pTTF_RenderUTF8_Blended=NULL;
+static w_TTF_SizeUTF8_t pTTF_SizeUTF8=NULL;
+#endif
+#ifndef LUC_NO_IMAGE
+typedef SDL_Surface_w* (*w_IMG_Load_t)(const char*);
+
+typedef int (*w_IMG_Init_t)(int);
+typedef int (*w_IMG_SavePNG_t)(SDL_Surface_w*,const char*);
+static W_LIB_H w_hIMG=NULL;
+static w_IMG_Load_t pIMG_Load=NULL;
+
+static w_IMG_Init_t pIMG_Init=NULL;
+static w_IMG_SavePNG_t pIMG_SavePNG=NULL;
+#endif
+#ifndef LUC_NO_MIXER
+typedef Mix_Chunk Mix_Chunk_opaque;
+typedef Mix_Music Mix_Music_opaque;
+typedef int (*w_Mix_Init_t)(int);
+typedef int (*w_Mix_OpenAudio_t)(int,unsigned short,int,int);
+typedef void (*w_Mix_CloseAudio_t)(void);
+typedef Mix_Chunk_opaque* (*w_Mix_LoadWAV_t)(const char*);
+typedef void (*w_Mix_FreeChunk_t)(Mix_Chunk_opaque*);
+typedef int (*w_Mix_PlayChannel_t)(int,Mix_Chunk_opaque*,int);
+typedef int (*w_Mix_Volume_t)(int,int);
+typedef int (*w_Mix_HaltChannel_t)(int);
+typedef Mix_Music_opaque* (*w_Mix_LoadMUS_t)(const char*);
+typedef void (*w_Mix_FreeMusic_t)(Mix_Music_opaque*);
+typedef int (*w_Mix_PlayMusic_t)(Mix_Music_opaque*,int);
+typedef int (*w_Mix_HaltMusic_t)(void);
+typedef int (*w_Mix_PauseMusic_t)(void);
+typedef void (*w_Mix_ResumeMusic_t)(void);
+typedef int (*w_Mix_VolumeMusic_t)(int);
+
+static W_LIB_H w_hMIX=NULL;
+static w_Mix_Init_t pMix_Init=NULL;
+static w_Mix_OpenAudio_t pMix_OpenAudio=NULL;
+static w_Mix_CloseAudio_t pMix_CloseAudio=NULL;
+static w_Mix_LoadWAV_t pMix_LoadWAV=NULL;
+static w_Mix_FreeChunk_t pMix_FreeChunk=NULL;
+static w_Mix_PlayChannel_t pMix_PlayChannel=NULL;
+static w_Mix_Volume_t pMix_Volume=NULL;
+static w_Mix_HaltChannel_t pMix_HaltChannel=NULL;
+static w_Mix_LoadMUS_t pMix_LoadMUS=NULL;
+static w_Mix_FreeMusic_t pMix_FreeMusic=NULL;
+static w_Mix_PlayMusic_t pMix_PlayMusic=NULL;
+static w_Mix_HaltMusic_t pMix_HaltMusic=NULL;
+static w_Mix_PauseMusic_t pMix_PauseMusic=NULL;
+static w_Mix_ResumeMusic_t pMix_ResumeMusic=NULL;
+static w_Mix_VolumeMusic_t pMix_VolumeMusic=NULL;
+
+#endif
 #define W_KEYS        SDL_NUM_SCANCODES
 #define W_IMGCACHE    64
 #define W_TXTCACHE    96
 #define W_FONTSLOTS   12
+#define W_SNDCACHE    32
 #define W_MAXPOLY     256
 
 typedef struct { char path[512]; SDL_Texture *tex; int w,h; unsigned age; } WImg;
+#ifndef LUC_NO_MIXER
+typedef struct { char path[512]; Mix_Chunk *chunk; unsigned age; } WSnd;
+#endif
 typedef struct { char txt[64]; int size; Uint32 col; SDL_Texture *tex;
                  int w,h; unsigned age; } WTxt;
 #ifndef LUC_NO_TTF
@@ -1874,6 +1966,12 @@ static struct {
     char textbuf[256]; int textlen;
     WImg img[W_IMGCACHE];
     WTxt txt[W_TXTCACHE];
+    int has_ttf, has_img, has_mix;   /* satellite DLLs present */
+#ifndef LUC_NO_MIXER
+    int mix_ok;
+    WSnd snd[W_SNDCACHE];
+    Mix_Music *music; char musicpath[512];
+#endif
 #ifndef LUC_NO_TTF
     int   ttf_ok;
     char  fontpath[512];
@@ -1882,7 +1980,7 @@ static struct {
 #endif
 } W;
 
-/* ---- embedded 5x7 fallback font (ASCII 32..126, column major, LSB = top) - */
+/* embedded 5x7 fallback font (ASCII 32..126, column major, LSB = top) */
 static const unsigned char W_FONT5x7[95][5] = {
 {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
 {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
@@ -1918,7 +2016,7 @@ static const unsigned char W_FONT5x7[95][5] = {
 {0x00,0x41,0x36,0x08,0x00},{0x08,0x08,0x2A,0x1C,0x08}
 };
 
-/* ---- helpers ------------------------------------------------------------ */
+/* helpers */
 static void w_need(void){
     if(!W.started || !W.ren)
         luc_error("window: call window.start(title,w,h) first");
@@ -2008,7 +2106,7 @@ static void w_setcolor(SDL_Color c){
     SDL_SetRenderDrawColor(W.ren,c.r,c.g,c.b,c.a);
 }
 
-/* ---- key names ---------------------------------------------------------- */
+/* key names */
 static int w_scancodes(const char *n,SDL_Scancode *out){
     size_t len=strlen(n);
     if(len==1){
@@ -2061,9 +2159,10 @@ static int w_scancodes(const char *n,SDL_Scancode *out){
     return 0;
 }
 
-/* ---- fonts -------------------------------------------------------------- */
+/* fonts */
 #ifndef LUC_NO_TTF
 static const char *W_FONTPATHS[] = {
+    "DejaVuSans.ttf",       /* shipped next to luc.exe by the installer */
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -2089,23 +2188,24 @@ static TTF_Font *w_font(int size){
     if(size<4) size=4; if(size>256) size=256;
     for(int i=0;i<W_FONTSLOTS;i++)
         if(W.fonts[i].f && W.fonts[i].size==size){ W.fonts[i].age=++W.clock; return W.fonts[i].f; }
-    TTF_Font *f=TTF_OpenFont(W.fontpath,size);
+    TTF_Font *f=pTTF_OpenFont(W.fontpath,size);
     if(!f) return NULL;
     int slot=-1;
     for(int i=0;i<W_FONTSLOTS;i++) if(!W.fonts[i].f){ slot=i; break; }
     if(slot<0){ slot=0;
         for(int i=1;i<W_FONTSLOTS;i++) if(W.fonts[i].age<W.fonts[slot].age) slot=i;
-        TTF_CloseFont(W.fonts[slot].f); }
+        pTTF_CloseFont(W.fonts[slot].f); }
     W.fonts[slot].f=f; W.fonts[slot].size=size; W.fonts[slot].age=++W.clock;
     return f;
 }
 static void w_drop_fonts(void){
-    for(int i=0;i<W_FONTSLOTS;i++){ if(W.fonts[i].f) TTF_CloseFont(W.fonts[i].f);
+    for(int i=0;i<W_FONTSLOTS;i++){ if(W.fonts[i].f) pTTF_CloseFont(W.fonts[i].f);
                                     W.fonts[i].f=NULL; W.fonts[i].size=0; }
 }
 #endif
 
-/* ---- texture caches ------------------------------------------------------ */
+/* texture caches */
+static void w_drop_sounds(void);   /* defined in the sound section below */
 static void w_drop_text_cache(void){
     for(int i=0;i<W_TXTCACHE;i++){
         if(W.txt[i].tex) SDL_DestroyTexture(W.txt[i].tex);
@@ -2118,8 +2218,23 @@ static void w_drop_img_cache(void){
         W.img[i].tex=NULL; W.img[i].path[0]=0;
     }
 }
-static SDL_Texture *w_image(const char *path,int *ow,int *oh){
-    for(int i=0;i<W_IMGCACHE;i++)
+/* AVIF/JPEG-XL decoder DLLs are not shipped with LUC (too heavy for beginners) */
+static int w_unshipped_format(const char *path){
+    size_t pl=strlen(path);
+    if(pl>4){
+        char e4[8]; int k;
+        for(k=0;k<4 && path[pl-4+k];k++){ int ch=(unsigned char)path[pl-4+k];
+            e4[k]=(char)(ch>='A'&&ch<='Z'? ch+32 : ch); }
+        e4[k]=0;
+        char e5[8];
+        if(pl>5){ for(k=0;k<5 && path[pl-5+k];k++){ int ch=(unsigned char)path[pl-5+k];
+            e5[k]=(char)(ch>='A'&&ch<='Z'? ch+32 : ch); } e5[k]=0; }
+        else e5[0]=0;
+        if(!strcmp(e5,".avif") || !strcmp(e4,".jxl") || !strcmp(e4,".jxs")) return 1;
+    }
+    return 0;
+}
+static SDL_Texture *w_image(const char *path,int *ow,int *oh){    for(int i=0;i<W_IMGCACHE;i++)
         if(W.img[i].tex && strcmp(W.img[i].path,path)==0){
             W.img[i].age=++W.clock;
             if(ow)*ow=W.img[i].w; if(oh)*oh=W.img[i].h;
@@ -2127,7 +2242,9 @@ static SDL_Texture *w_image(const char *path,int *ow,int *oh){
         }
     SDL_Surface *s;
 #ifndef LUC_NO_IMAGE
-    s=IMG_Load(path);
+    if(w_unshipped_format(path)) return NULL;   /* fail cleanly, caller reports */
+    if(W.has_img) s=pIMG_Load(path);
+    else s=SDL_LoadBMP(path);                   /* degraded: BMP only */
 #else
     s=SDL_LoadBMP(path);
 #endif
@@ -2148,7 +2265,7 @@ static SDL_Texture *w_image(const char *path,int *ow,int *oh){
     return t;
 }
 
-/* ---- text rendering ------------------------------------------------------ */
+/* text rendering */
 static void w_bitmap_text(const char *s,int len,int x,int y,SDL_Color c,int size){
     int scale=size/8; if(scale<1) scale=1;
     w_setcolor(c);
@@ -2196,7 +2313,7 @@ static void w_text(const char *s,int len,int x,int y,SDL_Color c,int size){
                 }
         }
         if(!tex){
-            SDL_Surface *sf=TTF_RenderUTF8_Blended(f,s,c);
+            SDL_Surface *sf=pTTF_RenderUTF8_Blended(f,s,c);
             if(!sf) return;
             tw=sf->w; th=sf->h;
             tex=SDL_CreateTextureFromSurface(W.ren,sf);
@@ -2228,7 +2345,7 @@ static void w_text(const char *s,int len,int x,int y,SDL_Color c,int size){
     w_bitmap_text(s,len,x,y,c,size);
 }
 
-/* ---- geometry ------------------------------------------------------------ */
+/* geometry */
 static void w_fill_circle(int cx,int cy,int r){
     if(r<0) return;
     for(int dy=-r;dy<=r;dy++){
@@ -2271,11 +2388,15 @@ static void w_fill_poly(const double *pts,int n){
     }
 }
 
-/* ---- lifecycle ----------------------------------------------------------- */
+/* lifecycle */
 static void w_shutdown(void){
     if(!W.started) return;
     w_drop_text_cache();
     w_drop_img_cache();
+#ifndef LUC_NO_MIXER
+    w_drop_sounds();
+    if(W.mix_ok){ pMix_CloseAudio(); W.mix_ok=0; }
+#endif
 #ifndef LUC_NO_TTF
     w_drop_fonts();
 #endif
@@ -2285,13 +2406,20 @@ static void w_shutdown(void){
 }
 static void w_atexit(void){ w_shutdown(); }
 
-/* ==========================  LUC-facing functions  ======================== */
+/* LUC-facing functions */
 
-LFN(f_w_start){ UNUSED_SELF;
-    if(W.started) luc_error("window: already started");
-    const char *title = nargs>=1? checkstr(L,base,nargs,0,"start")->s : "LUC";
-    int ww = nargs>=2? checkint(L,base,nargs,1,"start") : 800;
-    int hh = nargs>=3? checkint(L,base,nargs,2,"start") : 600;
+#ifndef LUC_NO_MIXER
+static int w_mix_init_done=0;
+static void w_audio_init(void){
+    if(!W.has_mix) return;
+    if(!w_mix_init_done){
+        w_mix_init_done=1;
+        pMix_Init(MIX_INIT_MP3|MIX_INIT_OGG|MIX_INIT_FLAC|MIX_INIT_MOD|MIX_INIT_MID);
+    }
+    if(!W.mix_ok && pMix_OpenAudio(44100,MIX_DEFAULT_FORMAT,2,2048)==0) W.mix_ok=1;
+}
+#endif
+static void w_start_impl(const char *title,int ww,int hh){
     if(ww<1) ww=1; if(hh<1) hh=1;
     W.win=SDL_CreateWindow(title,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,
                            ww,hh,SDL_WINDOW_SHOWN);
@@ -2313,7 +2441,17 @@ LFN(f_w_start){ UNUSED_SELF;
 #ifndef LUC_NO_TTF
     W.fontsize=16; w_find_font();
 #endif
+#ifndef LUC_NO_MIXER
+    w_audio_init();
+#endif
     { static int once=0; if(!once){ once=1; atexit(w_atexit); } }
+}
+LFN(f_w_start){ UNUSED_SELF;
+    if(W.started) luc_error("window: already started");
+    const char *title = nargs>=1? checkstr(L,base,nargs,0,"start")->s : "LUC";
+    int ww = nargs>=2? checkint(L,base,nargs,1,"start") : 800;
+    int hh = nargs>=3? checkint(L,base,nargs,2,"start") : 600;
+    w_start_impl(title,ww,hh);
     RET(0,mkbool(1)); return 1;
 }
 
@@ -2321,8 +2459,8 @@ LFN(f_w_close){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
     w_shutdown(); return 0;
 }
 
-LFN(f_w_running){ UNUSED_SELF; (void)base;(void)nargs;
-    if(!W.started){ RET(0,mkbool(0)); return 1; }
+/* event pump: shared by running() and go() */
+static void w_pump(void){
     SDL_Event e;
     while(SDL_PollEvent(&e)){
         switch(e.type){
@@ -2350,11 +2488,9 @@ LFN(f_w_running){ UNUSED_SELF; (void)base;(void)nargs;
       memcpy(W.keys_curr,ks,W_KEYS); }
     W.mouse_state=SDL_GetMouseState(&W.mouse_x,&W.mouse_y);
     SDL_GetWindowSize(W.win,&W.w,&W.h);
-    RET(0,mkbool(W.running)); return 1;
 }
-
-LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
-    w_need();
+/* present + fps pacing + delta clock */
+static void w_present(void){
     SDL_RenderPresent(W.ren);
     Uint32 now=SDL_GetTicks();
     if(W.target_fps>0){
@@ -2365,12 +2501,55 @@ LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
     double d=(double)(now-W.last_frame)/1000.0;
     if(d<=0) d=0.0001; if(d>0.25) d=0.25;
     W.delta=d; W.last_frame=now;
+}
+/* per-frame input edge resets */
+static void w_frame_end(void){
     memcpy(W.keys_prev,W.keys_curr,W_KEYS);
     W.mouse_prev=W.mouse_state;
     W.wheel_dy=0; W.wheel_dx=0;
     W.textlen=0; W.textbuf[0]=0;
     W.clock++;
+}
+LFN(f_w_running){ UNUSED_SELF; (void)base;(void)nargs;
+    if(!W.started){ RET(0,mkbool(0)); return 1; }
+    w_pump();
+    RET(0,mkbool(W.running)); return 1;
+}
+
+LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
+    w_need();
+    w_present();
+    w_frame_end();
     return 0;
+}
+
+/* beginner game loop: go(title, w, h, draw_fn)
+   starts the window (unless already started), calls draw_fn(dt) every frame
+   at 60 fps, presents, and closes on exit.  The classic
+   while/running/update loop keeps working untouched. */
+LFN(f_w_go){ UNUSED_SELF;
+    const char *title = nargs>=1? checkstr(L,base,nargs,0,"go")->s : "LUC";
+    int ww = nargs>=2? checkint(L,base,nargs,1,"go") : 800;
+    int hh = nargs>=3? checkint(L,base,nargs,2,"go") : 600;
+    Value fn = nargs>=4? AR(3) : NIL;
+    if(fn.t!=LT_FUNC && fn.t!=LT_CFUNC)
+        luc_error("window.go: argument #4 must be a function like function(dt) ... end");
+    int was_started=W.started;
+    if(!was_started) w_start_impl(title,ww,hh);
+    if(W.target_fps==0) W.target_fps=60;
+    int scratch=base+nargs+2;
+    ensure_stack(L,scratch+8);
+    while(W.started && W.running){
+        w_pump();
+        if(!W.running) break;
+        L->stack[scratch]=fn;
+        L->stack[scratch+1]=mknum(W.delta);
+        vm_call(L,scratch,1,0);
+        w_present();
+        w_frame_end();
+    }
+    if(!was_started) w_shutdown();
+    RET(0,mkbool(1)); return 1;
 }
 
 LFN(f_w_title){ UNUSED_SELF;
@@ -2392,7 +2571,7 @@ LFN(f_w_quit){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
     W.running=0; return 0;
 }
 
-/* ---- drawing ------------------------------------------------------------- */
+/* drawing */
 LFN(f_w_clear){ UNUSED_SELF;
     w_need();
     SDL_Color c = nargs>=1? w_color(w_argc(L,base,nargs,0)) : (SDL_Color){0,0,0,255};
@@ -2493,18 +2672,37 @@ LFN(f_w_text){ UNUSED_SELF;
     w_text(s->s,s->len,x,y,c,size);
     return 0;
 }
+static void w_measure(const char *s,int len,int size,int *ow,int *oh){
+#ifndef LUC_NO_TTF
+    { TTF_Font *f=w_font(size);
+      if(f){ pTTF_SizeUTF8(f,s,ow,oh); return; } }
+#endif
+    w_bitmap_size(s,len,size,ow,oh);
+}
 LFN(f_w_text_size){ UNUSED_SELF;
     Str *s=checkstr(L,base,nargs,0,"text_size");
     int size = nargs>=2? checkint(L,base,nargs,1,"text_size") : 16;
 #ifndef LUC_NO_TTF
     if(nargs<2) size=W.fontsize;
-    { TTF_Font *f=w_font(size);
-      if(f){ int tw=0,th=0; TTF_SizeUTF8(f,s->s,&tw,&th);
-             RET(0,mknum(tw)); RET(1,mknum(th)); return 2; } }
 #endif
-    { int tw,th; w_bitmap_size(s->s,s->len,size,&tw,&th);
+    { int tw,th; w_measure(s->s,s->len,size,&tw,&th);
       RET(0,mknum(tw)); RET(1,mknum(th)); }
     return 2;
+}
+/* centered text for beginners: text_center(s, y [, color [, size]]) */
+LFN(f_w_text_center){ UNUSED_SELF;
+    w_need();
+    Str *s=checkstr(L,base,nargs,0,"text_center");
+    int y=checkint(L,base,nargs,1,"text_center");
+    SDL_Color c=w_color(w_argc(L,base,nargs,2));
+    int size = nargs>=4? checkint(L,base,nargs,3,"text_center") : 16;
+#ifndef LUC_NO_TTF
+    if(nargs<4) size=W.fontsize;
+#endif
+    if(size<4) size=4;
+    int tw=0,th=0; w_measure(s->s,s->len,size,&tw,&th);
+    w_text(s->s,s->len,(W.w-tw)/2,y,c,size);
+    return 0;
 }
 LFN(f_w_font){ UNUSED_SELF;
 #ifdef LUC_NO_TTF
@@ -2533,8 +2731,10 @@ LFN(f_w_image){ UNUSED_SELF;
     int iw=0,ih=0;
     SDL_Texture *t=w_image(p->s,&iw,&ih);
     if(!t){
+        if(w_unshipped_format(p->s))
+            luc_error("window.image: '%s' uses AVIF/JPEG-XL, which LUC does not ship - convert it to PNG or JPG",p->s);
 #ifndef LUC_NO_IMAGE
-        luc_error("window.image: cannot load '%s' (%s)",p->s,IMG_GetError());
+        luc_error("window.image: cannot load '%s' (%s)",p->s,W.has_img?SDL_GetError():"SDL2_image not installed (BMP only)");
 #else
         luc_error("window.image: cannot load '%s' (built without SDL2_image; "
                   "only .bmp is supported)",p->s);
@@ -2556,6 +2756,71 @@ LFN(f_w_image_size){ UNUSED_SELF;
     if(!w_image(p->s,&iw,&ih)){ RET(0,NIL); RET(1,cstrv("cannot load image")); return 2; }
     RET(0,mknum(iw)); RET(1,mknum(ih)); return 2;
 }
+/* beginner sprites: spr = window.sprite(path); window.draw(spr, x, y [, opts])
+   opts = { scale = 2, rotate = 45, flip = "x"/"y"/"xy", alpha = 128, center = true } */
+LFN(f_w_sprite){ UNUSED_SELF;
+    /* preload-friendly: no window needed yet, the texture loads on first draw */
+    Str *p=checkstr(L,base,nargs,0,"sprite");
+    if(w_unshipped_format(p->s))
+        luc_error("window.sprite: '%s' uses AVIF/JPEG-XL, which LUC does not ship - convert it to PNG or JPG",p->s);
+    FILE *fp=fopen(p->s,"rb");
+    if(!fp) luc_error("window.sprite: cannot open '%s'",p->s);
+    fclose(fp);
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("path"),mkobj(LT_STR,p));
+    tab_set(t,cstrv("w"),mknum(0));
+    tab_set(t,cstrv("h"),mknum(0));
+    RET(0,mkobj(LT_TABLE,t)); return 1;
+}
+LFN(f_w_draw){ UNUSED_SELF;
+    w_need();
+    Table *t=checktab(L,base,nargs,0,"draw");
+    int x=checkint(L,base,nargs,1,"draw"), y=checkint(L,base,nargs,2,"draw");
+    Value pv=tab_get(t,cstrv("path"));
+    if(pv.t!=LT_STR)
+        luc_error("window.draw: argument #1 is not a sprite (make one with window.sprite(path))");
+    int iw=0,ih=0;
+    SDL_Texture *tex=w_image(AS_STR(pv)->s,&iw,&ih);
+    if(!tex){
+        if(w_unshipped_format(AS_STR(pv)->s))
+            luc_error("window.draw: '%s' uses AVIF/JPEG-XL, which LUC does not ship - convert it to PNG or JPG",AS_STR(pv)->s);
+#ifndef LUC_NO_IMAGE
+        luc_error("window.draw: cannot load '%s' (%s)",AS_STR(pv)->s,W.has_img?SDL_GetError():"SDL2_image not installed (BMP only)");
+#else
+        luc_error("window.draw: cannot load '%s' (built without SDL2_image; only .bmp is supported)",AS_STR(pv)->s);
+#endif
+    }
+    /* fill in sprite size on first draw (sprite() preloads without a window) */
+    tab_set(t,cstrv("w"),mknum((double)iw));
+    tab_set(t,cstrv("h"),mknum((double)ih));
+    double scale=1.0, angle=0.0; int alpha=255, flipm=0, centered=0;
+    if(nargs>=4 && AR(3).t==LT_TABLE){
+        Table *o=AS_TAB(AR(3)); Value v;
+        v=tab_get(o,cstrv("scale"));  if(v.t==LT_NUM) scale=v.u.n;
+        v=tab_get(o,cstrv("rotate")); if(v.t==LT_NUM) angle=v.u.n;
+        v=tab_get(o,cstrv("alpha"));
+        if(v.t==LT_NUM){ alpha=(int)v.u.n; if(alpha<0)alpha=0; if(alpha>255)alpha=255; }
+        v=tab_get(o,cstrv("flip"));
+        if(v.t==LT_STR){
+            if(!strcmp(AS_STR(v)->s,"x")) flipm|=SDL_FLIP_HORIZONTAL;
+            else if(!strcmp(AS_STR(v)->s,"y")) flipm|=SDL_FLIP_VERTICAL;
+            else if(!strcmp(AS_STR(v)->s,"xy")) flipm|=SDL_FLIP_HORIZONTAL|SDL_FLIP_VERTICAL;
+        }
+        v=tab_get(o,cstrv("center")); if(truthy(v)) centered=1;
+    }
+    SDL_Rect d;
+    d.w=(int)(iw*scale); d.h=(int)(ih*scale);
+    if(d.w<1)d.w=1; if(d.h<1)d.h=1;
+    d.x=centered? x-d.w/2 : x;
+    d.y=centered? y-d.h/2 : y;
+    if(alpha<255) SDL_SetTextureAlphaMod(tex,(Uint8)alpha);
+    if(angle!=0.0 || flipm || centered){
+        SDL_Point c; c.x=d.w/2; c.y=d.h/2;
+        SDL_RenderCopyEx(W.ren,tex,NULL,&d,angle,&c,(SDL_RendererFlip)flipm);
+    } else SDL_RenderCopy(W.ren,tex,NULL,&d);
+    if(alpha<255) SDL_SetTextureAlphaMod(tex,255);
+    return 0;
+}
 LFN(f_w_clip){ UNUSED_SELF;
     w_need();
     if(nargs==0){ SDL_RenderSetClipRect(W.ren,NULL); return 0; }
@@ -2565,7 +2830,7 @@ LFN(f_w_clip){ UNUSED_SELF;
     SDL_RenderSetClipRect(W.ren,&r); return 0;
 }
 
-/* ---- input --------------------------------------------------------------- */
+/* input */
 static int w_keystate(LucState *L,int base,int nargs,int mode){
     const char *n=checkstr(L,base,nargs,0,"key")->s;
     SDL_Scancode sc[2]; int k=w_scancodes(n,sc);
@@ -2614,7 +2879,7 @@ LFN(f_w_cursor){ UNUSED_SELF;
     SDL_ShowCursor(show?SDL_ENABLE:SDL_DISABLE); return 0;
 }
 
-/* ---- timing -------------------------------------------------------------- */
+/* timing */
 LFN(f_w_fps){ UNUSED_SELF;
     if(nargs==0){ RET(0,mknum(W.delta>0?1.0/W.delta:0)); return 1; }
     int n=checkint(L,base,nargs,0,"fps");
@@ -2628,7 +2893,7 @@ LFN(f_w_time){ UNUSED_SELF; (void)base;(void)nargs;
     RET(0,mknum(W.started? luc_now()-W.start_time : 0)); return 1;
 }
 
-/* ---- advanced ------------------------------------------------------------ */
+/* advanced */
 LFN(f_w_fullscreen){ UNUSED_SELF;
     w_need();
     int on = nargs<1 || truthy(w_argc(L,base,nargs,0));
@@ -2659,7 +2924,8 @@ LFN(f_w_icon){ UNUSED_SELF;
     Str *p=checkstr(L,base,nargs,0,"icon");
     SDL_Surface *s;
 #ifndef LUC_NO_IMAGE
-    s=IMG_Load(p->s);
+    if(W.has_img) s=pIMG_Load(p->s);
+    else s=SDL_LoadBMP(p->s);
 #else
     s=SDL_LoadBMP(p->s);
 #endif
@@ -2680,7 +2946,8 @@ LFN(f_w_screenshot){ UNUSED_SELF;
     int rc;
 #ifndef LUC_NO_IMAGE
     if(p->len>4 && strcmp(p->s+p->len-4,".bmp")==0) rc=SDL_SaveBMP(s,p->s);
-    else rc=IMG_SavePNG(s,p->s);
+    else if(W.has_img) rc=pIMG_SavePNG(s,p->s);
+    else { SDL_FreeSurface(s); luc_error("window.screenshot: PNG needs SDL2_image (not installed) - use a .bmp path"); }
 #else
     rc=SDL_SaveBMP(s,p->s);
 #endif
@@ -2689,24 +2956,286 @@ LFN(f_w_screenshot){ UNUSED_SELF;
     RET(0,mkbool(1)); return 1;
 }
 
-/* ---- module table -------------------------------------------------------- */
+/* sound + music (SDL_mixer): WAV always works, OGG/MP3/FLAC need the mixer DLLs */
+#ifndef LUC_NO_MIXER
+static void w_drop_sounds(void){
+    for(int i=0;i<W_SNDCACHE;i++){
+        if(W.snd[i].chunk){ pMix_FreeChunk(W.snd[i].chunk); W.snd[i].chunk=NULL; }
+        W.snd[i].path[0]=0;
+    }
+    if(W.music){ pMix_FreeMusic(W.music); W.music=NULL; }
+    W.musicpath[0]=0;
+}
+static Mix_Chunk *w_sound(const char *path){
+    for(int i=0;i<W_SNDCACHE;i++)
+        if(W.snd[i].chunk && strcmp(W.snd[i].path,path)==0){
+            W.snd[i].age=++W.clock;
+            return W.snd[i].chunk;
+        }
+    Mix_Chunk *c=pMix_LoadWAV(path);
+    if(!c) return NULL;
+    (void)c;
+    int slot=-1;
+    for(int i=0;i<W_SNDCACHE;i++) if(!W.snd[i].chunk){ slot=i; break; }
+    if(slot<0){ slot=0;
+        for(int i=1;i<W_SNDCACHE;i++) if(W.snd[i].age<W.snd[slot].age) slot=i;
+        pMix_FreeChunk(W.snd[slot].chunk); }
+    snprintf(W.snd[slot].path,sizeof W.snd[slot].path,"%s",path);
+    W.snd[slot].chunk=c; W.snd[slot].age=++W.clock;
+    return c;
+}
+static void w_need_mix(const char *fn){
+    if(!W.mix_ok){
+#ifndef LUC_NO_MIXER
+        w_audio_init();   /* reopen after a window close shut it down */
+#endif
+    }
+    if(!W.mix_ok)
+        luc_error("window.%s: no audio device (sound support unavailable)",fn);
+}
+static int w_opt_volume(Table *o){
+    Value v=tab_get(o,cstrv("volume"));
+    if(v.t==LT_NUM){ int p=(int)v.u.n; if(p<0)p=0; if(p>100)p=100; return p*128/100; }
+    return -1;
+}
+/* loop opt: true/-1 = forever, N>=1 = N plays total, else once */
+static int w_opt_loops(Table *o){
+    Value v=tab_get(o,cstrv("loop"));
+    if(v.t==LT_BOOL) return v.u.b? -1 : 0;
+    if(v.t==LT_NUM){
+        if(v.u.n<0) return -1;
+        int n=(int)v.u.n;
+        return n>=1? n-1 : 0;
+    }
+    return 0;
+}
+static Table *w_sound_handle(const char *path){
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("kind"),cstrv("sound"));
+    tab_set(t,cstrv("path"),cstrv(path));
+    return t;
+}
+static Mix_Chunk *w_sound_arg(LucState *L,int base,int nargs,int i,const char *fn){
+    Value a=AR(i);
+    const char *path=NULL;
+    if(a.t==LT_STR) path=AS_STR(a)->s;
+    else if(a.t==LT_TABLE || a.t==LT_LIST){
+        Value pv=tab_get(AS_TAB(a),cstrv("path"));
+        if(pv.t==LT_STR) path=AS_STR(pv)->s;
+    }
+    if(!path) luc_error("window.%s: expected a sound (window.sound(path) or \"path\")",fn);
+    Mix_Chunk *c=w_sound(path);
+    if(!c) luc_error("window.%s: cannot load '%s' (%s)",fn,path,SDL_GetError());
+    return c;
+}
+LFN(f_w_sound){ UNUSED_SELF;
+    w_need_mix("sound");
+    Str *p=checkstr(L,base,nargs,0,"sound");
+    if(!w_sound(p->s)) luc_error("window.sound: cannot load '%s' (%s)",p->s,SDL_GetError());
+    RET(0,mkobj(LT_TABLE,w_sound_handle(p->s))); return 1;
+}
+/* play(snd [, opts]): opts = { loop = 2, volume = 80 }. returns true/false. */
+LFN(f_w_play){ UNUSED_SELF;
+    w_need_mix("play");
+    Mix_Chunk *c=w_sound_arg(L,base,nargs,0,"play");
+    int loops=0, vol=-1;
+    if(nargs>=2 && AR(1).t==LT_TABLE){
+        Table *o=AS_TAB(AR(1));
+        loops=w_opt_loops(o); vol=w_opt_volume(o);
+    }
+    int ch=pMix_PlayChannel(-1,c,loops);
+    if(ch<0){ RET(0,mkbool(0)); return 1; }
+    if(vol>=0) pMix_Volume(ch,vol);
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_w_stop){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_HaltChannel(-1);
+#endif
+    return 0;
+}
+static Table *w_music_handle(const char *path){
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("kind"),cstrv("music"));
+    tab_set(t,cstrv("path"),cstrv(path));
+    return t;
+}
+static const char *w_music_path(LucState *L,int base,int nargs,int i,const char *fn){
+    Value a=AR(i);
+    if(a.t==LT_STR) return AS_STR(a)->s;
+    if(a.t==LT_TABLE || a.t==LT_LIST){
+        Value pv=tab_get(AS_TAB(a),cstrv("path"));
+        if(pv.t==LT_STR) return AS_STR(pv)->s;
+    }
+    luc_error("window.%s: expected music (window.music(path) or \"path\")",fn);
+    return NULL;
+}
+LFN(f_w_music){ UNUSED_SELF;
+    w_need_mix("music");
+    Str *p=checkstr(L,base,nargs,0,"music");
+    /* validate now so typos fail fast */
+    Mix_Music *m=pMix_LoadMUS(p->s);
+    if(!m) luc_error("window.music: cannot load '%s' (%s)",p->s,SDL_GetError());
+    pMix_FreeMusic(m);
+    RET(0,mkobj(LT_TABLE,w_music_handle(p->s))); return 1;
+}
+/* play_music(m [, opts]): opts = { loop = -1 (default: forever), volume = 80 } */
+LFN(f_w_play_music){ UNUSED_SELF;
+    w_need_mix("play_music");
+    const char *path=w_music_path(L,base,nargs,0,"play_music");
+    int loops=-1, vol=-1;
+    if(nargs>=2 && AR(1).t==LT_TABLE){
+        Table *o=AS_TAB(AR(1));
+        Value lv=tab_get(o,cstrv("loop"));
+        if(lv.t==LT_BOOL) loops=lv.u.b? -1 : 0;
+        else if(lv.t==LT_NUM) loops=(int)lv.u.n;
+        vol=w_opt_volume(o);
+    }
+    if(!W.music || strcmp(W.musicpath,path)!=0){
+        if(W.music){ pMix_FreeMusic(W.music); W.music=NULL; }
+        W.music=pMix_LoadMUS(path);
+        if(!W.music) luc_error("window.play_music: cannot load '%s' (%s)",path,SDL_GetError());
+        snprintf(W.musicpath,sizeof W.musicpath,"%s",path);
+    }
+    if(pMix_PlayMusic(W.music,loops)!=0)
+        luc_error("window.play_music: cannot play '%s' (%s)",path,SDL_GetError());
+    if(vol>=0) pMix_VolumeMusic(vol);
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_w_stop_music){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_HaltMusic();
+#endif
+    return 0;
+}
+LFN(f_w_pause_music){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_PauseMusic();
+#endif
+    return 0;
+}
+LFN(f_w_resume_music){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_ResumeMusic();
+#endif
+    return 0;
+}
+LFN(f_w_music_volume){ UNUSED_SELF;
+    int v=nargs>=1? checkint(L,base,nargs,0,"music_volume") : 100;
+    if(v<0)v=0; if(v>100)v=100;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_VolumeMusic(v*128/100);
+#endif
+    return 0;
+}
+LFN(f_w_sound_volume){ UNUSED_SELF;
+    int v=nargs>=1? checkint(L,base,nargs,0,"sound_volume") : 100;
+    if(v<0)v=0; if(v>100)v=100;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_Volume(-1,v*128/100);
+#endif
+    return 0;
+}
+#endif /* LUC_NO_MIXER */
+
+/* load satellite DLLs at runtime; missing ones degrade gracefully */
+static void w_load_satellites(void){
+    static int done=0; if(done) return; done=1;
+#ifndef LUC_NO_TTF
+    w_hTTF=W_LIB_OPEN(
+#ifdef _WIN32
+        "SDL2_ttf.dll"
+#else
+        "libSDL2_ttf-2.0.so.0"
+#endif
+    );
+    if(w_hTTF){
+        pTTF_Init=(w_TTF_Init_t)W_LIB_SYM(w_hTTF,"TTF_Init");
+        pTTF_OpenFont=(w_TTF_OpenFont_t)W_LIB_SYM(w_hTTF,"TTF_OpenFont");
+        pTTF_CloseFont=(w_TTF_CloseFont_t)W_LIB_SYM(w_hTTF,"TTF_CloseFont");
+        pTTF_RenderUTF8_Blended=(w_TTF_RenderUTF8_Blended_t)W_LIB_SYM(w_hTTF,"TTF_RenderUTF8_Blended");
+        pTTF_SizeUTF8=(w_TTF_SizeUTF8_t)W_LIB_SYM(w_hTTF,"TTF_SizeUTF8");
+        if(pTTF_Init&&pTTF_OpenFont&&pTTF_CloseFont&&pTTF_RenderUTF8_Blended&&pTTF_SizeUTF8)
+            W.has_ttf=1;
+    }
+#endif
+#ifndef LUC_NO_IMAGE
+    w_hIMG=W_LIB_OPEN(
+#ifdef _WIN32
+        "SDL2_image.dll"
+#else
+        "libSDL2_image-2.0.so.0"
+#endif
+    );
+    if(w_hIMG){
+        pIMG_Init=(w_IMG_Init_t)W_LIB_SYM(w_hIMG,"IMG_Init");
+        pIMG_Load=(w_IMG_Load_t)W_LIB_SYM(w_hIMG,"IMG_Load");
+
+        pIMG_SavePNG=(w_IMG_SavePNG_t)W_LIB_SYM(w_hIMG,"IMG_SavePNG");
+        if(pIMG_Init&&pIMG_Load&&pIMG_SavePNG)
+            W.has_img=1;
+    }
+#endif
+#ifndef LUC_NO_MIXER
+    w_hMIX=W_LIB_OPEN(
+#ifdef _WIN32
+        "SDL2_mixer.dll"
+#else
+        "libSDL2_mixer-2.0.so.0"
+#endif
+    );
+    if(w_hMIX){
+        pMix_Init=(w_Mix_Init_t)W_LIB_SYM(w_hMIX,"Mix_Init");
+        pMix_OpenAudio=(w_Mix_OpenAudio_t)W_LIB_SYM(w_hMIX,"Mix_OpenAudio");
+        pMix_CloseAudio=(w_Mix_CloseAudio_t)W_LIB_SYM(w_hMIX,"Mix_CloseAudio");
+        pMix_LoadWAV=(w_Mix_LoadWAV_t)W_LIB_SYM(w_hMIX,"Mix_LoadWAV");
+        pMix_FreeChunk=(w_Mix_FreeChunk_t)W_LIB_SYM(w_hMIX,"Mix_FreeChunk");
+        pMix_PlayChannel=(w_Mix_PlayChannel_t)W_LIB_SYM(w_hMIX,"Mix_PlayChannel");
+        pMix_Volume=(w_Mix_Volume_t)W_LIB_SYM(w_hMIX,"Mix_Volume");
+        pMix_HaltChannel=(w_Mix_HaltChannel_t)W_LIB_SYM(w_hMIX,"Mix_HaltChannel");
+        pMix_LoadMUS=(w_Mix_LoadMUS_t)W_LIB_SYM(w_hMIX,"Mix_LoadMUS");
+        pMix_FreeMusic=(w_Mix_FreeMusic_t)W_LIB_SYM(w_hMIX,"Mix_FreeMusic");
+        pMix_PlayMusic=(w_Mix_PlayMusic_t)W_LIB_SYM(w_hMIX,"Mix_PlayMusic");
+        pMix_HaltMusic=(w_Mix_HaltMusic_t)W_LIB_SYM(w_hMIX,"Mix_HaltMusic");
+        pMix_PauseMusic=(w_Mix_PauseMusic_t)W_LIB_SYM(w_hMIX,"Mix_PauseMusic");
+        pMix_ResumeMusic=(w_Mix_ResumeMusic_t)W_LIB_SYM(w_hMIX,"Mix_ResumeMusic");
+        pMix_VolumeMusic=(w_Mix_VolumeMusic_t)W_LIB_SYM(w_hMIX,"Mix_VolumeMusic");
+
+        if(pMix_Init&&pMix_OpenAudio&&pMix_CloseAudio&&pMix_LoadWAV&&pMix_FreeChunk&&
+           pMix_PlayChannel&&pMix_Volume&&pMix_HaltChannel&&pMix_LoadMUS&&pMix_FreeMusic&&
+           pMix_PlayMusic&&pMix_HaltMusic&&pMix_PauseMusic&&pMix_ResumeMusic&&
+           pMix_VolumeMusic)
+            W.has_mix=1;
+    }
+#endif
+}
+/* module table */
 Value lucL_window_module(void){
     static int sdl_ready=0;
     if(!sdl_ready){
         SDL_SetMainReady();
         if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_TIMER)!=0)
             luc_error("window: SDL2 could not initialise (%s)",SDL_GetError());
+        w_load_satellites();
 #ifndef LUC_NO_TTF
-        if(TTF_Init()==0) W.ttf_ok=1;
+        if(W.has_ttf && pTTF_Init()==0) W.ttf_ok=1;
 #endif
 #ifndef LUC_NO_IMAGE
-        IMG_Init(IMG_INIT_PNG|IMG_INIT_JPG);
+        if(W.has_img) pIMG_Init(IMG_INIT_PNG|IMG_INIT_JPG);
+#endif
+#ifndef LUC_NO_MIXER
+        w_audio_init();
 #endif
         sdl_ready=1;
     }
     Table *t=tab_new(0);
     reg(t,"start",f_w_start);         reg(t,"close",f_w_close);
     reg(t,"running",f_w_running);     reg(t,"update",f_w_update);
+    reg(t,"go",f_w_go);
     reg(t,"title",f_w_title);         reg(t,"size",f_w_size);
     reg(t,"resize",f_w_resize);       reg(t,"quit",f_w_quit);
 
@@ -2716,8 +3245,10 @@ Value lucL_window_module(void){
     reg(t,"circle",f_w_circle);       reg(t,"circle_outline",f_w_circle_outline);
     reg(t,"triangle",f_w_triangle);   reg(t,"polygon",f_w_polygon);
     reg(t,"text",f_w_text);           reg(t,"text_size",f_w_text_size);
+    reg(t,"text_center",f_w_text_center);
     reg(t,"font",f_w_font);           reg(t,"image",f_w_image);
     reg(t,"image_size",f_w_image_size); reg(t,"clip",f_w_clip);
+    reg(t,"sprite",f_w_sprite);       reg(t,"draw",f_w_draw);
 
     reg(t,"key",f_w_key);             reg(t,"key_pressed",f_w_key_pressed);
     reg(t,"key_released",f_w_key_released);
@@ -2732,16 +3263,32 @@ Value lucL_window_module(void){
     reg(t,"fullscreen",f_w_fullscreen); reg(t,"vsync",f_w_vsync);
     reg(t,"icon",f_w_icon);           reg(t,"screenshot",f_w_screenshot);
 
-    tab_set(t,cstrv("_VERSION"),cstrv("luc.window 1.0 (SDL2)"));
+#ifndef LUC_NO_MIXER
+    reg(t,"sound",f_w_sound);         reg(t,"play",f_w_play);
+    reg(t,"stop",f_w_stop);
+    reg(t,"music",f_w_music);         reg(t,"play_music",f_w_play_music);
+    reg(t,"stop_music",f_w_stop_music);
+    reg(t,"pause_music",f_w_pause_music);
+    reg(t,"resume_music",f_w_resume_music);
+    reg(t,"music_volume",f_w_music_volume);
+    reg(t,"sound_volume",f_w_sound_volume);
+#endif
+
+    tab_set(t,cstrv("_VERSION"),cstrv("luc.window 0.1 (SDL2)"));
 #ifndef LUC_NO_TTF
     tab_set(t,cstrv("has_ttf"),mkbool(W.ttf_ok));
 #else
     tab_set(t,cstrv("has_ttf"),mkbool(0));
 #endif
 #ifndef LUC_NO_IMAGE
-    tab_set(t,cstrv("has_image"),mkbool(1));
+    tab_set(t,cstrv("has_image"),mkbool(W.has_img));
 #else
     tab_set(t,cstrv("has_image"),mkbool(0));
+#endif
+#ifndef LUC_NO_MIXER
+    tab_set(t,cstrv("has_sound"),mkbool(W.mix_ok));
+#else
+    tab_set(t,cstrv("has_sound"),mkbool(0));
 #endif
     return mkobj(LT_TABLE,t);
 }

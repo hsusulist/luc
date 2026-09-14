@@ -1,29 +1,19 @@
-/*
-** ============================================================================
-**  LUC 0.1  --  an independent, register-based scripting language  (CORE)
-**
-**  luc_core.c  --  platform helpers, values, global state, tables, GC,
-**                  conversions, lexer, AST, parser, bytecode, compiler, VM,
-**                  coroutines, task scheduler, module finder, registration
-**                  and the command-line driver.
-**
-**  build (no window):  make            (or: gcc -O2 -std=c99 -o luc *.c -lm)
-**  build (window):     make luc-window (needs SDL2 + SDL2_ttf + SDL2_image)
-**
-**  optional: -DLUC_NO_TTF    build window lib without SDL2_ttf
-**            -DLUC_NO_IMAGE  build window lib without SDL2_image (BMP only)
-** ============================================================================
-*/
+/* luc_core.c - LUC 0.1 core: platform, values, GC, tables, lexer, parser, compiler, VM, modules, CLI driver */
+
+/* update 2026-09-01: added luc install command */
+
 #include "luc.h"
 
 #if defined(_WIN32)
 #  include <windows.h>
+#  include <winhttp.h>
 #else
 #  include <sys/time.h>
+#  include <sys/stat.h>
 #  include <unistd.h>
 #endif
 
-/* ======== platform helpers ======== */
+/* platform helpers */
 
 double luc_now(void){
 #if defined(_WIN32)
@@ -65,7 +55,7 @@ LucV V;                     /* global VM state (extern in luc.h) */
 
 int truthy(Value v){ return !(v.t==LT_NIL || (v.t==LT_BOOL && !v.u.b)); }
 
-/* ======== errors, allocation, strings, constructors ======== */
+/* errors, allocation, strings, constructors */
 
 void luc_throw(Value err){
     V.errval = err;
@@ -85,7 +75,7 @@ void luc_error(const char *fmt,...){
     luc_throw(mkobj(LT_STR,str_fromc(msg)));
 }
 
-/* --- object allocation ---------------------------------------------------*/
+/* object allocation */
 static Obj *newobj(size_t sz,int type){
     Obj *o = (Obj*)lcalloc(sz);
     o->type=(unsigned char)type; o->marked=0;
@@ -94,7 +84,7 @@ static Obj *newobj(size_t sz,int type){
     return o;
 }
 
-/* --- interned strings ----------------------------------------------------*/
+/* interned strings */
 static unsigned strhash(const char *s,int len){
     unsigned h=2166136261u;
     for(int i=0;i<len;i++){ h^=(unsigned char)s[i]; h*=16777619u; }
@@ -126,7 +116,7 @@ Str *str_new(const char *s,int len){
     return ns;
 }
 
-/* --- constructors --------------------------------------------------------*/
+/* constructors */
 Table *tab_new(int islist){
     Table *t=(Table*)newobj(sizeof(Table), islist?LT_LIST:LT_TABLE);
     t->tid=++V.tidcounter;
@@ -176,7 +166,7 @@ void ensure_stack(LucState *L,int need){
     L->stacksize=ns;
 }
 
-/* ======== tables ======== */
+/* tables */
 
 static unsigned val_hash(Value v){
     switch(v.t){
@@ -265,7 +255,7 @@ void tab_set(Table *t,Value k,Value v){
             return; }
         if(i==t->alen+1 && v.t!=LT_NIL){
             arr_reserve(t,i); t->arr[i-1]=v; t->alen=i;
-            /* migrate following integer keys out of the hash part */
+/* migrate following integer keys out of the hash part */
             for(;;){
                 Value nk=mknum((double)(t->alen+1));
                 Entry *e=hash_find(t,nk);
@@ -325,7 +315,7 @@ int tab_next(Table *t,Value key,Value *ok,Value *ov){
     return 0;
 }
 
-/* ======== garbage collector ======== */
+/* garbage collector */
 
 static void mark_value(Value v);
 
@@ -398,24 +388,26 @@ static void free_obj(Obj *o){
 
 void gc_collect(void){
     if(V.gcoff) return;
-    /* --- mark roots --- */
+/* mark roots */
     mark_obj((Obj*)V.globals);
     mark_obj((Obj*)V.stringlib); mark_obj((Obj*)V.listmeta);
     mark_obj((Obj*)V.bufferlib); mark_obj((Obj*)V.filelib);
+    if(V.listcore) mark_obj((Obj*)V.listcore);
+    if(V.tabmeta) mark_obj((Obj*)V.tabmeta);
     mark_obj((Obj*)V.mainco);
     if(V.loaded) mark_obj((Obj*)V.loaded);
     for(LucState *c=V.cur;c;c=c->resumer) mark_obj((Obj*)c);
     for(int i=0;i<V.nsched;i++) mark_obj((Obj*)V.sched[i].co);
     mark_value(V.errval);
 
-    /* --- sweep non-string objects --- */
+/* sweep non-string objects */
     Obj **pp=&V.objects;
     while(*pp){
         Obj *o=*pp;
         if(o->marked){ o->marked=0; pp=&o->next; }
         else { *pp=o->next; free_obj(o); V.nalloc--; }
     }
-    /* --- sweep interned strings --- */
+/* sweep interned strings */
     for(int i=0;i<V.strcap;i++){
         Str **sp=&V.strtab[i];
         while(*sp){
@@ -427,7 +419,7 @@ void gc_collect(void){
     V.gcthresh = V.nalloc*2 + 4096;
 }
 
-/* ======== conversions / printing ======== */
+/* conversions / printing */
 
 const char *type_name(Value v){
     switch(v.t){
@@ -467,7 +459,7 @@ static Str *v2str(Value v,int depth);
 static Value meta_callv(LucState *L,Value f,Value *args,int n);   /* fwd: VM */
 
 static Str *list_tostr(Table *t,int depth){
-    /* pretty-print lists: [1, 2, 3] */
+/* pretty-print lists: [1, 2, 3] */
     size_t cap=64,len=0; char *b=(char*)lmalloc(cap);
     #define PUT(str,n) do{ size_t _n=(size_t)(n); if(len+_n+1>cap){ while(len+_n+1>cap) cap*=2; b=(char*)lrealloc(b,cap);} memcpy(b+len,(str),_n); len+=_n; }while(0)
     PUT("[",1);
@@ -480,6 +472,37 @@ static Str *list_tostr(Table *t,int depth){
     PUT("]",1); b[len]=0;
     Str *r=str_new(b,(int)len); free(b);
     #undef PUT
+    return r;
+}
+
+static Str *dict_tostr(Table *t,int depth){
+/* pretty-print dicts: {key: value} */
+    size_t cap=64,len=0; char *b=(char*)lmalloc(cap);
+    #define PUTD(str,n) do{ size_t _n=(size_t)(n); if(len+_n+1>cap){ while(len+_n+1>cap) cap*=2; b=(char*)lrealloc(b,cap);} memcpy(b+len,(str),_n); len+=_n; }while(0)
+    int first=1;
+    PUTD("{",1);
+    for(int i=0;i<t->alen;i++){
+        if(!first) PUTD(", ",2); first=0;
+        Str *ks=v2str(mknum((double)(i+1)),depth+1); PUTD(ks->s,ks->len);
+        PUTD(": ",2);
+        Value e=t->arr[i];
+        if(e.t==LT_STR){ PUTD("\"",1); PUTD(AS_STR(e)->s,AS_STR(e)->len); PUTD("\"",1); }
+        else { Str *s=v2str(e,depth+1); PUTD(s->s,s->len); }
+    }
+    for(int i=0;i<t->ecap;i++){
+        if(t->ents[i].k.t==LT_NIL || t->ents[i].v.t==LT_NIL) continue;
+        if(!first) PUTD(", ",2); first=0;
+        Value k=t->ents[i].k;
+        if(k.t==LT_STR){ PUTD("\"",1); PUTD(AS_STR(k)->s,AS_STR(k)->len); PUTD("\"",1); }
+        else { Str *ks=v2str(k,depth+1); PUTD(ks->s,ks->len); }
+        PUTD(": ",2);
+        Value e=t->ents[i].v;
+        if(e.t==LT_STR){ PUTD("\"",1); PUTD(AS_STR(e)->s,AS_STR(e)->len); PUTD("\"",1); }
+        else { Str *s=v2str(e,depth+1); PUTD(s->s,s->len); }
+    }
+    PUTD("}",1); b[len]=0;
+    Str *r=str_new(b,(int)len); free(b);
+    #undef PUTD
     return r;
 }
 
@@ -503,6 +526,7 @@ static Str *v2str(Value v,int depth){
                         if(r.t==LT_NUM||r.t==LT_BOOL) return tostr(r);
                     }
                 }
+                return dict_tostr(t,depth);
             }
             snprintf(buf,sizeof buf,"%s: %p",type_name(v),(void*)v.u.o);
             return str_fromc(buf);
@@ -511,28 +535,31 @@ static Str *v2str(Value v,int depth){
 }
 Str *tostr(Value v){ return v2str(v,0); }
 
-/* ======== lexer, AST, parser, bytecode, compiler, VM ======== */
+/* lexer, AST, parser, bytecode, compiler, VM */
 
 enum {
     TK_EOF=256, TK_NAME, TK_NUMBER, TK_STRING,
     TK_AND, TK_BREAK, TK_DO, TK_ELSE, TK_ELSEIF, TK_END, TK_FALSE, TK_FOR,
-    TK_FUNCTION, TK_IF, TK_IN, TK_LOCAL, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
-    TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE, TK_IMPORT,
-    TK_CONCAT, TK_DOTS, TK_EQ, TK_NE, TK_LE, TK_GE
+    TK_FUNCTION, TK_IF, TK_IN, TK_CREATE, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
+    TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE, TK_IMPORT, TK_AS,
+    TK_CONCAT, TK_DOTS, TK_EQ, TK_NE, TK_LE, TK_GE,
+    TK_ADDEQ, TK_SUBEQ, TK_MULEQ, TK_DIVEQ
 };
 
 static const char *const kwnames[] = {
     "and","break","do","else","elseif","end","false","for","function","if",
-    "in","local","nil","not","or","repeat","return","then","true","until","while","import"
+    "in","create","nil","not","or","repeat","return","then","true","until","while","import","as"
 };
+
+#define NKW 23
 
 typedef struct {
     const char *p, *end;
     int line;
     Str *source;
-    /* current token */
+/* current token */
     int t; double num; Str *str; int tline;
-    /* lookahead */
+/* lookahead */
     int has_ahead; int at; double anum; Str *astr; int atline;
 } Lexer;
 
@@ -542,15 +569,16 @@ static void lex_error(Lexer *lx,const char *msg){
     luc_throw(mkobj(LT_STR,str_fromc(b)));
 }
 
-static int lx_check_kw(const char *s,int len){
-    for(int i=0;i<22;i++)
+static int lx_check_kw(Lexer *lx,const char *s,int len){
+    for(int i=0;i<NKW;i++)
         if((int)strlen(kwnames[i])==len && memcmp(kwnames[i],s,(size_t)len)==0)
             return TK_AND+i;
+    if(len==5 && memcmp(s,"local",5)==0)
+        lex_error(lx,"'local' is Lua syntax - LUC declares variables with 'create'");
     return TK_NAME;
 }
 
-/* long bracket:  [=[ ... ]=]  (level >= 1).  Plain [[ ]] is reserved for
-   list literals, so LUC long strings need at least one '='.               */
+/* long bracket:  [=[ ... ]=]  (level >= 1).  Plain [[ ]] is reserved for list literals, so LUC long strings need at least one '='. */
 static int lx_long_level(Lexer *lx,int incomment){
     const char *p=lx->p;
     if(*p!='[') return -1;
@@ -596,16 +624,16 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
         break;
     }
     char c=*lx->p;
-    /* identifiers / keywords */
+/* identifiers / keywords */
     if(isalpha((unsigned char)c)||c=='_'){
         const char *s=lx->p;
         while(lx->p<lx->end&&(isalnum((unsigned char)*lx->p)||*lx->p=='_')) lx->p++;
         int len=(int)(lx->p-s);
-        int t=lx_check_kw(s,len);
+        int t=lx_check_kw(lx,s,len);
         if(t==TK_NAME) *str=str_new(s,len);
         return t;
     }
-    /* numbers */
+/* numbers */
     if(isdigit((unsigned char)c)||(c=='.'&&lx->p+1<lx->end&&isdigit((unsigned char)lx->p[1]))){
         const char *s=lx->p;
         if(c=='0'&&lx->p+1<lx->end&&(lx->p[1]=='x'||lx->p[1]=='X')){
@@ -628,7 +656,7 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
         *num=strtod(tmp,NULL);
         return TK_NUMBER;
     }
-    /* short strings */
+/* short strings */
     if(c=='"'||c=='\''){
         char quote=c; lx->p++;
         size_t cap=32,len=0; char *b=(char*)lmalloc(cap);
@@ -673,19 +701,26 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
         #undef ADD
         return TK_STRING;
     }
-    /* long strings [=[ ]=] */
+/* long strings [=[ ]=] */
     if(c=='['){
         int lvl=lx_long_level(lx,0);
         if(lvl>0){ *str=lx_long_string(lx,lvl); return TK_STRING; }
     }
-    /* operators */
+/* operators */
     lx->p++;
     switch(c){
         case '=': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_EQ;} return '=';
-        case '~': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_NE;} lex_error(lx,"unexpected '~'"); break;
-        case '!': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_NE;} lex_error(lx,"unexpected '!'"); break;
+        case '~': if(lx->p<lx->end&&*lx->p=='=')
+                      lex_error(lx,"'~=' is Lua syntax - LUC compares with '!='");
+                  lex_error(lx,"unexpected '~'"); break;
+        case '!': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_NE;} lex_error(lx,"unexpected '!' (not equal is '!=', negation is 'not')"); break;
         case '<': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_LE;} return '<';
         case '>': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_GE;} return '>';
+        case '+': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_ADDEQ;} return '+';
+        case '-': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_SUBEQ;} return '-';
+        case '*': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_MULEQ;} return '*';
+        case '/': if(lx->p<lx->end&&*lx->p=='='){lx->p++;return TK_DIVEQ;} return '/';
+        case '#': lex_error(lx,"'#' is Lua syntax - LUC gets lengths with len(x)"); break;
         case '.':
             if(lx->p<lx->end&&*lx->p=='.'){
                 lx->p++;
@@ -716,12 +751,10 @@ static int lx_peek(Lexer *lx){
     return lx->at;
 }
 
-/* ==========================================================================
-** 7. AST
-** ========================================================================== */
+/* 7. AST */
 
 typedef enum {
-    E_NIL,E_TRUE,E_FALSE,E_NUM,E_STR,E_VARARG,E_NAME,E_INDEX,
+    E_NIL,E_TRUE,E_FALSE,E_NUM,E_STR,E_VARARG,E_NAME,E_INDEX,E_SLICE,
     E_CALL,E_METHCALL,E_FUNC,E_TABLE,E_LIST,E_BIN,E_UN,E_AND,E_OR
 } EKind;
 
@@ -736,7 +769,7 @@ typedef struct { Expr **k; Expr **v; int n,cap; } FieldList;
 struct Expr {
     EKind k; int line, op;
     double num; Str *str, *name;
-    Expr *a,*b;
+    Expr *a,*b,*c;
     EList args;
     FieldList fields;
     FuncBody *fb;
@@ -746,7 +779,7 @@ struct FuncBody { Str *name; Str **params; int nparams,isvararg,line; Block *bod
 
 typedef enum {
     S_LOCAL,S_ASSIGN,S_CALL,S_DO,S_WHILE,S_REPEAT,S_IF,
-    S_NUMFOR,S_GENFOR,S_LOCALFUNC,S_RETURN,S_BREAK
+    S_NUMFOR,S_GENFOR,S_RANGE,S_ITER,S_LOCALFUNC,S_RETURN,S_BREAK
 } SKind;
 
 struct Stat {
@@ -778,11 +811,9 @@ static void blk_add(Block *b,Stat *s){
     b->s[b->n++]=s;
 }
 
-/* ==========================================================================
-** 8. PARSER  (tokens -> AST)
-** ========================================================================== */
+/* 8. PARSER  (tokens -> AST) */
 
-typedef struct { Lexer lx; } Parser;
+typedef struct { Lexer lx; int fndepth; int inkey; } Parser;
 
 static Block *parse_block(Parser *ps);
 static Expr  *parse_expr(Parser *ps);
@@ -799,8 +830,10 @@ static const char *tok2str(int t,char *buf){
         case TK_EOF:return "<eof>"; case TK_NAME:return "<name>";
         case TK_NUMBER:return "<number>"; case TK_STRING:return "<string>";
         case TK_CONCAT:return ".."; case TK_DOTS:return "...";
-        case TK_EQ:return "=="; case TK_NE:return "~=";
+        case TK_EQ:return "=="; case TK_NE:return "!=";
         case TK_LE:return "<="; case TK_GE:return ">=";
+        case TK_ADDEQ:return "+="; case TK_SUBEQ:return "-=";
+        case TK_MULEQ:return "*="; case TK_DIVEQ:return "/=";
         default: return kwnames[t-TK_AND];
     }
 }
@@ -816,7 +849,19 @@ static Str *expect_name(Parser *ps){
     Str *s=ps->lx.str; lx_next(&ps->lx); return s;
 }
 
-/* --- optional type annotations: parsed and discarded ------------------- */
+/* name position after '.' or ':' - keywords allowed so t.create keeps working */
+static Str *expect_kwname(Parser *ps){
+    char b[8];
+    if(ps->lx.t==TK_NAME){ Str *s=ps->lx.str; lx_next(&ps->lx); return s; }
+    if(ps->lx.t>=TK_AND && ps->lx.t<TK_AND+NKW){
+        Str *s=str_fromc(kwnames[ps->lx.t-TK_AND]);
+        lx_next(&ps->lx); return s;
+    }
+    perr(ps,"<name> expected near '%s'",tok2str(ps->lx.t,b));
+    return str_fromc("");
+}
+
+/* optional type annotations: parsed and discarded */
 static void parse_type(Parser *ps){
     for(;;){
         if(ps->lx.t=='{'){                 /* {number}, {[string]:number} */
@@ -827,7 +872,7 @@ static void parse_type(Parser *ps){
             do{ if(ps->lx.t=='(')d++; else if(ps->lx.t==')')d--; lx_next(&ps->lx); }while(d>0&&ps->lx.t!=TK_EOF);
         } else if(ps->lx.t==TK_NAME||ps->lx.t==TK_NIL||ps->lx.t==TK_FUNCTION){
             lx_next(&ps->lx);
-            while(ps->lx.t=='.'){ lx_next(&ps->lx); expect_name(ps); }
+            while(ps->lx.t=='.'){ lx_next(&ps->lx); expect_kwname(ps); }
         } else break;
         if(ps->lx.t=='?') lx_next(&ps->lx);
         if(ps->lx.t=='-'&&lx_peek(&ps->lx)=='>'){ lx_next(&ps->lx); lx_next(&ps->lx); continue; }
@@ -837,9 +882,10 @@ static void parse_type(Parser *ps){
 }
 static void opt_type(Parser *ps){ if(ps->lx.t==':'){ lx_next(&ps->lx); parse_type(ps); } }
 
-/* --- function body ------------------------------------------------------ */
+/* function body */
 static FuncBody *parse_funcbody(Parser *ps,Str *name,int ismethod){
     FuncBody *fb=(FuncBody*)anew(sizeof(FuncBody));
+    ps->fndepth++;
     fb->name=name; fb->line=ps->lx.tline;
     fb->params=(Str**)anew(sizeof(Str*)*64);
     if(ismethod) fb->params[fb->nparams++]=str_fromc("self");
@@ -856,10 +902,11 @@ static FuncBody *parse_funcbody(Parser *ps,Str *name,int ismethod){
     opt_type(ps);                       /* return type annotation */
     fb->body=parse_block(ps);
     expect(ps,TK_END);
+    ps->fndepth--;
     return fb;
 }
 
-/* --- expressions -------------------------------------------------------- */
+/* expressions */
 static void parse_args(Parser *ps,Expr *call){
     if(ps->lx.t==TK_STRING){
         Expr *s=new_expr(E_STR,ps->lx.tline); s->str=ps->lx.str;
@@ -877,7 +924,7 @@ static Expr *parse_primary(Parser *ps){
         lx_next(&ps->lx);
         Expr *e=parse_expr(ps);
         expect(ps,')');
-        /* parenthesised expressions are truncated to one value */
+/* parenthesised expressions are truncated to one value */
         if(e->k==E_CALL||e->k==E_METHCALL||e->k==E_VARARG){
             Expr *p=new_expr(E_UN,line); p->op='('; p->a=e; return p;
         }
@@ -891,27 +938,43 @@ static Expr *parse_primary(Parser *ps){
     return NULL;
 }
 
-static Expr *parse_suffixed(Parser *ps){
-    Expr *e=parse_primary(ps);
+static Expr *parse_postfix(Parser *ps,Expr *e){
     for(;;){
         int line=ps->lx.tline;
         switch(ps->lx.t){
             case '.': {
                 lx_next(&ps->lx);
-                Str *n=expect_name(ps);
+                Str *n=expect_kwname(ps);
                 Expr *ix=new_expr(E_INDEX,line);
                 ix->a=e; ix->b=new_expr(E_STR,line); ix->b->str=n;
                 e=ix; break; }
             case '[': {
                 lx_next(&ps->lx);
+                if(ps->lx.t==':'){                  /* t[:n] */
+                    lx_next(&ps->lx);
+                    Expr *sl=new_expr(E_SLICE,line); sl->a=e; sl->b=NULL;
+                    if(ps->lx.t!=']') sl->c=parse_expr(ps);
+                    expect(ps,']'); e=sl; break;
+                }
                 Expr *k=parse_expr(ps);
+                if(ps->lx.t==':'){                  /* t[a:b] */
+                    lx_next(&ps->lx);
+                    Expr *sl=new_expr(E_SLICE,line); sl->a=e; sl->b=k;
+                    if(ps->lx.t!=']') sl->c=parse_expr(ps);
+                    expect(ps,']'); e=sl; break;
+                }
                 expect(ps,']');
                 Expr *ix=new_expr(E_INDEX,line); ix->a=e; ix->b=k; e=ix; break; }
-            case ':': {
-                lx_next(&ps->lx);
-                Str *n=expect_name(ps);
-                Expr *c=new_expr(E_METHCALL,line); c->a=e; c->name=n;
-                parse_args(ps,c); e=c; break; }
+            case ':':
+                if(ps->inkey) return e;       /* dict separator */
+                lx_next(&ps->lx);             /* obj:method(args) - self passed implicitly */
+                {
+                    Str *n=expect_kwname(ps);
+                    Expr *c=new_expr(E_METHCALL,line);
+                    c->a=e; c->name=n;
+                    parse_args(ps,c);
+                    e=c; break;
+                }
             case '(': case TK_STRING: case '{': {
                 Expr *c=new_expr(E_CALL,line); c->a=e;
                 parse_args(ps,c); e=c; break; }
@@ -920,24 +983,26 @@ static Expr *parse_suffixed(Parser *ps){
     }
 }
 
+static Expr *parse_suffixed(Parser *ps){
+    return parse_postfix(ps,parse_primary(ps));
+}
+
+/* dicts: {key: value, ...} - keys are expressions, { } empty dict */
 static Expr *parse_table(Parser *ps){
     int line=ps->lx.tline;
     Expr *e=new_expr(E_TABLE,line);
     expect(ps,'{');
     while(ps->lx.t!='}'){
-        if(ps->lx.t=='['){
-            lx_next(&ps->lx);
-            Expr *k=parse_expr(ps); expect(ps,']'); expect(ps,'=');
-            fl_add(&e->fields,k,parse_expr(ps));
-        } else if(ps->lx.t==TK_NAME && lx_peek(&ps->lx)=='='){
-            Expr *k=new_expr(E_STR,ps->lx.tline); k->str=ps->lx.str;
-            lx_next(&ps->lx); lx_next(&ps->lx);
-            fl_add(&e->fields,k,parse_expr(ps));
-        } else {
-            fl_add(&e->fields,NULL,parse_expr(ps));
-        }
+        ps->inkey=1;                        /* ':' after a dict key is a separator */
+        Expr *k=parse_expr(ps);
+        ps->inkey=0;
+        if(ps->lx.t!=':')
+            perr(ps,"':' expected - LUC dicts use {key: value}, lists use [a, b, c]");
+        lx_next(&ps->lx);
+        fl_add(&e->fields,k,parse_expr(ps));
         if(!opt(ps,',') && !opt(ps,';')) break;
     }
+    ps->inkey=0;
     expect(ps,'}');
     return e;
 }
@@ -960,14 +1025,20 @@ static Expr *parse_simple(Parser *ps){
         case TK_NIL:    e=new_expr(E_NIL,line);   lx_next(&ps->lx); return e;
         case TK_TRUE:   e=new_expr(E_TRUE,line);  lx_next(&ps->lx); return e;
         case TK_FALSE:  e=new_expr(E_FALSE,line); lx_next(&ps->lx); return e;
-        case TK_NUMBER: e=new_expr(E_NUM,line); e->num=ps->lx.num; lx_next(&ps->lx); return e;
-        case TK_STRING: e=new_expr(E_STR,line); e->str=ps->lx.str; lx_next(&ps->lx); return e;
+        case TK_NUMBER: {
+            e=new_expr(E_NUM,line); e->num=ps->lx.num; lx_next(&ps->lx);
+            return parse_postfix(ps,e);
+        }
         case TK_DOTS:   e=new_expr(E_VARARG,line); lx_next(&ps->lx); return e;
-        case '{':       return parse_table(ps);
-        case '[':       return parse_list(ps);
+        case '{':       return parse_postfix(ps,parse_table(ps));
+        case '[':       return parse_postfix(ps,parse_list(ps));
         case TK_FUNCTION: {
             lx_next(&ps->lx);
-            e=new_expr(E_FUNC,line); e->fb=parse_funcbody(ps,NULL,0); return e; }
+            e=new_expr(E_FUNC,line); e->fb=parse_funcbody(ps,NULL,0);
+            return parse_postfix(ps,e); }
+        case TK_STRING: {
+            e=new_expr(E_STR,line); e->str=ps->lx.str; lx_next(&ps->lx);
+            return parse_postfix(ps,e); }
         default: return parse_suffixed(ps);
     }
 }
@@ -1010,21 +1081,29 @@ static Expr *parse_subexpr(Parser *ps,int limit){
 
     for(;;){
         int op=getbinop(ps->lx.t);
-        if(!op) break;
-        Prio pr=binprio(op);
-        if(pr.left<=limit) break;
+        int notin=0;
+        if(!op && ps->lx.t==TK_NOT && lx_peek(&ps->lx)==TK_IN) notin=1;
+        if(!op && !notin) break;
+        Prio pr; pr.left=3; pr.right=3;
+        if(!notin){ pr=binprio(op); if(pr.left<=limit) break; }
         int l2=ps->lx.tline;
         lx_next(&ps->lx);
-        Expr *rhs=parse_subexpr(ps,pr.right);
-        Expr *b=new_expr(op==TK_AND?E_AND:(op==TK_OR?E_OR:E_BIN),l2);
-        b->op=op; b->a=e; b->b=rhs;
-        e=b;
+        if(notin) lx_next(&ps->lx);
+        Expr *rhs=parse_subexpr(ps,notin?3:pr.right);
+        if(notin){
+            Expr *in=new_expr(E_BIN,l2); in->op=TK_IN; in->a=e; in->b=rhs;
+            e=new_expr(E_UN,l2); e->op=TK_NOT; e->a=in;
+        } else {
+            Expr *b=new_expr(op==TK_AND?E_AND:(op==TK_OR?E_OR:E_BIN),l2);
+            b->op=op; b->a=e; b->b=rhs;
+            e=b;
+        }
     }
     return e;
 }
 static Expr *parse_expr(Parser *ps){ return parse_subexpr(ps,0); }
 
-/* --- statements --------------------------------------------------------- */
+/* statements */
 static Stat *new_stat(SKind k,int line){ Stat *s=(Stat*)anew(sizeof(Stat)); s->k=k; s->line=line; return s; }
 
 static void clause_add(Stat *s,Expr *c,Block *b){
@@ -1037,7 +1116,7 @@ static void clause_add(Stat *s,Expr *c,Block *b){
 }
 
 static int block_follow(int t){
-    return t==TK_EOF||t==TK_END||t==TK_ELSE||t==TK_ELSEIF||t==TK_UNTIL;
+    return t==TK_EOF||t==TK_END||t==TK_ELSE||t==TK_ELSEIF;
 }
 
 static Stat *parse_statement(Parser *ps){
@@ -1072,40 +1151,66 @@ static Stat *parse_statement(Parser *ps){
             s->body=parse_block(ps); expect(ps,TK_END);
             return s; }
 
-        case TK_REPEAT: {
-            Stat *s=new_stat(S_REPEAT,line);
-            lx_next(&ps->lx);
-            s->body=parse_block(ps); expect(ps,TK_UNTIL);
-            s->e1=parse_expr(ps);
-            return s; }
+        case TK_FOR:
+            perr(ps,"'for' is Lua syntax - LUC loops with 'repeat'");
+            return NULL;
 
-        case TK_FOR: {
+        case TK_UNTIL:
+            perr(ps,"'until' is Lua do-while syntax - LUC removed it, use 'while'");
+            return NULL;
+
+        case TK_REPEAT: {
+/* repeat [step,] destination [as i] do ... end
+   step > 0 counts up from 0, stops BEFORE destination
+   step < 0 counts down destination..0 (0 still runs)
+   repeat destination do ... end is short for step 1
+   repeat name [, name] in expr do ... end     iterate list/string/dict */
+            Stat *s=NULL;
             lx_next(&ps->lx);
-            Str *n1=expect_name(ps);
-            opt_type(ps);
-            if(ps->lx.t=='='){
-                Stat *s=new_stat(S_NUMFOR,line);
-                s->names=(Str**)anew(sizeof(Str*)); s->names[0]=n1; s->nnames=1;
-                lx_next(&ps->lx);
-                s->e1=parse_expr(ps); expect(ps,',');
-                s->e2=parse_expr(ps);
-                if(opt(ps,',')) s->e3=parse_expr(ps);
-                expect(ps,TK_DO);
-                s->body=parse_block(ps); expect(ps,TK_END);
-                return s;
-            } else {
-                Stat *s=new_stat(S_GENFOR,line);
-                s->names=(Str**)anew(sizeof(Str*)*32); s->names[0]=n1; s->nnames=1;
+            Expr *e1=parse_subexpr(ps,3);
+            if(ps->lx.t==TK_IN){
+                if(e1->k!=E_NAME) perr(ps,"loop variable must be a plain name");
+                s=new_stat(S_ITER,line);
+                s->names=(Str**)anew(sizeof(Str*)*8);
+                s->names[s->nnames++]=e1->name;
                 while(opt(ps,',')){
-                    if(s->nnames>=30) perr(ps,"too many loop variables");
-                    s->names[s->nnames++]=expect_name(ps); opt_type(ps);
+                    if(s->nnames>=2) perr(ps,"too many loop variables (max 2)");
+                    Expr *n2=parse_subexpr(ps,3);
+                    if(n2->k!=E_NAME) perr(ps,"loop variable must be a plain name");
+                    s->names[s->nnames++]=n2->name;
                 }
                 expect(ps,TK_IN);
-                do{ el_add(&s->rhs,parse_expr(ps)); }while(opt(ps,','));
-                expect(ps,TK_DO);
-                s->body=parse_block(ps); expect(ps,TK_END);
-                return s;
-            } }
+                s->e1=parse_expr(ps);
+            } else if(ps->lx.t==','){
+                lx_next(&ps->lx);
+                Expr *e2=parse_subexpr(ps,3);
+                if(ps->lx.t==TK_IN){
+                    if(e1->k!=E_NAME||e2->k!=E_NAME) perr(ps,"loop variables must be plain names");
+                    s=new_stat(S_ITER,line);
+                    s->names=(Str**)anew(sizeof(Str*)*8);
+                    s->names[s->nnames++]=e1->name;
+                    s->names[s->nnames++]=e2->name;
+                    expect(ps,TK_IN);
+                    s->e1=parse_expr(ps);
+                } else {
+                    s=new_stat(S_RANGE,line);
+                    s->e1=e1; s->e2=e2;
+                    if(ps->lx.t==',') perr(ps,"repeat takes at most two numbers (step, destination) - no third");
+                    if(opt(ps,TK_AS)){
+                        s->names=(Str**)anew(sizeof(Str*));
+                        s->names[0]=expect_name(ps); s->nnames=1;
+                    }
+                }
+            } else {
+                s=new_stat(S_RANGE,line);
+                s->e2=e1;
+                Expr *one=new_expr(E_NUM,line); one->num=1;
+                s->e1=one;
+            }
+            expect(ps,TK_DO);
+            s->body=parse_block(ps);
+            expect(ps,TK_END);
+            return s; }
 
         case TK_FUNCTION: {
             lx_next(&ps->lx);
@@ -1115,17 +1220,18 @@ static Stat *parse_statement(Parser *ps){
             Str *last=n;
             while(ps->lx.t=='.'){
                 lx_next(&ps->lx);
-                Str *f=expect_name(ps);
+                Str *f=expect_kwname(ps);
                 Expr *ix=new_expr(E_INDEX,line);
                 ix->a=target; ix->b=new_expr(E_STR,line); ix->b->str=f;
                 target=ix; last=f;
             }
-            if(ps->lx.t==':'){
+            if(ps->lx.t==':'){                  /* function obj.name(args): self is implicit */
                 lx_next(&ps->lx);
-                Str *f=expect_name(ps);
+                Str *f=expect_kwname(ps);
                 Expr *ix=new_expr(E_INDEX,line);
                 ix->a=target; ix->b=new_expr(E_STR,line); ix->b->str=f;
-                target=ix; last=f; ismethod=1;
+                target=ix; last=f;
+                ismethod=1;
             }
             Stat *s=new_stat(S_ASSIGN,line);
             el_add(&s->lhs,target);
@@ -1134,7 +1240,7 @@ static Stat *parse_statement(Parser *ps){
             el_add(&s->rhs,fe);
             return s; }
 
-        case TK_LOCAL: {
+        case TK_CREATE: {
             lx_next(&ps->lx);
             if(opt(ps,TK_FUNCTION)){
                 Stat *s=new_stat(S_LOCALFUNC,line);
@@ -1155,13 +1261,23 @@ static Stat *parse_statement(Parser *ps){
             return s; }
 
         case TK_IMPORT: {
-            /* import a, b  ==  do a = __import("a") b = __import("b") end */
+/* import a, b("x")  ==  do a = __import("a") x = __import("b") end
+   the optional ("alias") binds the system library to a shorter name:
+   import window("w")  ->  w = __import("window")                      */
             lx_next(&ps->lx);
             Stat *s=new_stat(S_DO,line);
             s->body=(Block*)anew(sizeof(Block));
             do{
                 Str *n=expect_name(ps);
-                Expr *target=new_expr(E_NAME,line); target->name=n;
+                Str *alias=n;
+                if(opt(ps,'(')){
+                    if(ps->lx.t!=TK_STRING)
+                        perr(ps,"expected an alias string after the module name - use import window(\"w\")");
+                    alias=ps->lx.str;
+                    lx_next(&ps->lx);
+                    expect(ps,')');
+                }
+                Expr *target=new_expr(E_NAME,line); target->name=alias;
                 Expr *fn=new_expr(E_NAME,line); fn->name=str_fromc("__import");
                 Expr *arg=new_expr(E_STR,line); arg->str=n;
                 Expr *call=new_expr(E_CALL,line); call->a=fn; el_add(&call->args,arg);
@@ -1183,6 +1299,23 @@ static Stat *parse_statement(Parser *ps){
 
         default: {
             Expr *e=parse_suffixed(ps);
+            if(ps->lx.t==':')
+                perr(ps,"unexpected ':' (dict literals use {key: value}, methods use obj:method(args))");
+            int cop=0;
+            if(ps->lx.t==TK_ADDEQ) cop='+';
+            else if(ps->lx.t==TK_SUBEQ) cop='-';
+            else if(ps->lx.t==TK_MULEQ) cop='*';
+            else if(ps->lx.t==TK_DIVEQ) cop='/';
+            if(cop){
+                if(e->k!=E_NAME && e->k!=E_INDEX)
+                    perr(ps,"cannot assign to this expression");
+                lx_next(&ps->lx);
+                Stat *s=new_stat(S_ASSIGN,line);
+                el_add(&s->lhs,e);
+                Expr *bin=new_expr(E_BIN,line); bin->op=cop; bin->a=e; bin->b=parse_expr(ps);
+                el_add(&s->rhs,bin);
+                return s;
+            }
             if(ps->lx.t=='='||ps->lx.t==','){
                 Stat *s=new_stat(S_ASSIGN,line);
                 el_add(&s->lhs,e);
@@ -1211,9 +1344,7 @@ static Block *parse_block(Parser *ps){
     return b;
 }
 
-/* ==========================================================================
-** 9. BYTECODE
-** ========================================================================== */
+/* 9. BYTECODE */
 
 enum {
     OP_MOVE, OP_LOADK, OP_LOADNIL, OP_LOADBOOL,
@@ -1224,7 +1355,7 @@ enum {
     OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_IN,
     OP_JMP, OP_JMPIF, OP_JMPIFNOT,
     OP_CALL, OP_RETURN, OP_CLOSURE, OP_VARARG, OP_CLOSE,
-    OP_FORPREP, OP_FORLOOP, OP_TFORLOOP,
+    OP_FORPREP, OP_FORLOOP, OP_TFORLOOP, OP_SLICE, OP_NEXT,
     OP_COUNT
 };
 
@@ -1239,9 +1370,7 @@ enum {
 #define GET_Bx(i)   ((int)((i)&0xFFFFu))
 #define GET_sBx(i)  (GET_Bx(i)-32767)
 
-/* ==========================================================================
-** 10. COMPILER (AST -> bytecode)
-** ========================================================================== */
+/* 10. COMPILER (AST -> bytecode) */
 
 typedef struct { Str *name; } LocalVar;
 typedef struct BlockCnt {
@@ -1359,7 +1488,7 @@ static int multiret(Expr *e){ return e->k==E_CALL||e->k==E_METHCALL||e->k==E_VAR
 /* compile e producing `nres` results (nres<0 = all), returns first register */
 static int comp_multi(FuncState *fs,Expr *e,int nres){
     if(e->k==E_CALL||e->k==E_METHCALL) return comp_call(fs,e,nres);
-    /* vararg */
+/* vararg */
     int r=reserve(fs,1);
     emit(fs,I_ABC(OP_VARARG,r,nres<0?0:nres+1,0),e->line);
     if(nres>1) reserve(fs,nres-1);
@@ -1427,7 +1556,7 @@ static void comp_ctor(FuncState *fs,Expr *e,int reg){
             emit(fs,I_ABC(OP_SETLIST,tmp,0,startidx),e->line);
             fs->freereg=tmp+1;
         } else if(startidx+pending>240){
-            /* very long literal: fall back to explicit index stores */
+/* very long literal: fall back to explicit index stores */
             if(pending){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
                          startidx+=pending; pending=0; fs->freereg=tmp+1; }
             int rb=reserve(fs,1);
@@ -1486,6 +1615,14 @@ static void exprd(FuncState *fs,Expr *e,int reg){
             if(f!=reg) emit(fs,I_ABC(OP_MOVE,reg,f,0),e->line);
             fs->freereg=save; break; }
         case E_TABLE: case E_LIST: comp_ctor(fs,e,reg); break;
+        case E_SLICE: {
+            int save=fs->freereg;
+            int rt=exprtmp(fs,e->a);
+            int rs=reserve(fs,2);
+            if(e->b) exprd(fs,e->b,rs); else emit(fs,I_ABC(OP_LOADNIL,rs,0,0),e->line);
+            if(e->c) exprd(fs,e->c,rs+1); else emit(fs,I_ABC(OP_LOADNIL,rs+1,0,0),e->line);
+            emit(fs,I_ABC(OP_SLICE,reg,rt,rs),e->line);
+            fs->freereg=save; break; }
         case E_FUNC: {
             Proto *np=compile_proto(fs,e->fb,fs->source);
             Proto *p=fs->p;
@@ -1632,7 +1769,7 @@ static void comp_stat(FuncState *fs,Stat *s){
         case S_REPEAT: {
             int start=here(fs);
             BlockCnt bl; enterblock(fs,&bl,1);
-            /* condition can see the body's locals -> evaluate before leaveblock */
+/* condition can see the body's locals -> evaluate before leaveblock */
             comp_block(fs,s->body);
             int save=fs->freereg;
             int r=reserve(fs,1);
@@ -1641,7 +1778,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             int jf=emit(fs,I_AsBx(OP_JMPIFNOT,r,0),s->line);
             leaveblock(fs,s->line);
             patch(fs,jf,start);
-            /* fallthrough when condition is true */
+/* fallthrough when condition is true */
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_NUMFOR: {
@@ -1685,6 +1822,49 @@ static void comp_stat(FuncState *fs,Stat *s){
             int tfor=emit(fs,I_ABC(OP_TFORLOOP,base,0,s->nnames),s->line);
             patch(fs,emit(fs,I_AsBx(OP_JMP,0,0),s->line),body);
             patch(fs,prep,tfor);
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_RANGE: {
+/* repeat [step,] destination [as i] - FORPREP validates step and picks direction */
+            int base=fs->nlocals;
+            fs->freereg=base;
+            int r0=reserve(fs,1); exprd(fs,s->e1,r0);
+            int r1=reserve(fs,1); exprd(fs,s->e2,r1);
+            BlockCnt bl; enterblock(fs,&bl,1);
+            newlocal(fs,str_fromc("(for state)"));
+            newlocal(fs,str_fromc("(for limit)"));
+            newlocal(fs,str_fromc("(for step)"));
+            newlocal(fs,s->nnames?s->names[0]:str_fromc("(i)"));
+            fs->freereg=fs->nlocals;
+            int prep=emit(fs,I_AsBx(OP_FORPREP,base,0),s->line);
+            int body=here(fs);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            int loop=emit(fs,I_AsBx(OP_FORLOOP,base,0),s->line);
+            patch(fs,loop,body);
+            patch(fs,prep,loop);
+            patch_breaks(fs,&bl,here(fs));
+            break; }
+        case S_ITER: {
+/* repeat a [, b] in expr - a,b get value/index for lists+strings, key/value for dicts */
+            int base=fs->nlocals;
+            fs->freereg=base;
+            int r0=reserve(fs,1); exprd(fs,s->e1,r0);
+            int r1=reserve(fs,1); emit(fs,I_ABC(OP_LOADNIL,r1,0,0),s->line);
+            reserve(fs,2);                      /* out1/out2 slots */
+            BlockCnt bl; enterblock(fs,&bl,1);
+            newlocal(fs,str_fromc("(iter target)"));
+            newlocal(fs,str_fromc("(iter state)"));
+            newlocal(fs,s->names[0]);
+            if(s->nnames>1) newlocal(fs,s->names[1]);
+            fs->freereg=fs->nlocals;
+            int prep=emit(fs,I_AsBx(OP_JMP,0,0),s->line);
+            int body=here(fs);
+            comp_block(fs,s->body);
+            leaveblock(fs,s->line);
+            int nxt=emit(fs,I_ABC(OP_NEXT,base,0,0),s->line);
+            patch(fs,emit(fs,I_AsBx(OP_JMP,0,0),s->line),body);
+            patch(fs,prep,nxt);
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_RETURN: {
@@ -1748,9 +1928,7 @@ Closure *luc_compile(const char *src,int len,const char *chunkname){
     return closure_new(p);
 }
 
-/* ==========================================================================
-** 11. VM
-** ========================================================================== */
+/* 11. VM */
 
 YieldPt *g_yp=NULL;
 static int g_cdepth=0;
@@ -1815,6 +1993,34 @@ int vm_lessthan(Value a,Value b,int orequal){
     luc_error("attempt to compare %s with %s",type_name(a),type_name(b));
     return 0;
 }
+/* bound native methods: obj.append(x) receives obj as hidden first argument.
+   obj:append(x) passes self explicitly (E_METHCALL), so when the first
+   argument already IS the bound object the trampoline must not inject it again. */
+static int meth_trampoline(LucState *L,int base,int nargs,CFunc *cf){
+    CFunc *t=(CFunc*)cf->up[1].u.o;
+    if(nargs>0 && val_rawequal(L->stack[base],cf->up[0]))
+        return t->fn(L,base,nargs,t);   /* self passed explicitly: use as-is */
+    ensure_stack(L,base+nargs+8);
+    for(int i=nargs;i>0;i--) L->stack[base+i]=L->stack[base+i-1];
+    L->stack[base]=cf->up[0];
+    return t->fn(L,base,nargs+1,t);   /* results already land at base */
+}
+static Value bind_method(Value self,Value m){
+    CFunc *cf=cfunc_new(meth_trampoline,"method",2);
+    cf->up[0]=self; cf->up[1]=m;
+    return mkobj(LT_CFUNC,cf);
+}
+
+/* core list methods that override the list lib (remove is by VALUE here) */
+static int f_core_remove(LucState *L,int base,int nargs,CFunc *self){
+    (void)self;
+    Table *t=checktab(L,base,nargs,0,"remove");
+    Value v=AR(1);
+    for(int i=0;i<t->alen;i++)
+        if(val_rawequal(t->arr[i],v)){ list_removeat(t,i+1); RET(0,mkbool(1)); return 1; }
+    RET(0,mkbool(0)); return 1;
+}
+
 static Value vm_index(Value t,Value k){
     switch(t.t){
         case LT_TABLE: {
@@ -1826,30 +2032,80 @@ static Value vm_index(Value t,Value k){
                 if(h.t==LT_TABLE||h.t==LT_LIST){ tb=AS_TAB(h); r=tab_get(tb,k); d++; }
                 else break;
             }
+            if(r.t==LT_NIL && k.t==LT_STR && V.tabmeta){
+                Value m=tab_get(V.tabmeta,k);
+                if(m.t!=LT_NIL) return bind_method(t,m);
+            }
             return r;
         }
         case LT_LIST:
-            if(k.t==LT_NUM) return tab_get(AS_TAB(t),k);
-            if(k.t==LT_STR) return tab_get(V.listmeta,k);
+            if(k.t==LT_NUM){
+                double d=k.u.n;
+                if(d!=d || d!=floor(d)) return NIL;
+                int i=(int)d, n=AS_TAB(t)->alen;
+                if(i<0) i+=n;
+                if(i>=0 && i<n) return AS_TAB(t)->arr[i];
+                return NIL;
+            }
+            if(k.t==LT_STR){
+                Value m = V.listcore? tab_get(V.listcore,k) : NIL;
+                if(m.t==LT_NIL) m=tab_get(V.listmeta,k);
+                if(m.t==LT_NIL) return NIL;
+                return bind_method(t,m);
+            }
             return tab_get(AS_TAB(t),k);
         case LT_STR:
-            if(k.t==LT_STR) return tab_get(V.stringlib,k);
+            if(k.t==LT_NUM){
+                double d=k.u.n;
+                if(d!=d || d!=floor(d)) return NIL;
+                int i=(int)d, n=AS_STR(t)->len;
+                if(i<0) i+=n;
+                if(i>=0 && i<n) return strv(AS_STR(t)->s+i,1);
+                return NIL;
+            }
+            if(k.t==LT_STR){
+                Value m=tab_get(V.stringlib,k);
+                if(m.t==LT_NIL) return NIL;
+                return bind_method(t,m);
+            }
             return NIL;
-        case LT_BUFFER: return k.t==LT_STR? tab_get(V.bufferlib,k):NIL;
-        case LT_FILE:   return k.t==LT_STR? tab_get(V.filelib,k):NIL;
+        case LT_BUFFER: {
+            if(k.t!=LT_STR) return NIL;
+            Value m=tab_get(V.bufferlib,k);
+            return m.t==LT_NIL? NIL : bind_method(t,m);
+        }
+        case LT_FILE: {
+            if(k.t!=LT_STR) return NIL;
+            Value m=tab_get(V.filelib,k);
+            return m.t==LT_NIL? NIL : bind_method(t,m);
+        }
         default:
             luc_error("attempt to index a %s value",type_name(t));
     }
     return NIL;
 }
 static void vm_setindex(Value t,Value k,Value v){
+    if(t.t==LT_LIST && k.t==LT_NUM){
+        double d=k.u.n;
+        if(d!=d || d!=floor(d)) luc_error("list index is not an integer");
+        int i=(int)d, n=AS_TAB(t)->alen;
+        if(i<0) i+=n;
+        if(i<0) luc_error("list index out of range");
+        tab_set(AS_TAB(t),mknum((double)(i+1)),v);
+        return;
+    }
     if(t.t==LT_TABLE||t.t==LT_LIST) tab_set(AS_TAB(t),k,v);
     else luc_error("attempt to index a %s value",type_name(t));
 }
 int vm_len(Value v){
     switch(v.t){
         case LT_STR: return AS_STR(v)->len;
-        case LT_TABLE: return tab_len(AS_TAB(v));
+        case LT_TABLE: {
+            Table *t=AS_TAB(v);
+            int n=0; Value k=NIL,w;
+            while(tab_next(t,k,&k,&w)) n++;
+            return n;
+        }
         case LT_LIST: return AS_TAB(v)->alen;
         case LT_BUFFER: return AS_BUF(v)->len;
         default: luc_error("attempt to get length of a %s value",type_name(v));
@@ -1857,11 +2113,19 @@ int vm_len(Value v){
     return 0;
 }
 int vm_in(Value x,Value c){
-    if(c.t==LT_LIST||c.t==LT_TABLE){
+    if(c.t==LT_LIST){
         Table *t=AS_TAB(c);
         for(int i=0;i<t->alen;i++) if(val_rawequal(t->arr[i],x)) return 1;
+        return 0;
+    }
+    if(c.t==LT_TABLE){
+        Table *t=AS_TAB(c);
+        if(x.t==LT_NUM){
+            double d=x.u.n;
+            if(d==floor(d) && d>=1 && d<=t->alen) return 1;
+        }
         for(int i=0;i<t->ecap;i++)
-            if(t->ents[i].k.t!=LT_NIL && val_rawequal(t->ents[i].v,x)) return 1;
+            if(t->ents[i].k.t!=LT_NIL && val_rawequal(t->ents[i].k,x)) return 1;
         return 0;
     }
     if(c.t==LT_STR){
@@ -1873,6 +2137,39 @@ int vm_in(Value x,Value c){
         return 0;
     }
     luc_error("attempt to use 'in' on a %s value",type_name(c));
+    return 0;
+}
+
+/* dict methods reachable through dot access: t.keys(), t.values() */
+static int f_dict_keys(LucState *L,int base,int nargs,CFunc *self){
+    (void)self; (void)nargs;
+    Table *t=checktab(L,base,nargs,0,"keys");
+    Table *r=tab_new(1);
+    Value k=NIL,v;
+    while(tab_next(t,k,&k,&v)) list_push(r,k);
+    RET(0,mkobj(LT_LIST,r)); return 1;
+}
+static int f_dict_values(LucState *L,int base,int nargs,CFunc *self){
+    (void)self; (void)nargs;
+    Table *t=checktab(L,base,nargs,0,"values");
+    Table *r=tab_new(1);
+    Value k=NIL,v;
+    while(tab_next(t,k,&k,&v)) list_push(r,v);
+    RET(0,mkobj(LT_LIST,r)); return 1;
+}
+
+/* len(x) replaces the Lua '#' operator */
+static int f_core_len(LucState *L,int base,int nargs,CFunc *self){
+    (void)self;
+    RET(0,mknum((double)vm_len(AR(0)))); return 1;
+}
+
+/* pairs/ipairs die with friendly migration hints */
+static int f_lua_trap(LucState *L,int base,int nargs,CFunc *self){
+    (void)L; (void)base; (void)nargs;
+    if(!strcmp(self->name,"ipairs"))
+        luc_error("'ipairs' is Lua syntax - LUC iterates lists with: repeat item, i in list do ... end");
+    luc_error("'pairs' is Lua syntax - LUC iterates dicts with: repeat k, v in dict do ... end");
     return 0;
 }
 
@@ -1933,10 +2230,9 @@ int vm_call(LucState *L,int func,int nargs,int nres){
     return 0;
 }
 
-/* --- metatable-lite runtime (after vm_call is available) ---------------- */
+/* metatable-lite runtime (after vm_call is available) */
 
-/* call f(args...) from deep inside VM/C helpers; single result on return.
-   NOTE: may reallocate L->stack and L->ci — caller must refresh base/pc. */
+/* call f(args...) from deep inside VM/C helpers; single result on return. NOTE: may reallocate L->stack and L->ci — caller must refresh base/pc. */
 static Value meta_callv(LucState *L,Value f,Value *args,int n){
     ensure_stack(L,L->top+n+8);
     int slot=L->top;
@@ -1949,8 +2245,7 @@ static Value meta_callv(LucState *L,Value f,Value *args,int n){
     return r;
 }
 
-/* lookup metamethod 'ev' for a binary op: x side first, then y side.
-   returns 1 and fills *out when a handler fired. */
+/* lookup metamethod 'ev' for a binary op: x side first, then y side. returns 1 and fills *out when a handler fired. */
 static int vm_metabin(LucState *L,Value x,Value y,const char *ev,Value *out){
     if(x.t==LT_TABLE && AS_TAB(x)->meta){
         Value f=tab_get(AS_TAB(x)->meta,mkobj(LT_STR,str_fromc(ev)));
@@ -1979,7 +2274,7 @@ static void vm_execute(LucState *L,int baselevel){
         &&vm_op_GT, &&vm_op_GE, &&vm_op_IN, &&vm_op_JMP, &&vm_op_JMPIF,
         &&vm_op_JMPIFNOT, &&vm_op_CALL, &&vm_op_RETURN, &&vm_op_CLOSURE,
         &&vm_op_VARARG, &&vm_op_CLOSE, &&vm_op_FORPREP, &&vm_op_FORLOOP,
-        &&vm_op_TFORLOOP
+        &&vm_op_TFORLOOP, &&vm_op_SLICE, &&vm_op_NEXT
     };
 #else
 #define VM_LABEL(name) case OP_##name:
@@ -2057,6 +2352,7 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(ADD) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
             if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n+y.u.n); VM_NEXT; }
+            if((x.t==LT_STR||x.t==LT_NUM)&&(y.t==LT_STR||y.t==LT_NUM)){ base[A]=vm_concat(x,y); VM_NEXT; }
             Value mr; ci->savedpc=pc;
             if(vm_metabin(L,x,y,"__add",&mr)){
                 ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
@@ -2220,14 +2516,18 @@ static void vm_execute(LucState *L,int baselevel){
             if(want>=0) L->top=ci->base+pr->maxstack;
         } VM_NEXT;
         VM_LABEL(FORPREP) {
-            double init=arith_num(base[A]), lim=arith_num(base[A+1]), st=arith_num(base[A+2]);
-            base[A]=mknum(init-st); base[A+1]=mknum(lim); base[A+2]=mknum(st);
+/* repeat [step,] destination: going up stops BEFORE destination, going down lands on 0 */
+            double st=arith_num(base[A]), tg=arith_num(base[A+1]);
+            if(st==0) luc_error("repeat: step cannot be zero");
+            if(st>0){ base[A]=mknum(-st); base[A+1]=mknum(tg); }
+            else { base[A]=mknum(tg-st); base[A+1]=mknum(0); }
+            base[A+2]=mknum(st);
             pc+=GET_sBx(ins);
         } VM_NEXT;
         VM_LABEL(FORLOOP) {
             double idx=base[A].u.n+base[A+2].u.n;
             double lim=base[A+1].u.n, st=base[A+2].u.n;
-            if(st>0? idx<=lim : idx>=lim){
+            if(st>0? idx<lim : idx>=lim){
                 base[A]=mknum(idx); base[A+3]=mknum(idx);
                 pc+=GET_sBx(ins);
             }
@@ -2246,6 +2546,55 @@ static void vm_execute(LucState *L,int baselevel){
             else pc++;
             for(int i=0;i<nvars;i++) base[A+3+i]=L->stack[cb+i];
         } VM_NEXT;
+        VM_LABEL(SLICE) {
+            Value tv=base[GET_B(ins)], sv=base[GET_C(ins)], ev=base[GET_C(ins)+1];
+            int len;
+            if(tv.t==LT_LIST) len=AS_TAB(tv)->alen;
+            else if(tv.t==LT_STR) len=AS_STR(tv)->len;
+            else { luc_error("cannot slice a %s value",type_name(tv)); len=0; }
+            int st,en;
+            if(sv.t==LT_NIL) st=0;
+            else if(sv.t==LT_NUM){ st=(int)floor(sv.u.n); if(st<0) st+=len; }
+            else { luc_error("slice indices must be numbers"); st=0; }
+            if(ev.t==LT_NIL) en=len;
+            else if(ev.t==LT_NUM){ en=(int)floor(ev.u.n); if(en<0) en+=len; }
+            else { luc_error("slice indices must be numbers"); en=len; }
+            if(st<0) st=0; if(st>len) st=len;
+            if(en<0) en=0; if(en>len) en=len;
+            if(en<st) en=st;
+            if(tv.t==LT_LIST){
+                if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
+                Table *r=tab_new(1);
+                for(int i=st;i<en;i++) list_push(r,AS_TAB(tv)->arr[i]);
+                base[A]=mkobj(LT_LIST,r);
+            } else {
+                Str *s=AS_STR(tv);
+                base[A]=strv(s->s+st,en-st);
+            }
+        } VM_NEXT;
+        VM_LABEL(NEXT) {
+/* base[A]=target, base[A+1]=state; outputs base[A+2], base[A+3]
+   lists/strings: value, index (0-based); dicts: key, value */
+            Value tv=base[A], st=base[A+1];
+            if(tv.t==LT_LIST||tv.t==LT_STR){
+                int len=tv.t==LT_LIST? AS_TAB(tv)->alen : AS_STR(tv)->len;
+                int idx;
+                if(st.t==LT_NIL) idx=0;
+                else if(st.t==LT_NUM) idx=(int)st.u.n+1;
+                else { luc_error("invalid iteration state"); idx=0; }
+                if(idx<len){
+                    base[A+1]=mknum((double)idx);
+                    if(tv.t==LT_LIST) base[A+2]=AS_TAB(tv)->arr[idx];
+                    else { Str *s=AS_STR(tv); base[A+2]=strv(s->s+idx,1); }
+                    base[A+3]=mknum((double)idx);
+                } else pc++;
+            } else if(tv.t==LT_TABLE){
+                Value k,v;
+                if(tab_next(AS_TAB(tv),st,&k,&v)){
+                    base[A+1]=k; base[A+2]=k; base[A+3]=v;
+                } else pc++;
+            } else luc_error("cannot iterate a %s value",type_name(tv));
+        } VM_NEXT;
 #if !defined(__GNUC__) && !defined(__clang__)
         default: luc_error("bad opcode %d",GET_OP(ins));
 #endif
@@ -2254,7 +2603,7 @@ static void vm_execute(LucState *L,int baselevel){
 #undef VM_NEXT
 }
 
-/* ======== coroutines + task scheduler ======== */
+/* coroutines + task scheduler */
 
 int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
     if(co->status==CO_DEAD){ V.errval=mkobj(LT_STR,str_fromc("cannot resume dead coroutine")); return 1; }
@@ -2270,7 +2619,7 @@ int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
     if(setjmp(yp.jb)==0){
         if(setjmp(ej.jb)==0){
             if(co->status==CO_RUNNING && co->nci==0){
-                /* first start: function already at stack[0] */
+/* first start: function already at stack[0] */
                 ensure_stack(co,nargs+8);
                 for(int i=0;i<nargs;i++) co->stack[1+i]=args[i];
                 Value f=co->stack[0];
@@ -2309,9 +2658,7 @@ int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
     return rc;
 }
 
-/* ==========================================================================
-** 13. task scheduler
-** ========================================================================== */
+/* 13. task scheduler */
 
 void sched_add(LucState *co,double wake){
     if(V.nsched==V.schedcap){
@@ -2354,7 +2701,7 @@ int hexval(int c){
     return -1;
 }
 
-/* ======== lib argument-check helpers ======== */
+/* lib argument-check helpers */
 
 double checknum(LucState *L,int base,int nargs,int i,const char *fn){
     Value v=AR(i);
@@ -2389,7 +2736,7 @@ uint32_t checku32(LucState *L,int base,int nargs,int i,const char *fn){
     double d=checknum(L,base,nargs,i,fn);
     return (uint32_t)(int64_t)d;
 }
-/* ======== module system ======== */
+/* module system */
 
 static char g_scriptdir[1024] = "";
 static char g_exepath[1024]   = "";
@@ -2425,10 +2772,9 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     char rel[512]; modname_to_path(name,rel,sizeof rel);
     char *src;
     if(*g_scriptdir && (src=try_dir(g_scriptdir,rel,len,found,fcap))) return src;
-    /* fallback: also try CWD in case scriptdir is empty or relative */
+/* fallback: also try CWD in case scriptdir is empty or relative */
     if((src=try_dir(".",rel,len,found,fcap))) return src;
-    /* local bundle first: ./luc_modules shadows the installed LUC_PATH so a
-       refreshed copy next to the project is always the one that loads */
+/* local bundle first: ./luc_modules shadows the installed LUC_PATH so a refreshed copy next to the project is always the one that loads */
     if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
     const char *lp=getenv("LUC_PATH");
     if(lp){
@@ -2449,7 +2795,33 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     return NULL;
 }
 
-/* ======== library registration ======== */
+/* system libraries load only from the luc install bundle: ./luc_modules and
+   the LUC_PATH dirs.  The script dir and cwd are skipped on purpose so a
+   user's own module (say their own ai.luc) can never shadow a system lib. */
+char *find_system_module(const char *name,int *len,char *found,size_t fcap){
+    char rel[512]; modname_to_path(name,rel,sizeof rel);
+    char *src;
+    if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
+    const char *lp=getenv("LUC_PATH");
+    if(lp){
+#if defined(_WIN32)
+        const char sepc=';';
+#else
+        const char sepc=':';
+#endif
+        char dir[512]; const char *p=lp;
+        while(*p){
+            const char *q=strchr(p,sepc); if(!q) q=p+strlen(p);
+            size_t n=(size_t)(q-p); if(n>=sizeof dir) n=sizeof dir-1;
+            memcpy(dir,p,n); dir[n]=0;
+            if(n && (src=try_dir(dir,rel,len,found,fcap))) return src;
+            p = *q? q+1 : q;
+        }
+    }
+    return NULL;
+}
+
+/* library registration */
 
 void reg(Table *t,const char *name,CFn fn){
     tab_set(t,cstrv(name),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
@@ -2470,9 +2842,18 @@ static void luc_openlibs(void){
     lucL_open_io();
     lucL_open_buffer();
     lucL_open_coro();
+/* core-level additions on top of the libs */
+    V.listcore=tab_new(0);
+    reg(V.listcore,"remove",f_core_remove);       /* by value, returns bool */
+    V.tabmeta=tab_new(0);
+    reg(V.tabmeta,"keys",f_dict_keys);
+    reg(V.tabmeta,"values",f_dict_values);
+    tab_set(V.globals,cstrv("len"),mkobj(LT_CFUNC,cfunc_new(f_core_len,"len",0)));
+    tab_set(V.globals,cstrv("pairs"), mkobj(LT_CFUNC,cfunc_new(f_lua_trap,"pairs",0)));
+    tab_set(V.globals,cstrv("ipairs"),mkobj(LT_CFUNC,cfunc_new(f_lua_trap,"ipairs",0)));
 }
 
-/* ======== init + driver ======== */
+/* init + driver */
 
 static void luc_init(void){
     memset(&V,0,sizeof V);
@@ -2528,32 +2909,439 @@ static char *read_file(const char *path,int *outlen){
     return b;
 }
 
+/* package installer (luc install) */
+
+/* Packages live in the LUC GitHub repo itself, so no release step is needed: raw file downloads from the main branch. Override with the LUC_INSTALL_URL env var for mirrors/tests. */
+#define LUC_REPO_URL "https://raw.githubusercontent.com/hsusulist/luc/main"
+
+typedef struct { const char *name; const char *desc; } PkgInfo;
+static const PkgInfo PKGS[]={
+    {"window","SDL2 window support (2D graphics, PNG/JPG sprites, TTF text, WAV/OGG/MP3 sound)"},
+    {"ai",    "lanternl AI library - import ai (tensor, nn, tokenizer)"},
+};
+
+static const char *pkg_base_url(void){
+    const char *e=getenv("LUC_INSTALL_URL");
+    return (e && *e)? e : LUC_REPO_URL;
+}
+
+static void pkg_join_url(char *out,size_t cap,const char *rel){
+    const char *b=pkg_base_url();
+    size_t bl=strlen(b);
+    if(bl && b[bl-1]=='/') snprintf(out,cap,"%s%s",b,rel);
+    else                  snprintf(out,cap,"%s/%s",b,rel);
+}
+
+static int pkg_file_exists(const char *p){
+    FILE *f=fopen(p,"rb");
+    if(f) fclose(f);
+    return f!=NULL;
+}
+
+static int pkg_mkdir(const char *path){
+#if defined(_WIN32)
+    if(CreateDirectoryA(path,NULL)) return 0;
+    return GetLastError()==ERROR_ALREADY_EXISTS? 0 : -1;
+#else
+    return mkdir(path,0777);      /* EEXIST is fine too */
+#endif
+}
+
+/* install root: the folder the luc binary itself lives in */
+static int pkg_exe_dir(char *out,size_t cap){
+#if defined(_WIN32)
+    DWORD n=GetModuleFileNameA(NULL,out,(DWORD)cap);
+    if(n==0||n>=cap) return 0;
+#else
+    ssize_t n=readlink("/proc/self/exe",out,cap-1);
+    if(n<=0){
+        if(!*g_exepath) return 0;
+        snprintf(out,cap,"%s",g_exepath);
+    } else out[n]=0;
+#endif
+    char *p=strrchr(out,'/');
+    char *q=strrchr(out,'\\');
+    if(q && q>p) p=q;
+    if(!p){ snprintf(out,cap,"."); return 1; }
+    *p=0;
+    return 1;
+}
+
+static void pkg_fmt_size(long bytes,char *out,size_t cap){
+    if(bytes>=1024*1024) snprintf(out,cap,"%.1f MB",(double)bytes/(1024.0*1024.0));
+    else if(bytes>=1024) snprintf(out,cap,"%.1f KB",(double)bytes/1024.0);
+    else snprintf(out,cap,"%ld B",bytes);
+}
+
+#if defined(_WIN32)
+
+/* GET url -> outpath via WinHTTP (system TLS, follows redirects). */
+static int pkg_http_get(const char *url,const char *outpath,long *outsize){
+    const char *p=url;
+    int secure=1;
+    if(!strncmp(p,"https://",8)){ secure=1; p+=8; }
+    else if(!strncmp(p,"http://",7)){ secure=0; p+=7; }
+    else return 0;
+    char host[256]; const char *slash=strchr(p,'/');
+    if(slash){
+        if((size_t)(slash-p)>=sizeof host) return 0;
+        memcpy(host,p,slash-p); host[slash-p]=0;
+    } else { snprintf(host,sizeof host,"%s",p); slash="/"; }
+    wchar_t whost[256], wpath[1024];
+    if(!MultiByteToWideChar(CP_UTF8,0,host,-1,whost,256)) return 0;
+    if(!MultiByteToWideChar(CP_UTF8,0,slash,-1,wpath,1024)) return 0;
+    int ok=0;
+    HINTERNET hs=WinHttpOpen(L"luc-install",WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                             WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+    if(!hs) return 0;
+    WinHttpSetTimeouts(hs,10000,10000,10000,60000);
+    HINTERNET hc=WinHttpConnect(hs,whost,secure?INTERNET_DEFAULT_HTTPS_PORT:INTERNET_DEFAULT_HTTP_PORT,0);
+    if(hc){
+        HINTERNET hr=WinHttpOpenRequest(hc,L"GET",wpath,NULL,WINHTTP_NO_REFERER,
+                                        WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                        secure?WINHTTP_FLAG_SECURE:0);
+        if(hr){
+            DWORD pol=WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+            WinHttpSetOption(hr,WINHTTP_OPTION_REDIRECT_POLICY,&pol,sizeof pol);
+            if(WinHttpSendRequest(hr,WINHTTP_NO_ADDITIONAL_HEADERS,0,
+                                  WINHTTP_NO_REQUEST_DATA,0,0,0) &&
+               WinHttpReceiveResponse(hr,NULL)){
+                DWORD status=0, dsz=sizeof status;
+                WinHttpQueryHeaders(hr,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX,&status,&dsz,
+                                    WINHTTP_NO_HEADER_INDEX);
+                if(status==200){
+                    FILE *f=fopen(outpath,"wb");
+                    if(f){
+                        ok=1;
+                        for(;;){
+                            DWORD avail=0, rd=0;
+                            if(!WinHttpQueryDataAvailable(hr,&avail)||!avail) break;
+                            char *buf=(char*)malloc(avail);
+                            if(!buf){ ok=0; break; }
+                            if(WinHttpReadData(hr,buf,avail,&rd)&&rd){
+                                if(fwrite(buf,1,rd,f)!=rd){ ok=0; free(buf); break; }
+                                if(outsize) *outsize+=rd;
+                            }
+                            free(buf);
+                            if(!rd) break;
+                        }
+                        fclose(f);
+                        if(!ok) remove(outpath);
+                    }
+                }
+            }
+            WinHttpCloseHandle(hr);
+        }
+        WinHttpCloseHandle(hc);
+    }
+    WinHttpCloseHandle(hs);
+    return ok;
+}
+
+#else
+
+/* POSIX: curl is near-universal and handles TLS + redirects for us */
+static int pkg_http_get(const char *url,const char *outpath,long *outsize){
+    char cmd[1600];
+    snprintf(cmd,sizeof cmd,"curl -fL --connect-timeout 10 -s -o '%s' '%s'",outpath,url);
+    if(system(cmd)!=0){ remove(outpath); return 0; }
+    if(outsize){
+        FILE *f=fopen(outpath,"rb");
+        if(f){ fseek(f,0,SEEK_END); *outsize=ftell(f); fclose(f); }
+    }
+    return 1;
+}
+
+#endif
+
+static int pkg_has_pe_magic(const char *path){
+    FILE *f=fopen(path,"rb");
+    if(!f) return 0;
+    int ok=fgetc(f)=='M' && fgetc(f)=='Z';
+    fclose(f);
+    return ok;
+}
+
+static void pkg_install_path(char *out,size_t cap,const char *sub){
+    char dir[1024];
+    if(!pkg_exe_dir(dir,sizeof dir)) snprintf(dir,sizeof dir,".");
+    snprintf(out,cap,"%s/%s",dir,sub);
+}
+
+/* Swap a freshly downloaded tmp file into its final place. On Windows a running exe cannot be overwritten, so the old one is renamed to .old first (allowed while running) and swept away on the next run. */
+static int pkg_put_file(const char *tmp,const char *dest){
+#if defined(_WIN32)
+    if(!MoveFileExA(tmp,dest,MOVEFILE_REPLACE_EXISTING)) return 0;
+    return 1;
+#else
+    return rename(tmp,dest)==0;
+#endif
+}
+
+static int pkg_install_window(int force){
+    char dll[1200],dlltmp[1250],newexe[1250],exetmp[1300],oldexe[1250],url[1200];
+    char pd[1200],pdll[1250],pexe[1250];
+    long sz=0;
+    int offline;
+    pkg_install_path(dll,sizeof dll,"SDL2.dll");
+    if(!force && pkg_file_exists(dll)){
+        printf("window support is already installed (%s).\n",dll);
+        printf("use 'luc install window --force' to download it again.\n");
+        return 0;
+    }
+    snprintf(dlltmp,sizeof dlltmp,"%s.tmp",dll);
+    pkg_install_path(newexe,sizeof newexe,"luc-new.exe");
+    snprintf(exetmp,sizeof exetmp,"%s.tmp",newexe);
+    pkg_install_path(oldexe,sizeof oldexe,"luc.exe.old");
+    remove(oldexe);                       /* sweep stale backup */
+
+    /* the installer ships packages/window next to luc.exe: try it first */
+    pkg_install_path(pd,sizeof pd,"packages/window");
+    snprintf(pdll,sizeof pdll,"%s/SDL2.dll",pd);
+    snprintf(pexe,sizeof pexe,"%s/luc-win.exe",pd);
+    offline=!force && pkg_file_exists(pdll) && pkg_file_exists(pexe);
+    if(offline){
+        printf("using bundled package: %s\n",pd);
+        snprintf(dlltmp,sizeof dlltmp,"%s",pdll);
+        snprintf(exetmp,sizeof exetmp,"%s",pexe);
+    } else {
+        pkg_join_url(url,sizeof url,"dist/app/SDL2.dll");
+        printf("downloading %s\n",url);
+        if(!pkg_http_get(url,dlltmp,&sz)||!pkg_has_pe_magic(dlltmp)){
+            fprintf(stderr,"luc install: download failed for SDL2.dll\n");
+            remove(dlltmp); return 1;
+        }
+        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
+        printf("  SDL2.dll  %s\n",hs);
+
+        pkg_join_url(url,sizeof url,"dist/app/luc-win.exe");
+        printf("downloading %s\n",url);
+        sz=0;
+        if(!pkg_http_get(url,exetmp,&sz)||!pkg_has_pe_magic(exetmp)){
+            fprintf(stderr,"luc install: download failed for luc-win.exe\n");
+            remove(exetmp); remove(dlltmp); return 1;
+        }
+        pkg_fmt_size(sz,hs,sizeof hs);
+        printf("  luc-win.exe  %s\n",hs);
+    }
+
+    if(!pkg_put_file(dlltmp,dll)){
+        fprintf(stderr,"luc install: cannot replace SDL2.dll (close other LUC programs)\n");
+        if(!offline){ remove(dlltmp); remove(exetmp); }
+        return 1;
+    }
+    char exe[1200]; pkg_install_path(exe,sizeof exe,"luc.exe");
+    int moved_old=0;
+    if(pkg_file_exists(exe)){
+#if defined(_WIN32)
+        moved_old=MoveFileExA(exe,oldexe,MOVEFILE_REPLACE_EXISTING)? 1:0;
+#else
+        remove(oldexe);
+        moved_old=(rename(exe,oldexe)==0);
+#endif
+    }
+    if(!pkg_put_file(exetmp,exe)){
+        fprintf(stderr,"luc install: cannot replace luc.exe (close other LUC programs)\n");
+        if(!offline) remove(exetmp);
+        return 1;
+    }
+    /* satellite media files: TTF/image/mixer DLLs + deps + default font.
+       Missing ones only degrade features (bitmap font, BMP-only, no sound),
+       so failures here warn instead of aborting. */
+    { static const char *extra[]={
+        "SDL2_ttf.dll","SDL2_image.dll","SDL2_mixer.dll",
+        "libfreetype-6.dll","libharfbuzz-0.dll","libbz2-1.dll",
+        "libpng16-16.dll","zlib1.dll","libbrotlidec.dll","libbrotlicommon.dll",
+        "libgraphite2.dll","libglib-2.0-0.dll","libintl-8.dll","libpcre2-8-0.dll",
+        "libiconv-2.dll","libjpeg-8.dll","libmpg123-0.dll","libogg-0.dll",
+        "libopus-0.dll","libopusfile-0.dll","libvorbis-0.dll","libvorbisfile-3.dll",
+        "libFLAC.dll","libgcc_s_seh-1.dll","libstdc++-6.dll","libwinpthread-1.dll",
+        "DejaVuSans.ttf",NULL
+    };
+      char dest[1200],src[1300],u[1200]; long s2=0;
+      char exedir[1200];
+      if(!pkg_exe_dir(exedir,sizeof exedir)) snprintf(exedir,sizeof exedir,".");
+      for(int k=0;extra[k];k++){
+        snprintf(dest,sizeof dest,"%s/%s",exedir,extra[k]);
+        if(!force && pkg_file_exists(dest)) continue;
+        snprintf(src,sizeof src,"%s/%s",pd,extra[k]);
+        if(offline && pkg_file_exists(src)){
+            if(!pkg_put_file(src,dest))
+                printf("luc install: warning: cannot install %s (file in use?)\n",extra[k]);
+            else printf("  %s\n",extra[k]);
+        } else if(!offline){
+            pkg_join_url(u,sizeof u,"dist/app/");
+            strncat(u,extra[k],sizeof u-strlen(u)-1);
+            printf("downloading %s\n",u);
+            s2=0;
+            snprintf(src,sizeof src,"%s.tmp",dest);
+            if(!pkg_http_get(u,src,&s2)){ remove(src);
+                printf("luc install: warning: download failed for %s (skipped)\n",extra[k]);
+                continue; }
+            if(!pkg_put_file(src,dest)){
+                printf("luc install: warning: cannot install %s (file in use?)\n",extra[k]);
+                remove(src); continue;
+            }
+            { char hs[32]; pkg_fmt_size(s2,hs,sizeof hs); printf("  %s  %s\n",extra[k],hs); }
+        }
+      } }
+    printf("installed window support.\n");
+    if(moved_old) printf("note: the old interpreter is kept as luc.exe.old (safe to delete).\n");
+    printf("try: luc demos/pong.luc\n");
+    return 0;
+}
+
+/* Unpack a text bundle: lines '#=lucfile: <name>' switch output files, '#=lucpkg:..' starts it, '#=endpkg' closes it. CRLF is normalized. */
+static int pkg_unpack_bundle(const char *path,const char *outdir){
+    int len; char *src=read_file(path,&len);
+    if(!src) return -1;
+    FILE *cur=NULL;
+    int count=0;
+    size_t i=0;
+    while(i<(size_t)len){
+        char *line=src+i;
+        char *nl=(char*)memchr(line,'\n',(size_t)len-i);
+        size_t ll=nl? (size_t)(nl-line) : (size_t)len-i;
+        size_t wl=ll;                          /* write length w/o CR */
+        if(wl>0 && line[wl-1]=='\r') wl--;
+        if(wl>=11 && !strncmp(line,"#=lucfile: ",11)){
+            if(cur){ fclose(cur); cur=NULL; }
+            char name[256];
+            size_t n2=wl-11;
+            if(n2>=sizeof name) n2=sizeof name-1;
+            memcpy(name,line+11,n2); name[n2]=0;
+            char out[1400];
+            snprintf(out,sizeof out,"%s/%s",outdir,name);
+            cur=fopen(out,"wb");
+            if(cur) count++;
+        } else if(wl>=8 && !strncmp(line,"#=endpkg",8)){
+            if(cur){ fclose(cur); cur=NULL; }
+        } else if(wl>=9 && !strncmp(line,"#=lucpkg:",9)){
+/* header, ignore */
+        } else if(cur){
+            fwrite(line,1,wl,cur);
+            fputc('\n',cur);
+        }
+        i+=ll+(nl?1:0);
+    }
+    if(cur) fclose(cur);
+    free(src);
+    return count;
+}
+
+static int pkg_install_ai(void){
+    char mods[1200],tmp[1300],url[1200],pkg[1300];
+    long sz=0;
+    int offline;
+    pkg_install_path(mods,sizeof mods,"luc_modules");
+    pkg_mkdir(mods);
+    /* the installer ships packages/ai.lucpkg next to luc.exe: try it first */
+    pkg_install_path(pkg,sizeof pkg,"packages/ai.lucpkg");
+    offline=pkg_file_exists(pkg);
+    if(offline){
+        printf("using bundled package: %s\n",pkg);
+        snprintf(tmp,sizeof tmp,"%s",pkg);
+    } else {
+        snprintf(tmp,sizeof tmp,"%s/ai.lucpkg.tmp",mods);
+        pkg_join_url(url,sizeof url,"packages/ai.lucpkg");
+        printf("downloading %s\n",url);
+        if(!pkg_http_get(url,tmp,&sz)){
+            fprintf(stderr,"luc install: download failed (no internet, and no\n");
+            fprintf(stderr,"  packages/ai.lucpkg folder next to luc.exe)\n");
+            remove(tmp); return 1;
+        }
+        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
+        printf("  ai.lucpkg  %s\n",hs);
+    }
+    int n=pkg_unpack_bundle(tmp,mods);
+    if(!offline) remove(tmp);
+    if(n<=0){
+        fprintf(stderr,"luc install: package file is empty or invalid\n");
+        return 1;
+    }
+    printf("installed %d modules -> %s\n",n,mods);
+    printf("try: luc -e \"import ai print(ai.Tensor)\"\n");
+    return 0;
+}
+
+static int cmd_install(int argc,char **argv){
+    if(argc<3){
+        char dir[1024];
+        int have=pkg_exe_dir(dir,sizeof dir);
+        printf("LUC package installer  (source: %s)\n",pkg_base_url());
+        printf("  the bundled packages folder (from the installer) is used first\n");
+        for(size_t k=0;k<sizeof PKGS/sizeof PKGS[0];k++){
+            char p[1200];
+            int inst=0;
+            if(have){
+                if(!strcmp(PKGS[k].name,"window")) snprintf(p,sizeof p,"%s/SDL2.dll",dir);
+                else snprintf(p,sizeof p,"%s/luc_modules/ai.luc",dir);
+                inst=pkg_file_exists(p);
+            }
+            printf("  %-8s %-58s [%s]\n",PKGS[k].name,PKGS[k].desc,inst?"installed":"not installed");
+        }
+        printf("\nusage: luc install <name>            install a package (window, ai)\n");
+        printf("       luc install window --force    redownload window support\n");
+        return 0;
+    }
+    const char *name=argv[2];
+    int force=(argc>3 && (!strcmp(argv[3],"--force")||!strcmp(argv[3],"-f")));
+    if(!strcmp(name,"window")) return pkg_install_window(force);
+    if(!strcmp(name,"ai"))     return pkg_install_ai();
+    fprintf(stderr,"luc install: unknown package '%s' (available: window, ai)\n",name);
+    return 1;
+}
+
 static void print_help(void){
     printf(
-    "%s  --  the LUC programming language\n\n"
+    "LUC %s\n\n"
     "usage: luc [options] [script [args...]]\n\n"
-    "  script.luc        run a LUC source file\n"
-    "  -e \"chunk\"        execute a chunk of LUC code given on the command line\n"
-    "  -v, --version     print version information and exit\n"
-    "  -h, --help        print this help and exit\n\n"
-    "LUC is an independent, register-based language implemented in C99.\n"
-    "Pipeline: lexer -> parser -> AST -> bytecode compiler -> VM (mark & sweep GC).\n"
-    "Syntax follows Lua 5.1 (all 21 keywords) plus LUC additions:\n"
-    "  import <name>       - load built-in or third-party modules (ai, json, ...)\n"
-    "  setmetatable/metatable-lite: __index, __call, __add..__pow, __unm, __tostring\n"
-    "  [1,2,3] list literals with :append/:pop/:insert/:remove/:len/:contains\n"
-    "  the 'in' membership operator, optional type annotations (x: number)\n"
-    "  string.split/trim/startswith/endswith/tohex/fromhex\n"
-    "  io.replace/clearline/eraseline/clear for terminal output control\n"
-    "  task.*, buffer.* (incl. hex helpers), bit32.*\n"
-    "  require(\"window\") for SDL2 graphics (build with -DLUC_WINDOW)\n",
+    "  script.luc          run a LUC source file\n"
+    "  -e \"chunk\"          execute LUC code from the command line\n"
+    "  install [pkg]       list or install a package  (window, ai)\n"
+    "  -v, --version       print version and exit\n"
+    "  -h, --help          print this help and exit\n\n"
+    "variables\n"
+    "  create x = 10       local variable\n"
+    "  x = 10              global variable\n"
+    "  create function f() local function\n\n"
+    "types\n"
+    "  [1, 2, 3]           list  (0-based)\n"
+    "  {key: value}        dict\n"
+    "  \"text\" + num        string join\n"
+    "  true  false  nil\n\n"
+    "repeat\n"
+    "  repeat 5 do                        5 times, i = 0..4\n"
+    "  repeat 1, 10 as i do               i = 0..9  (stops before 10)\n"
+    "  repeat 3, 10 as i do               i = 0, 3, 6, 9\n"
+    "  repeat -1, 10 as i do              i = 10..0  (countdown)\n"
+    "  repeat item, i in list do          iterate list\n"
+    "  repeat k, v in dict do             iterate dict\n\n"
+    "operators\n"
+    "  == != < <= > >=     comparison\n"
+    "  += -= *= /=         compound assignment\n"
+    "  in  not in          membership\n"
+    "  and  or  not        logic\n\n"
+    "builtins\n"
+    "  list.append / remove / sort\n"
+    "  dict.keys() / values()\n"
+    "  list[1:3]           slicing\n"
+    "  tostring()  tonumber()  len()\n"
+    "  string.split / trim / startswith / endswith / tohex / fromhex\n"
+    "  io.replace / clearline / eraseline / clear\n"
+    "  task.*   buffer.*   bit32.*\n\n"
+    "modules\n"
+    "  import window       system library (SDL2 graphics, build with -DLUC_WINDOW)\n"
+    "  import window(\"w\")  same, bound to short name\n"
+    "  require(\"name\")     third-party module from disk\n\n"
+    "internals\n"
+    "  lexer -> parser -> AST -> bytecode -> VM  (mark & sweep GC)\n"
+    "  metatable-lite: __index __call __add..__pow __unm __tostring\n",
     LUC_VERSION);
 }
 
-/* -mwindows builds are GUI-subsystem: cmd does not attach stdout/stderr,
-   so print()/errors are invisible when run from a terminal. Re-attach to
-   the parent console if we have no standard handles (GUI subsystem run
-   from cmd/PowerShell). Double-clicked from Explorer: stay silent. */
+/* mwindows builds are GUI-subsystem: cmd does not attach stdout/stderr, so print()/errors are invisible when run from a terminal. Re-attach to the parent console if we have no standard handles (GUI subsystem run from cmd/PowerShell). Double-clicked from Explorer: stay silent. */
 #if defined(_WIN32)
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004u
@@ -2600,11 +3388,13 @@ int main(int argc,char **argv){
         if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
         return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);
     }
+    if(strcmp(argv[1],"install")==0)
+        return cmd_install(argc,argv);
 
     int len=0;
     char *src=read_file(argv[1],&len);
     if(!src){ fprintf(stderr,"luc: cannot open '%s'\n",argv[1]); return 1; }
-    /* allow a #! line at the start of a script */
+/* allow a #! line at the start of a script */
     int off=0;
     if(len>1 && src[0]=='#'){ while(off<len && src[off]!='\n') off++; }
     set_scriptdir(argv[1]);

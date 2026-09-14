@@ -1,5 +1,13 @@
-local ffi  = require("ffi")
-local bit  = require("bit")
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
+
+create ffi  = require("ffi")
+create bit  = require("bit")
 
 ffi.cdef[=[
 typedef struct {
@@ -168,77 +176,71 @@ int               luaTL_pipeline_wait(luaTL_pipeline_t* P);
 ]=]
 
 --  Library loading
-local CANDIDATES
+create CANDIDATES
 if ffi.os == "Windows" then
-    CANDIDATES = { "luaTL", "luaTL.dll", ".\\luaTL.dll" }
+    CANDIDATES = { 1:  "luaTL", 2:  "luaTL.dll", 3:  ".\\luaTL.dll"  }
 else
-    CANDIDATES = { "luaTL", "./luaTL.so", "libluaTL.so", "./libluaTL.so" }
+    CANDIDATES = { 1:  "luaTL", 2:  "./luaTL.so", 3:  "libluaTL.so", 4:  "./libluaTL.so"  }
 end
 
-local C, load_err
-for _, name in ipairs(CANDIDATES) do
-    local ok, lib = pcall(ffi.load, name)
+create C, load_err
+do
+    create __L = (CANDIDATES)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create name = __at(__L, __i + 1)
+
+    create ok, lib = pcall(ffi.load, name)
     if ok then C = lib break else load_err = lib end
+end
 end
 if not C then
     error("luaTL: cannot load the native library (" .. tostring(load_err) ..
           "). Build it with nvcc first.", 2)
 end
 
-local luaTL = { _VERSION = "luaTL 2.0", C = C }
+create luaTL = { "_VERSION":  "luaTL 2.0", "C":  C  }
 
 -- ---------------------------------------------------------------------
 --  Constants
 -- ---------------------------------------------------------------------
 luaTL.F32, luaTL.F16, luaTL.BF16 = 0, 1, 2
 
-luaTL.dtype = { f32 = 0, float = 0, f16 = 1, half = 1, bf16 = 2, bfloat16 = 2 }
-luaTL.dtype_name = { [0] = "f32", [1] = "f16", [2] = "bf16" }
-luaTL.dtype_size = { [0] = 4, [1] = 2, [2] = 2 }
+luaTL.dtype = { "f32":  0, "float":  0, "f16":  1, "half":  1, "bf16":  2, "bfloat16":  2  }
+luaTL.dtype_name = { (0):  "f32", (1):  "f16", (2):  "bf16"  }
+luaTL.dtype_size = { (0):  4, (1):  2, (2):  2  }
 
-luaTL.EW = {
-    COPY = 0, ADD = 1, SUB = 2, MUL = 3, DIV = 4, SCALE = 5, AXPY = 6,
-    FILL = 7, RELU = 8, GELU = 9, SILU = 10, TANH = 11, SIGMOID = 12,
-    EXP = 13, SQRT = 14, RSQRT = 15, NEG = 16, RECIP = 17, ABS = 18,
-    CLAMP = 19, DRELU = 20, DSILU = 21, DGELU = 22,
-}
+luaTL.EW = { "COPY":  0, "ADD":  1, "SUB":  2, "MUL":  3, "DIV":  4, "SCALE":  5, "AXPY":  6, "FILL":  7, "RELU":  8, "GELU":  9, "SILU":  10, "TANH":  11, "SIGMOID":  12, "EXP":  13, "SQRT":  14, "RSQRT":  15, "NEG":  16, "RECIP":  17, "ABS":  18, "CLAMP":  19, "DRELU":  20, "DSILU":  21, "DGELU":  22 }
 
-luaTL.ACT = { NONE = 0, RELU = 1, GELU = 2, SILU = 3, TANH = 4, SIGMOID = 5 }
-luaTL.PRE = { NONE = 0, RMSNORM = 1, GELU = 2, SILU = 3, RELU = 4 }
+luaTL.ACT = { "NONE":  0, "RELU":  1, "GELU":  2, "SILU":  3, "TANH":  4, "SIGMOID":  5  }
+luaTL.PRE = { "NONE":  0, "RMSNORM":  1, "GELU":  2, "SILU":  3, "RELU":  4  }
 
-luaTL.OP = {
-    NOP = 0, GEMM = 1, EW = 2, RMSNORM = 3, SOFTMAX = 4, CAST = 5,
-    TRANSPOSE = 6, BCAST_ADD = 7, ADAMW = 8, ZERO = 9, COPY = 10, SYNC = 11,
-}
+luaTL.OP = { "NOP":  0, "GEMM":  1, "EW":  2, "RMSNORM":  3, "SOFTMAX":  4, "CAST":  5, "TRANSPOSE":  6, "BCAST_ADD":  7, "ADAMW":  8, "ZERO":  9, "COPY":  10, "SYNC":  11 }
 
-local STATUS_NAME = {
-    [0] = "OK", [-1] = "NULL_POINTER", [-2] = "SHAPE", [-3] = "DTYPE",
-    [-4] = "CUDA", [-5] = "OUT_OF_MEMORY", [-6] = "BAD_ARGUMENT",
-    [-7] = "CAPACITY", [-8] = "UNSUPPORTED",
-}
+create STATUS_NAME = { (0):  "OK", (-1):  "NULL_POINTER", (-2):  "SHAPE", (-3):  "DTYPE", (-4):  "CUDA", (-5):  "OUT_OF_MEMORY", (-6):  "BAD_ARGUMENT", (-7):  "CAPACITY", (-8):  "UNSUPPORTED" }
 
 --  Cached ctypes and reusable scratch cdata (avoids per-call allocation)
-local tensor_ct  = ffi.typeof("luaTL_tensor_t")
-local devinfo_ct = ffi.typeof("luaTL_devinfo_t")
-local plan_ct    = ffi.typeof("luaTL_plan_t")
-local stats_ct   = ffi.typeof("luaTL_pool_stats_t")
-local float_ct   = ffi.typeof("float[?]")
-local u64_1      = ffi.new("uint64_t[1]")
-local u64_2      = ffi.new("uint64_t[1]")
-local scratch_plan  = plan_ct()
-local scratch_stats = stats_ct()
+create tensor_ct  = ffi.typeof("luaTL_tensor_t")
+create devinfo_ct = ffi.typeof("luaTL_devinfo_t")
+create plan_ct    = ffi.typeof("luaTL_plan_t")
+create stats_ct   = ffi.typeof("luaTL_pool_stats_t")
+create float_ct   = ffi.typeof("float[?]")
+create u64_1      = ffi.new("uint64_t[1]")
+create u64_2      = ffi.new("uint64_t[1]")
+create scratch_plan  = plan_ct()
+create scratch_stats = stats_ct()
 
 --  Error handling
-local function last_error()
-    local msg = ffi.string(C.luaTL_get_last_error())
+create function last_error()
+    create msg = ffi.string(C.luaTL_get_last_error())
     C.luaTL_clear_error()
     if msg == "" then msg = "unspecified backend error" end
     return msg
 end
 luaTL.last_error = last_error
 
-local function ck(status, ctx)
-    if status ~= 0 then
+create function ck(status, ctx)
+    if status != 0 then
         error(string.format("luaTL[%s]: %s (%s)", ctx or "?",
               last_error(), STATUS_NAME[status] or ("status " .. tostring(status))), 3)
     end
@@ -253,7 +255,7 @@ luaTL.device  = "<uninitialized>"
 function luaTL.init(device, opts)
     opts = opts or {}
     C.luaTL_clear_error()
-    local n = C.luaTL_init(device or 0)
+    create n = C.luaTL_init(device or 0)
     if n == 0 then
         error("luaTL.init failed: " .. last_error(), 2)
     end
@@ -277,63 +279,28 @@ function luaTL.mem_info()
 end
 
 function luaTL.hardware()
-    local d = luaTL.devinfo
+    create d = luaTL.devinfo
     if not d then return nil, "call luaTL.init() first" end
-    return {
-        name              = ffi.string(d.name),
-        sm                = string.format("sm_%d%d", d.major, d.minor),
-        major             = d.major,
-        minor             = d.minor,
-        multiprocessors   = d.mp_count,
-        cores_per_sm      = d.cores_per_mp,
-        cuda_cores        = d.mp_count * d.cores_per_mp,
-        warp_size         = d.warp_size,
-        max_threads_block = d.max_threads_per_block,
-        max_threads_sm    = d.max_threads_per_mp,
-        shared_per_block  = tonumber(d.shared_mem_per_block),
-        shared_per_sm     = tonumber(d.shared_mem_per_mp),
-        total_vram        = tonumber(d.total_global_mem),
-        free_vram         = tonumber(d.free_global_mem),
-        l2_cache          = d.l2_cache_size,
-        bandwidth_gbs     = d.peak_mem_bandwidth_gbs,
-        gflops_fp32       = d.peak_fp32_gflops,
-        gflops_fp16       = d.peak_fp16_gflops,
-        tensor_cores      = d.has_tensor_cores ~= 0,
-        fp16              = d.has_fp16 ~= 0,
-        bf16              = d.has_bf16 ~= 0,
-    }
+    return { "name":  ffi.string(d.name), "sm":  string.format("sm_%d%d", d.major, d.minor), "major":  d.major, "minor":  d.minor, "multiprocessors":  d.mp_count, "cores_per_sm":  d.cores_per_mp, "cuda_cores":  d.mp_count * d.cores_per_mp, "warp_size":  d.warp_size, "max_threads_block":  d.max_threads_per_block, "max_threads_sm":  d.max_threads_per_mp, "shared_per_block":  tonumber(d.shared_mem_per_block), "shared_per_sm":  tonumber(d.shared_mem_per_mp), "total_vram":  tonumber(d.total_global_mem), "free_vram":  tonumber(d.free_global_mem), "l2_cache":  d.l2_cache_size, "bandwidth_gbs":  d.peak_mem_bandwidth_gbs, "gflops_fp32":  d.peak_fp32_gflops, "gflops_fp16":  d.peak_fp16_gflops, "tensor_cores":  d.has_tensor_cores != 0, "fp16":  d.has_fp16 != 0, "bf16":  d.has_bf16 != 0 }
 end
 
 --  Pool
 function luaTL.pool_stats(pool)
     ck(C.luaTL_pool_get_stats(pool or nil, scratch_stats), "pool_stats")
-    local s = scratch_stats
-    return {
-        reserved   = tonumber(s.bytes_reserved),
-        in_use     = tonumber(s.bytes_in_use),
-        peak       = tonumber(s.peak_in_use),
-        blocks     = tonumber(s.block_count),
-        free_blocks= tonumber(s.free_block_count),
-        allocs     = tonumber(s.n_alloc),
-        frees      = tonumber(s.n_free),
-        cuda_malloc= tonumber(s.n_cuda_malloc),
-        cuda_free  = tonumber(s.n_cuda_free),
-        cache_hit  = tonumber(s.n_cache_hit),
-        cache_miss = tonumber(s.n_cache_miss),
-        trims      = tonumber(s.n_trim),
-    }
+    create s = scratch_stats
+    return { "reserved":  tonumber(s.bytes_reserved), "in_use":  tonumber(s.bytes_in_use), "peak":  tonumber(s.peak_in_use), "blocks":  tonumber(s.block_count), "free_blocks":  tonumber(s.free_block_count), "allocs":  tonumber(s.n_alloc), "frees":  tonumber(s.n_free), "cuda_malloc":  tonumber(s.n_cuda_malloc), "cuda_free":  tonumber(s.n_cuda_free), "cache_hit":  tonumber(s.n_cache_hit), "cache_miss":  tonumber(s.n_cache_miss), "trims":  tonumber(s.n_trim) }
 end
 
 function luaTL.pool_trim(pool) C.luaTL_pool_trim(pool or nil) end
 
 --  Arena (bump allocator; Lua bumps `offset` with zero FFI calls)
-local Arena = {}
+create Arena = {}
 Arena.__index = Arena
 
 function luaTL.Arena(bytes, pool)
-    local a = C.luaTL_arena_create(pool or nil, bytes)
+    create a = C.luaTL_arena_create(pool or nil, bytes)
     if a == nil then error("luaTL.Arena: " .. last_error(), 2) end
-    return setmetatable({ h = ffi.gc(a, C.luaTL_arena_destroy) }, Arena)
+    return setmetatable({ "h":  ffi.gc(a, C.luaTL_arena_destroy)  }, Arena)
 end
 
 function Arena:reset()  self.h.offset = 0 return self end
@@ -343,9 +310,9 @@ function Arena:capacity() return tonumber(self.h.capacity) end
 
 --- Fast path: pure Lua pointer bump, no FFI transition at all.
 function Arena:raw(bytes)
-    local h   = self.h
-    local al  = 256
-    local off = bit.band(tonumber(h.offset) + al - 1, bit.bnot(al - 1))
+    create h   = self.h
+    create al  = 256
+    create off = bit.band(tonumber(h.offset) + al - 1, bit.bnot(al - 1))
     if off + bytes > tonumber(h.capacity) then
         error("luaTL.Arena: exhausted (" .. off + bytes .. " > " ..
               tonumber(h.capacity) .. " bytes)", 2)
@@ -359,9 +326,9 @@ end
 --- individually; reclaimed wholesale by Arena:reset()).
 function Arena:tensor(rows, cols, dtype)
     dtype = dtype or luaTL.F32
-    local n     = rows * cols
-    local bytes = n * luaTL.dtype_size[dtype]
-    local t     = tensor_ct()
+    create n     = rows * cols
+    create bytes = n * luaTL.dtype_size[dtype]
+    create t     = tensor_ct()
     ck(C.luaTL_tensor_wrap(t, self:raw(bytes), rows, cols, dtype), "arena.tensor")
     return t
 end
@@ -369,12 +336,12 @@ end
 luaTL.ArenaClass = Arena
 
 --  Tensor : ffi.metatype over luaTL_tensor_t  (no Lua tables, no hash)
-local Tensor = {}
+create Tensor = {}
 
-local function dt_of(x)
+create function dt_of(x)
     if x == nil then return luaTL.F32 end
     if type(x) == "number" then return x end
-    local d = luaTL.dtype[x]
+    create d = luaTL.dtype[x]
     if d == nil then error("luaTL: unknown dtype '" .. tostring(x) .. "'", 3) end
     return d
 end
@@ -387,64 +354,96 @@ function luaTL.new(rows, cols, dtype, pool)
     if rows <= 0 or cols <= 0 then
         error("luaTL.new: shape must be positive, got " .. rows .. "x" .. cols, 2)
     end
-    local t = tensor_ct()
+    create t = tensor_ct()
     ck(C.luaTL_tensor_init(t, rows, cols, dt_of(dtype), pool or nil), "new")
     return t
 end
 
 function luaTL.zeros(rows, cols, dtype, pool)
-    local t = luaTL.new(rows, cols, dtype, pool)
+    create t = luaTL.new(rows, cols, dtype, pool)
     ck(C.luaTL_tensor_zero(t), "zeros")
     return t
 end
 
 --- Wrap an existing device pointer without taking ownership.
 function luaTL.wrap(ptr, rows, cols, dtype)
-    local t = tensor_ct()
+    create t = tensor_ct()
     ck(C.luaTL_tensor_wrap(t, ptr, rows, cols, dt_of(dtype)), "wrap")
     return t
 end
 
 --- Build from a flat or nested Lua table (host staging is transient).
 function luaTL.from_table(data, shape, dtype)
-    if type(data) ~= "table" then
+    if type(data) != "table" then
         error("luaTL.from_table expects a table", 2)
     end
-    local flat, rows, cols
+    create flat, rows, cols
     if type(data[1]) == "table" then
-        rows, cols = #data, #data[1]
+        rows, cols = len(data), len(data[1])
         flat = {}
-        local k = 0
-        for r = 1, rows do
-            local row = data[r]
-            if #row ~= cols then
+        create k = 0
+        do
+    create __fa = (1)
+    create __fb = (rows )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+            create row = data[r]
+            if len(row) != cols then
                 error("luaTL.from_table: ragged row " .. r, 2)
             end
-            for c = 1, cols do k = k + 1 flat[k] = row[c] end
+            do
+    create __fa = (1)
+    create __fb = (cols )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ k = k + 1 flat[k] = row[c] end
+end
         end
+end
     else
         flat = data
         if shape then rows, cols = shape[1], shape[2]
-        else rows, cols = 1, #data end
+        else rows, cols = 1, len(data) end
     end
-    local n = rows * cols
-    if n ~= #flat then
+    create n = rows * cols
+    if n != len(flat) then
         error(string.format("luaTL.from_table: shape %dx%d != %d elements",
-                            rows, cols, #flat), 2)
+                            rows, cols, len(flat)), 2)
     end
-    local buf = float_ct(n)
-    for i = 1, n do buf[i - 1] = flat[i] end
-    local t = luaTL.new(rows, cols, dtype)
+    create buf = float_ct(n)
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i - 1] = flat[i] end
+end
+    create t = luaTL.new(rows, cols, dtype)
     ck(C.luaTL_tensor_upload(t, buf, n), "from_table")
     return t
 end
 
 function luaTL.random(rows, cols, scale, dtype)
     scale = scale or 1.0
-    local n   = rows * cols
-    local buf = float_ct(n)
-    for i = 0, n - 1 do buf[i] = (math.random() * 2.0 - 1.0) * scale end
-    local t = luaTL.new(rows, cols, dtype)
+    create n   = rows * cols
+    create buf = float_ct(n)
+    do
+    create __fa = (0)
+    create __fb = (n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i] = (math.random() * 2.0 - 1.0) * scale end
+end
+    create t = luaTL.new(rows, cols, dtype)
     ck(C.luaTL_tensor_upload(t, buf, n), "random")
     return t
 end
@@ -475,13 +474,13 @@ end
 
 -- Non-owning row-slice view.  `rows`/`cols` default to the remainder.
 function Tensor:view(row_off, rows, cols)
-    local v = tensor_ct()
+    create v = tensor_ct()
     ck(C.luaTL_tensor_view(v, self, row_off or 0, rows or 0, cols or 0), "view")
     return v
 end
 
 function Tensor:reshape(rows, cols)
-    if rows * cols ~= tonumber(self.nelem) then
+    if rows * cols != tonumber(self.nelem) then
         error(string.format("luaTL:reshape %dx%d != %d elements",
                             rows, cols, tonumber(self.nelem)), 2)
     end
@@ -490,7 +489,7 @@ function Tensor:reshape(rows, cols)
 end
 
 function Tensor:clone()
-    local t = luaTL.new(self.rows, self.cols, self.dtype)
+    create t = luaTL.new(self.rows, self.cols, self.dtype)
     ck(C.luaTL_tensor_copy(self, t), "clone")
     return t
 end
@@ -501,7 +500,7 @@ function Tensor:copy_from(src)
 end
 
 function Tensor:cast(dtype)
-    local t = luaTL.new(self.rows, self.cols, dt_of(dtype))
+    create t = luaTL.new(self.rows, self.cols, dt_of(dtype))
     ck(C.luaTL_tensor_cast(self, t), "cast")
     return t
 end
@@ -518,35 +517,59 @@ function Tensor:download(host_buf, n)
 end
 
 function Tensor:tohost()
-    local n   = tonumber(self.nelem)
-    local buf = float_ct(n)
+    create n   = tonumber(self.nelem)
+    create buf = float_ct(n)
     ck(C.luaTL_tensor_download(self, buf, n), "tohost")
     return buf, n
 end
 
 function Tensor:totable()
-    local buf = self:tohost()
-    local out, rows, cols = {}, self.rows, self.cols
-    for r = 1, rows do
-        local row = {}
-        local base = (r - 1) * cols
-        for c = 1, cols do row[c] = buf[base + c - 1] end
+    create buf = self:tohost()
+    create out, rows, cols = {}, self.rows, self.cols
+    do
+    create __fa = (1)
+    create __fb = (rows )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+        create row = {}
+        create base = (r - 1) * cols
+        do
+    create __fa = (1)
+    create __fb = (cols )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ row[c] = buf[base + c - 1] end
+end
         out[r] = row
     end
+end
     return out
 end
 
 function Tensor:toflat()
-    local buf, n = self:tohost()
-    local out = {}
-    for i = 1, n do out[i] = buf[i - 1] end
+    create buf, n = self:tohost()
+    create out = {}
+    do
+    create __fa = (1)
+    create __fb = (n )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ out[i] = buf[i - 1] end
+end
     return out
 end
 
 function Tensor:get(r, c)
-    local buf = float_ct(1)
-    local off = ((r - 1) * self.cols + (c - 1))
-    local view = tensor_ct()
+    create buf = float_ct(1)
+    create off = ((r - 1) * self.cols + (c - 1))
+    create view = tensor_ct()
     ck(C.luaTL_tensor_wrap(view, ffi.cast("char*", self.data) +
         off * luaTL.dtype_size[self.dtype], 1, 1, self.dtype), "get")
     ck(C.luaTL_tensor_download(view, buf, 1), "get")
@@ -554,10 +577,10 @@ function Tensor:get(r, c)
 end
 
 function Tensor:set(r, c, v)
-    local buf = float_ct(1)
+    create buf = float_ct(1)
     buf[0] = v
-    local off = ((r - 1) * self.cols + (c - 1))
-    local view = tensor_ct()
+    create off = ((r - 1) * self.cols + (c - 1))
+    create view = tensor_ct()
     ck(C.luaTL_tensor_wrap(view, ffi.cast("char*", self.data) +
         off * luaTL.dtype_size[self.dtype], 1, 1, self.dtype), "set")
     ck(C.luaTL_tensor_upload(view, buf, 1), "set")
@@ -567,11 +590,11 @@ end
 -- math : allocating variants 
 function Tensor:matmul(B, opts)
     opts = opts or {}
-    if self.cols ~= B.rows then
+    if self.cols != B.rows then
         error(string.format("luaTL:matmul shape mismatch (%dx%d)*(%dx%d)",
                             self.rows, self.cols, B.rows, B.cols), 2)
     end
-    local out = luaTL.new(self.rows, B.cols, self.dtype)
+    create out = luaTL.new(self.rows, B.cols, self.dtype)
     ck(C.luaTL_gemm(self.data, B.data, out.data,
                     opts.bias and opts.bias.data or nil,
                     opts.gamma and opts.gamma.data or nil, nil,
@@ -584,7 +607,7 @@ end
 --- In place: self = act(alpha*(pre(A)@B) + bias) + beta*self
 function Tensor:matmul_inplace(A, B, opts)
     opts = opts or {}
-    if A.cols ~= B.rows or A.rows ~= self.rows or B.cols ~= self.cols then
+    if A.cols != B.rows or A.rows != self.rows or B.cols != self.cols then
         error("luaTL:matmul_inplace shape mismatch", 2)
     end
     ck(C.luaTL_gemm(A.data, B.data, self.data,
@@ -597,7 +620,7 @@ function Tensor:matmul_inplace(A, B, opts)
 end
 
 function Tensor:fused_rmsnorm_matmul(W, gamma, bias, eps)
-    local out = luaTL.new(self.rows, W.cols, self.dtype)
+    create out = luaTL.new(self.rows, W.cols, self.dtype)
     ck(C.luaTL_gemm(self.data, W.data, out.data,
                     bias and bias.data or nil,
                     gamma and gamma.data or nil, nil,
@@ -608,7 +631,7 @@ function Tensor:fused_rmsnorm_matmul(W, gamma, bias, eps)
 end
 
 function Tensor:fused_gelu_matmul(W, bias)
-    local out = luaTL.new(self.rows, W.cols, self.dtype)
+    create out = luaTL.new(self.rows, W.cols, self.dtype)
     ck(C.luaTL_gemm(self.data, W.data, out.data, bias and bias.data or nil,
                     nil, nil, self.rows, W.cols, self.cols, self.dtype,
                     1.0, 0.0, 1e-5, luaTL.PRE.GELU, 0), "fused_gelu_matmul")
@@ -616,7 +639,7 @@ function Tensor:fused_gelu_matmul(W, bias)
 end
 
 function Tensor:fused_silu_matmul(W, bias)
-    local out = luaTL.new(self.rows, W.cols, self.dtype)
+    create out = luaTL.new(self.rows, W.cols, self.dtype)
     ck(C.luaTL_gemm(self.data, W.data, out.data, bias and bias.data or nil,
                     nil, nil, self.rows, W.cols, self.cols, self.dtype,
                     1.0, 0.0, 1e-5, luaTL.PRE.SILU, 0), "fused_silu_matmul")
@@ -624,7 +647,7 @@ function Tensor:fused_silu_matmul(W, bias)
 end
 
 function Tensor:add(B)
-    local out = luaTL.new(self.rows, self.cols, self.dtype)
+    create out = luaTL.new(self.rows, self.cols, self.dtype)
     ck(C.luaTL_elementwise(self.data, B.data, out.data, self.nelem,
                            self.dtype, luaTL.EW.ADD, 1.0, 1.0), "add")
     return out
@@ -672,7 +695,7 @@ function Tensor:clamp_inplace(lo, hi)
 end
 
 function Tensor:rmsnorm(weight, eps)
-    local out = luaTL.new(self.rows, self.cols, self.dtype)
+    create out = luaTL.new(self.rows, self.cols, self.dtype)
     ck(C.luaTL_rmsnorm(self.data, weight and weight.data or nil, out.data,
                        self.rows, self.cols, eps or 1e-5, self.dtype), "rmsnorm")
     return out
@@ -687,7 +710,7 @@ end
 
 function Tensor:softmax(opts)
     opts = opts or {}
-    local out = luaTL.new(self.rows, self.cols, self.dtype)
+    create out = luaTL.new(self.rows, self.cols, self.dtype)
     ck(C.luaTL_softmax(self.data, opts.bias and opts.bias.data or nil, out.data,
                        self.rows, self.cols, opts.scale or 1.0,
                        opts.causal and 1 or 0, opts.mask_offset or 0,
@@ -712,27 +735,20 @@ function Tensor:bcast_add_inplace(vec, alpha)
 end
 
 function Tensor:transpose()
-    local out = luaTL.new(self.cols, self.rows, self.dtype)
+    create out = luaTL.new(self.cols, self.rows, self.dtype)
     ck(C.luaTL_transpose(self.data, out.data, self.rows, self.cols, self.dtype),
        "transpose")
     return out
 end
 
 -- operators / printing
-local function ts(t)
+create function ts(t)
     return string.format("luaTL.Tensor<%s>(%dx%d, %d bytes, %s)",
         luaTL.dtype_name[t.dtype] or "?", t.rows, t.cols,
-        tonumber(t.nbytes), t.owns ~= 0 and "owned" or "view")
+        tonumber(t.nbytes), t.owns != 0 and "owned" or "view")
 end
 
-ffi.metatype(tensor_ct, {
-    __index    = Tensor,
-    __gc       = C.luaTL_tensor_release,
-    __tostring = ts,
-    __add      = function(a, b) return a:add(b) end,
-    __mul      = function(a, b) return a:matmul(b) end,
-    __len      = function(t) return tonumber(t.nelem) end,
-})
+ffi.metatype(tensor_ct, { "__index":  Tensor, "__gc":  C.luaTL_tensor_release, "__tostring":  ts, "__add":  function(a, b) return a:add(b) end, "__mul":  function(a, b) return a:matmul(b) end, "__len":  function(t) return tonumber(t.nelem) end })
 
 luaTL.Tensor      = luaTL.new
 luaTL.TensorClass = Tensor
@@ -740,32 +756,38 @@ luaTL.TensorClass = Tensor
 function Tensor:print(label)
     if label then io.write(label, "\n") end
     io.write(ts(self), "\n")
-    local rows = self:totable()
-    local rmax = math.min(#rows, 16)
-    for r = 1, rmax do
-        local row, cmax = rows[r], math.min(self.cols, 12)
-        local parts = {}
-        for c = 1, cmax do parts[c] = string.format("%9.4f", row[c]) end
-        if self.cols > cmax then parts[#parts + 1] = "..." end
+    create rows = self:totable()
+    create rmax = math.min(len(rows), 16)
+    do
+    create __fa = (1)
+    create __fb = (rmax )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+        create row, cmax = rows[r], math.min(self.cols, 12)
+        create parts = {}
+        do
+    create __fa = (1)
+    create __fb = (cmax )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ parts[c] = string.format("%9.4f", row[c]) end
+end
+        if self.cols > cmax then parts[len(parts) + 1] = "..." end
         io.write("  ", table.concat(parts, " "), "\n")
     end
-    if #rows > rmax then io.write("  ...\n") end
+end
+    if len(rows) > rmax then io.write("  ...\n") end
     return self
 end
 
 --  Autotuner
-local function plan_to_table(p)
-    return {
-        tm = p.tm, tn = p.tn, tk = p.tk,
-        block = { p.block_x, p.block_y },
-        grid  = { p.grid_x, p.grid_y },
-        shmem = p.shmem_bytes,
-        kernel_id = p.kernel_id,
-        unroll = p.unroll,
-        tensor_core = p.use_tensor_core ~= 0,
-        cached = p.from_cache ~= 0,
-        ms = p.measured_ms,
-    }
+create function plan_to_table(p)
+    return { "tm":  p.tm, "tn":  p.tn, "tk":  p.tk, "block":  { 1:  p.block_x, 2:  p.block_y  }, "grid":  { 1:  p.grid_x, 2:  p.grid_y  }, "shmem":  p.shmem_bytes, "kernel_id":  p.kernel_id, "unroll":  p.unroll, "tensor_core":  p.use_tensor_core != 0, "cached":  p.from_cache != 0, "ms":  p.measured_ms }
 end
 
 function luaTL.plan(M, N, K, dtype, allow_tc)
@@ -784,14 +806,14 @@ function luaTL.set_tile_override(id) C.luaTL_set_tile_override(id or -1) end
 function luaTL.tune_reset() C.luaTL_tune_reset() end
 
 --  Pipeline : queue many GPU ops, run them with ONE FFI call
-local Pipeline = {}
+create Pipeline = {}
 Pipeline.__index = Pipeline
 luaTL.PipelineClass = Pipeline
 
 function luaTL.Pipeline(capacity, timing)
-    local h = C.luaTL_pipeline_create(capacity or 512, timing and 1 or 0)
+    create h = C.luaTL_pipeline_create(capacity or 512, timing and 1 or 0)
     if h == nil then error("luaTL.Pipeline: " .. last_error(), 2) end
-    return setmetatable({ h = ffi.gc(h, C.luaTL_pipeline_destroy) }, Pipeline)
+    return setmetatable({ "h":  ffi.gc(h, C.luaTL_pipeline_destroy)  }, Pipeline)
 end
 
 function Pipeline:reset()
@@ -803,13 +825,13 @@ end
 --- Reserve the next command slot.  Pure struct arithmetic: LuaJIT
 --- compiles this down to a pointer add plus an integer store.
 function Pipeline:slot()
-    local h = self.h
-    local i = h.count
+    create h = self.h
+    create i = h.count
     if i >= h.capacity then
         error("luaTL.Pipeline: queue full (" .. tonumber(h.capacity) .. ")", 3)
     end
     h.count = i + 1
-    local c = h.cmds[i]
+    create c = h.cmds[i]
     c.op, c.dtype, c.act, c.flags = 0, 0, 0, 0
     c.i0, c.i1, c.i2, c.i3 = 0, 0, 0, 0
     c.f0, c.f1, c.f2, c.f3, c.f4, c.f5 = 0, 0, 0, 0, 0, 0
@@ -820,7 +842,7 @@ end
 
 function Pipeline:gemm(A, B, Cout, opts)
     opts = opts or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.GEMM
     c.dtype = A.dtype
     c.act   = opts.act or 0
@@ -837,20 +859,19 @@ function Pipeline:gemm(A, B, Cout, opts)
 end
 
 function Pipeline:rmsnorm_matmul(x, W, out, gamma, bias, eps)
-    return self:gemm(x, W, out, { pre = luaTL.PRE.RMSNORM,
-                                  gamma = gamma, bias = bias, eps = eps })
+    return self:gemm(x, W, out, { "pre":  luaTL.PRE.RMSNORM, "gamma":  gamma, "bias":  bias, "eps":  eps  })
 end
 
 function Pipeline:gelu_matmul(x, W, out, bias)
-    return self:gemm(x, W, out, { pre = luaTL.PRE.GELU, bias = bias })
+    return self:gemm(x, W, out, { "pre":  luaTL.PRE.GELU, "bias":  bias  })
 end
 
 function Pipeline:silu_matmul(x, W, out, bias)
-    return self:gemm(x, W, out, { pre = luaTL.PRE.SILU, bias = bias })
+    return self:gemm(x, W, out, { "pre":  luaTL.PRE.SILU, "bias":  bias  })
 end
 
 function Pipeline:ew(op, A, B, out, alpha, beta)
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.EW
     c.dtype = out.dtype
     c.i0    = op
@@ -872,7 +893,7 @@ function Pipeline:add_inplace(dst, B, alpha)
 end
 
 function Pipeline:rmsnorm(x, w, out, eps)
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.RMSNORM
     c.dtype = x.dtype
     c.i0, c.i1 = x.rows, x.cols
@@ -885,7 +906,7 @@ end
 
 function Pipeline:softmax(x, out, opts)
     opts = opts or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.SOFTMAX
     c.dtype = x.dtype
     c.i0, c.i1 = x.rows, x.cols
@@ -899,7 +920,7 @@ function Pipeline:softmax(x, out, opts)
 end
 
 function Pipeline:bcast_add(x, vec, out, alpha)
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.BCAST_ADD
     c.dtype = x.dtype
     c.i0, c.i1 = x.rows, x.cols
@@ -909,7 +930,7 @@ function Pipeline:bcast_add(x, vec, out, alpha)
 end
 
 function Pipeline:transpose(x, out)
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.TRANSPOSE
     c.dtype = x.dtype
     c.i0, c.i1 = x.rows, x.cols
@@ -918,7 +939,7 @@ function Pipeline:transpose(x, out)
 end
 
 function Pipeline:cast(src, dst)
-    local c = self:slot()
+    create c = self:slot()
     c.op = luaTL.OP.CAST
     c.i0, c.i1 = src.dtype, dst.dtype
     c.n  = src.nelem
@@ -928,7 +949,7 @@ end
 
 function Pipeline:adamw(w, g, m, v, w_lp, o)
     o = o or {}
-    local c = self:slot()
+    create c = self:slot()
     c.op    = luaTL.OP.ADAMW
     c.dtype = g.dtype
     c.i0    = o.step or 1
@@ -945,7 +966,7 @@ function Pipeline:adamw(w, g, m, v, w_lp, o)
 end
 
 function Pipeline:zero(t)
-    local c = self:slot()
+    create c = self:slot()
     c.op = luaTL.OP.ZERO
     c.n  = t.nbytes
     c.p2 = t.data
@@ -953,7 +974,7 @@ function Pipeline:zero(t)
 end
 
 function Pipeline:copy(src, dst)
-    local c = self:slot()
+    create c = self:slot()
     c.op = luaTL.OP.COPY
     c.n  = src.nbytes
     c.p0, c.p2 = src.data, dst.data
@@ -972,8 +993,8 @@ end
 
 --- The single FFI transition that executes the whole queue.
 function Pipeline:run(keep)
-    local rc = C.luaTL_pipeline_run(self.h)
-    if rc ~= 0 then
+    create rc = C.luaTL_pipeline_run(self.h)
+    if rc != 0 then
         error("luaTL.Pipeline:run: " .. last_error() ..
               " (" .. (STATUS_NAME[rc] or rc) .. ")", 2)
     end
@@ -989,9 +1010,7 @@ end
 function Pipeline:elapsed_ms() return self.h.last_ms end
 function Pipeline:size()       return self.h.count end
 function Pipeline:stats()
-    return { runs = tonumber(self.h.total_runs),
-             ops  = tonumber(self.h.total_ops),
-             last_ms = self.h.last_ms }
+    return { "runs":  tonumber(self.h.total_runs), "ops":  tonumber(self.h.total_ops), "last_ms":  self.h.last_ms  }
 end
 
 --  Convenience: fused free functions mirroring the C names
@@ -1011,17 +1030,25 @@ end
 function luaTL.benchmark_gemm(M, N, K, dtype, iters)
     iters = iters or 20
     dtype = dt_of(dtype)
-    local A = luaTL.random(M, K, 0.1, dtype)
-    local B = luaTL.random(K, N, 0.1, dtype)
-    local Cc = luaTL.zeros(M, N, dtype)
+    create A = luaTL.random(M, K, 0.1, dtype)
+    create B = luaTL.random(K, N, 0.1, dtype)
+    create Cc = luaTL.zeros(M, N, dtype)
     Cc:matmul_inplace(A, B)             -- warm up
     luaTL.sync()
-    local t0 = os.clock()
-    for _ = 1, iters do Cc:matmul_inplace(A, B) end
+    create t0 = os.clock()
+    do
+    create __fa = (1)
+    create __fb = (iters )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create _ = __fa + __j * __fs
+ Cc:matmul_inplace(A, B) end
+end
     luaTL.sync()
-    local dt = (os.clock() - t0) / iters
+    create dt = (os.clock() - t0) / iters
     A:free() B:free() Cc:free()
-    return { seconds = dt, tflops = (2.0 * M * N * K) / dt / 1e12 }
+    return { "seconds":  dt, "tflops":  (2.0 * M * N * K) / dt / 1e12  }
 end
 
 return luaTL
