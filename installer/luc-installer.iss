@@ -1,7 +1,8 @@
-; LUC - Inno Setup script (PREBUILT, English) - LUC 0.1
+﻿; LUC - Inno Setup script (PREBUILT, English, setup v3)
 ; update 2026-09-01: AppId, opt-in window/ai, maintenance dialog, start menu
 ; update 2026-09-02: ver 0.1, library management, offline packages
-; This installer ships READY-TO-RUN binaries built ahead of
+; Setup v3 changes EVERYTHING about how window support works:
+; the installer now ships READY-TO-RUN binaries built ahead of
 ; time on the developer's machine (build_installer.ps1):
 ;   luc.exe     - full build with SDL2 window support (when the
 ;                 "window" component is ticked) + SDL2.dll
@@ -59,7 +60,7 @@ ChangesEnvironment=yes
 DisableProgramGroupPage=yes
 DisableDirPage=no
 ; Inno 7 HIDES the Welcome page by default (shDisableWelcomePage is in the
-; compiler's default option set) - show it again, it carries the LUC version
+; compiler's default option set) - show it again, it carries the "Setup v3"
 ; marker the user can verify before installing
 DisableWelcomePage=no
 ShowLanguageDialog=yes
@@ -200,7 +201,7 @@ Type: filesandordirs; Name: "{app}\sdl2"
 [Messages]
 ; window title shows the version so users know what they are installing
 SetupAppTitle=Setup - Luc {#SetupSetting("AppVersion")}
-WelcomeLabel2=This will install LUC 0.1 on your computer - a tiny scripting language packed into a single exe.%n%nEverything is prebuilt - no compiler, no MSYS2, no downloads during setup. Click Install and LUC works immediately, just like installing Python.
+WelcomeLabel2=This will install LUC on your computer - a tiny scripting language packed into a single exe.%n%nSetup: everything is prebuilt - no compiler, no MSYS2, no downloads during setup. Click Install and LUC works immediately, just like installing Python.
 
 [Code]
 var
