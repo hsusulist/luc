@@ -1,0 +1,18 @@
+-- demos/ai libaries/ai_tokenizer.luc -- tiny BPE tokenizer: train, encode, decode
+-- needs the ai library (luc install ai)
+-- run: luc "demos/ai libaries/ai_tokenizer.luc"
+
+import ai
+
+create text = "hello world hello luc world hello luc luc world"
+
+create tok = ai.Tokenizer.new({"text": text, "vocab_size": 40, "verbose": false})
+tok:train()
+
+create ids = tok:encode("hello luc")
+create n = 0
+repeat id, k in ids do
+    n = n + 1
+end
+print("encoded ids: " + n)
+print(tok:decode(ids))

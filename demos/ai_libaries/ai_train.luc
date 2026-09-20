@@ -1,0 +1,18 @@
+-- demos/ai libaries/ai_train.luc -- fit y = 2x + 1 with a tiny MLP
+-- needs the ai library (luc install ai)
+-- run: luc "demos/ai libaries/ai_train.luc"
+
+import ai
+
+create data = [
+    {"input": [0], "target": [1]},
+    {"input": [1], "target": [3]},
+    {"input": [2], "target": [5]},
+    {"input": [3], "target": [7]},
+]
+
+create t = ai.Train({"layers": {1: 1, 2: 8, 3: 1}, "data": data, "epochs": 300, "lr": 0.01, "log_every": 100})
+t:run()
+
+print("--- evaluate ---")
+t:evaluate(data)

@@ -1,5 +1,5 @@
 -- demos/chat.luc -- echo chat server (import net)
--- run: luc demos/chat.luc
+-- run: luc "demos/net libaries/chat.luc"
 -- test: telnet 127.0.0.1 8000  (or run a second luc script as client)
 
 import net("n")

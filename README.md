@@ -34,13 +34,14 @@ The Components page keeps the install light by default:
 
 | Component | Default | What it is |
 |---|---|---|
-| **main** | ✔ always | LUC interpreter + core libraries (string, list, math, bit32, JSON, buffer, IO, OS, task, coroutine) |
+| **main** | ✔ always | LUC interpreter + core libraries (string, list, math, bit32, JSON, buffer, IO, OS, task, coroutine, **net** built-in) |
 | **window** | ☐ opt-in | SDL2 2D graphics, PNG/JPG sprites, TTF text, WAV/OGG/MP3 sound + demos |
 | **ailib** | ☐ opt-in | lanternl AI library — `import ai` |
+| **discord** | ☐ opt-in | Discord bot library — `import discord` (needs `luc install discord` if skipped) |
 | **vsext** | ✔ | VS Code extension (syntax highlighting) |
 | **source** | ✔ | C source code for developers |
 
-Skipped `window`/`ailib` and changed your mind later? No installer needed —
+Skipped `window`/`ailib`/`discord` and changed your mind later? No installer needed —
 see [`luc install`](#luc-install--package-manager) below.
 
 ### Re-running the installer (maintenance)
@@ -65,8 +66,12 @@ The installer bundles a `packages\` folder next to `luc.exe`, so this works
 luc install                  list packages and their status
 luc install window           add SDL2 window support (full build + media DLLs + font)
 luc install ai               add the lanternl AI library (import ai)
+luc install discord          add the Discord bot library (import discord)
 luc install window --force   redownload window support
 ```
+
+> **net** needs no download: it is built into `luc.exe` (Winsock, no extra
+> DLLs) — `import net` works right after install.
 
 - `luc install window` replaces `luc.exe` with the SDL2 build and drops
   `SDL2.dll` + media DLLs (`SDL2_ttf/image/mixer` + deps) + `DejaVuSans.ttf` font next to it (the old exe is kept as `luc.exe.old`).
@@ -159,7 +164,7 @@ w.play_music(bgm)          -- lặp vô hạn mặc định
 w.stop_music()
 
 -- phím/chuột: w.key("space"), w.key_pressed("escape"), w.mouse() ...
--- xem them: demos/pong.luc
+-- xem them: demos/window libaries/pong.luc
 ```
 
 > **import vs require** — `import` chỉ nạp thư viện hệ thống (`window`, `ai`, `json`).
@@ -224,26 +229,112 @@ MESSAGE CONTENT INTENT to read text) and the library itself:
 luc install discord
 ```
 
+Setup — token riêng, run gọn (`bot:run` chỉ chạy bot, không loop).
+Chạy không được (token sai, mất mạng...) thì nó ném lỗi luôn nên code
+sau đó chỉ chạy khi đã online. Token có thể truyền trực tiếp hoặc nạp
+trước bằng `bot.token`:
+
 ```lua
 import discord("bot")
 
+create log = bot.debug
 create token = bot.token("TOKEN_HERE")
 
-bot:run(token) do
-    while true do
-        create cmd = bot.prefix("!")
-        if cmd == "ping" then
-            bot.msg:send("pong!")
-        end
+bot:run(token)
+print("login as " + log.username + " and in " + log.servers + " servers")
+
+while bot.run do
+    create cmd = bot.prefix("!")
+    if cmd == "ping" then
+        bot.msg:send("pong!")
     end
 end
 ```
 
-More: `bot.msg:send(channel, text)` / `bot.msg:dm(name_or_id, text)` /
-`bot.msg:edit/delete`, `bot.user:join()` (new-member id) /
-`bot.user:getid(name)`, slash commands (`cmd.new("hi", "global")` then
-`cmd.slash("hi")`), `bot:stop()` pause (queues up) / `bot:on(true)` resume /
-`while bot:on() do` status. See `demos/discordbot.luc`.
+Debug — `bot.debug` lấy trước khi run cũng được (cùng một bảng nên
+tự cập nhật khi online): `log.username` (vd `bottesting`), `log.name`
+(tên hiển thị), `log.id`, `log.servers` (số server đang ở, tự cập nhật
+khi vào/rời server).
+
+Lib im lặng mặc định; bật `LUC_WSDEBUG=1` để xem traffic (`discord> ...`).
+
+Prefix — `bot.prefix("!")` chờ tới khi có người nhắn `!...` rồi trả chữ
+đằng sau nó (`!ping` thì `cmd == "ping"`). Mỗi prefix một watcher riêng
+nên không trùng nhau (mỗi watcher một task):
+
+```lua
+task.spawn(function()
+    while true do
+        if bot.prefix("!") == "ping" then msg:send("pong!") end
+    end
+end)
+task.spawn(function()
+    while true do
+        if bot.prefix("?") == "ping" then msg:send("pong?") end
+    end
+end
+```
+
+```lua
+while bot.run do
+    create cmd = bot.prefix("!")
+    if cmd == "ping" then
+        bot.msg:send("pong!")
+    end
+end
+```
+
+Msg — gom `bot.msg` lại cho gọn. `send` bằng tên channel, `dm` bằng
+tên hoặc id. Một arg thì trả lời ngay tại chỗ ra lệnh:
+
+```lua
+create msg = bot.msg
+msg:send("general", "pong!")
+msg:send("pong!")
+msg.dm("someuser", "chào bạn")
+```
+
+Đọc tin nhắn cũ (không block như prefix — gọi lúc nào trả lúc đó):
+
+```lua
+create text, who = msg:last("general")       -- tin mới nhất kênh
+create text = msg:lastby("someuser")         -- text mới nhất của user (mọi kênh)
+create text = msg:lastby("someuser", "general")
+create name = msg:sender("!ping")            -- ai nhắn đúng text này
+```
+
+Trong prefix/slash command thì bỏ args cũng được — tự lấy người gọi
+lệnh và kênh họ nhắn: `msg:lastby()` (text mới nhất của người đó tại
+đó), `msg:last()` (tin mới nhất tại đó). Đừng gọi trong vòng lặp sát
+nhau (mỗi gọi là 1+ request REST).
+
+User — `join()` chờ người mới vào trả id, `getid(tên)` đổi tên ra id:
+
+```lua
+create user = bot.user
+task.spawn(function()
+    while true do
+        create uid = user:join()
+        msg.dm(uid, "Welcome to the server")
+    end
+end)
+```
+
+Slash — `cmd.new` tạo lệnh, `cmd.slash("hi")` chạy khi có người gõ `/hi`.
+`bot:stop()` kìm lại (vẫn nhận nhưng giữ queue), `bot:on()` xả hết ra:
+
+```lua
+create cmd = bot.slash
+cmd.new("hi", "gobal")
+while bot.on do
+    if cmd.slash("hi") then
+        create msg = bot.msg
+        msg:send("hi")
+    end
+end
+```
+
+See `demos/discord libaries/discordbot.luc`.
 
 ---
 
@@ -341,7 +432,7 @@ luc/
 ├── luc_modules/         ← lanternl AI library ported to LUC (import ai)
 ├── packages/            ← ai.lucpkg bundle consumed by "luc install ai"
 ├── tools/               ← make_pkg.ps1 (rebuild the ai bundle)
-├── demos/               ← example .luc files (hello, json, pong, minesweeper)
+├── demos/               ← examples per lib: ai, discord, net, window (subfolders)
 ├── vscode/              ← VS Code extension (syntax highlighting + icons)
 ├── installer/           ← Inno Setup script + assets
 ├── dist/                ← compiled binaries + luc-installer.exe

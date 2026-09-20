@@ -43,11 +43,13 @@ Verify the version: the Welcome page must say
 "LUC 0.1 - everything is prebuilt - no compiler, no MSYS2 ...".
 AppVersion is 0.1.
 
-Component layout (Components page)
+Component layout (Components page - large libs each have their own index)
 ----------------------------------
   main    (fixed)  LUC interpreter - prebuilt, runs immediately
-  window           SDL2 window support + Pong demo - prebuilt
-  ailib            lanternl AI library ('import ai')
+                   (net is built in: import net works, no download)
+  window           SDL2 window support + Pong demo - prebuilt (opt-in, off by default)
+  ailib            lanternl AI library ('import ai') (opt-in, off by default)
+  discord          Discord bot library ('import discord') (opt-in, off by default)
   vsext            VS Code extension
   source           keep the C source in the install folder
 

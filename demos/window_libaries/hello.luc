@@ -1,0 +1,16 @@
+-- demos/window libaries/hello.luc -- minimal window: bounce + text
+-- needs the window build (luc install window)
+-- run: luc "demos/window libaries/hello.luc"
+
+import window("w")
+
+create x, vx = 100, 200
+
+w.go("Hello LUC", 800, 600, function(dt)
+    x = x + vx * dt
+    if x > 780 or x < 20 then vx = -vx end
+
+    w.clear("navy")
+    w.circle(x, 300, 30, "yellow")
+    w.text_center("Xin chao LUC!", 100, "white", 32)
+end)

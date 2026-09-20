@@ -1,0 +1,8 @@
+-- demos/net libaries/http.luc -- one-line HTTPS GET (import net)
+-- run: luc "demos/net libaries/http.luc"
+
+import net("n")
+
+create page, code = n.get("https://example.com")
+print(code)
+print(string.len(page))

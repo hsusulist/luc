@@ -26,8 +26,11 @@
 ;                       (unticking one deletes it from the install)
 ;   Fix               - silent reinstall over the previous folder
 ;   Uninstall         - runs the existing uninstaller
-; Default components: main only. "window" and "ailib" are opt-in; users
-; can add them later without this setup via "luc install window|ai".
+; Default components: main only. "window", "ailib" and "discord" are opt-in
+; (each has its own checkbox/index, unchecked by default); users
+; can add them later without this setup via "luc install window|ai|discord".
+; "net" needs no component: it is built into luc.exe itself (Winsock,
+; no extra DLLs, no download) - "import net" works out of the box.
 ; Build the installer: run build_installer.ps1, or
 ;   ISCC installer\luc-installer.iss
 ;   (needs dist\app\luc-win.exe, dist\app\luc-core.exe,
@@ -75,12 +78,17 @@ Name: "vi"; MessagesFile: "compiler:Languages\Vietnamese.isl"
 Name: "full"; Description: "Download all"; Flags: iscustom
 
 [Components]
-; main (fixed) is the lightweight default: interpreter + core libraries.
-; window and ailib declare no Types so they start unchecked (opt-in);
-; both can be added later without this installer: "luc install window|ai".
-Name: "main"; Description: "LUC interpreter + core libraries (string, list, math, bit32, JSON, buffer, IO, OS, task, coroutine) - prebuilt"; Types: full; Flags: fixed
+; main (fixed) is the lightweight default: interpreter + core libraries
+; (including built-in "net": TCP/HTTP/WebSocket, no download needed).
+; Large libraries each get their OWN checkbox/index (unchecked = opt-in),
+; kept in one block and separate from the tools below (vsext, source):
+; tick only what you need instead of one bundled "download all".
+; All three can be added later without this installer:
+;   "luc install window|ai|discord".
+Name: "main"; Description: "LUC interpreter + core libraries (string, list, math, bit32, JSON, buffer, IO, OS, task, coroutine, net) - prebuilt"; Types: full; Flags: fixed
 Name: "window"; Description: "Window support - SDL2 2D graphics, PNG/JPG sprites, TTF text, WAV/OGG/MP3 sound + Pong demo (optional; add later with: luc install window)"
 Name: "ailib"; Description: "lanternl AI library - 'import ai': neural nets, LMTrain, BPE tokenizer (optional; add later with: luc install ai)"
+Name: "discord"; Description: "Discord bot library - 'import discord': bot, slash commands, gateway (optional; add later with: luc install discord)"
 Name: "vsext"; Description: "VS Code extension - LUC syntax highlighting"; Types: full
 Name: "source"; Description: "Keep the C source in the install folder (for developers)"; Types: full
 
@@ -120,16 +128,20 @@ Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window;
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
 ; Console-only build, installed as luc.exe when "window" is unticked
 Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "luc.exe"; Check: ConsoleSelected; Flags: ignoreversion
-; Runnable example scripts (hello, json, pong, minesweeper)
-Source: "..\demos\*"; DestDir: "{app}\demos"; Flags: ignoreversion
+; Runnable example scripts (window, net, discord, ai demos in subfolders)
+Source: "..\demos\*"; DestDir: "{app}\demos"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; This setup itself, so users can reopen the maintenance dialog
 ; (Install libraries / Fix / Uninstall) from the Start Menu without hunting for it.
 ; external: {srcexe} resolves at run time, not compile time
 Source: "{srcexe}"; DestDir: "{app}"; DestName: "luc-installer.exe"; Flags: external ignoreversion; Check: NotSelfCopy
 ; lanternl AI library (loaded via 'import ai', also reachable through LUC_PATH)
-; (discord.luc ships separately via "luc install discord", not with ailib)
+; (discord.luc ships with the "discord" component, or separately via
+; "luc install discord" - never bundled inside ailib)
 Source: "..\luc_modules\*"; DestDir: "{app}\luc_modules"; Components: ailib; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "discord.luc"
-; Offline package source for "luc install ai|window" (works with no internet)
+; Discord bot library (loaded via 'import discord'): own opt-in checkbox,
+; own index - NOT auto-installed, NOT bundled with ailib.
+Source: "..\luc_modules\discord.luc"; DestDir: "{app}\luc_modules"; Components: discord; Flags: ignoreversion
+; Offline package source for "luc install ai|discord|window" (works with no internet)
 Source: "..\packages\ai.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\packages\discord.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\luc-win.exe"; DestDir: "{app}\packages\window"; DestName: "luc-win.exe"; Flags: ignoreversion

@@ -5,12 +5,19 @@
 --
 --   import discord("bot")
 --   create token = bot.token("TOKEN")
---   bot:run(token) do
---       create p = bot.prefix("!")
---       while true do
---           if p == "ping" then bot.msg:send("general", "pong!") end
---       end
+--   bot:run(token)
+--   while bot.run do
+--       create cmd = bot.prefix("!")
+--       if cmd == "ping" then bot.msg:send("pong!") end
 --   end
+--
+-- Groups: bot.msg (send/dm/last/lastby/sender), bot.user (join/getid),
+-- bot.slash (new/slash), bot.debug (name/username/id/servers - grab early).
+-- bot:run(token) only starts the bot: no loop, no config, no do-block
+-- (throws on failure, so code after it only runs when online).
+-- bot.on reads state, bot:stop() pauses (events queue up),
+-- bot:on() resumes (queued events flush out).
+-- The lib is silent by default; set LUC_WSDEBUG=1 for traffic logs.
 -- NOTE: bot.prefix / bot.user.join / cmd.slash BLOCK until their event
 -- arrives (each in its own task). Unmatched events stay queued.
 import net("dn")
@@ -24,12 +31,17 @@ create B = {
     "token": nil, "ws": nil, "seq": nil, "session": nil, "app": nil,
     "hb": 30, "hback": true, "gen": 0, "hello": false,
     "msgq": [], "joinq": [], "intq": [],
+    "recent": [],
     "guilds": {}, "channels": {}, "members": {},
     "pending": [], "cur": nil,
     "paused": false, "running": false, "on": true,
 }
 
 create bot = {}
+
+-- live info table: grab it before run, fields fill in at READY
+-- (same table is mutated, never replaced, so early refs stay live)
+bot.debug = {}
 
 -- drop a leading self (dot and colon forms both work everywhere)
 create function unself(a, b, c)
@@ -70,7 +82,9 @@ create function rest(method, path, body)
 end
 
 create function gw_send(t)
-    B.ws:send(json.encode(t))
+    create s = json.encode(t)
+    if os.getenv("LUC_WSDEBUG") != nil then print("discord> " .. s) end
+    B.ws:send(s)
 end
 
 create function cache_guild(g)
@@ -122,28 +136,71 @@ create function channel_id(name)
     return nil
 end
 
+-- channel arg can be id, "name" or "#name"; ids pass through
+create function resolve_channel(a)
+    if a == nil then return nil end
+    if type(a) != "string" then return a end
+    if string.sub(a, 1, 1) == "#" then return channel_id(string.sub(a, 2)) end
+    return channel_id(a) or a
+end
+
+-- newest-first history page for one channel (REST, non-blocking)
+create function fetch_history(cid, limit)
+    if limit == nil then limit = 20 end
+    create r, code = rest("GET", "/channels/" .. cid .. "/messages?limit=" .. tostring(limit), nil)
+    if r == nil then return nil, code end
+    if code != 200 then return nil, r end
+    return json.decode(r)
+end
+
+-- recount servers into bot.debug.servers (call after any guild change)
+create function debug_servers()
+    create n = 0
+    repeat id, g in B.guilds do
+        if g != nil then n = n + 1 end
+    end
+    bot.debug.servers = n
+end
+
+-- heartbeat with explicit null seq: the gateway requires "d":null
+-- (not a missing key) before the first dispatch arrives
+create function send_beat()
+    create s = "{\"op\":1,\"d\":null}"
+    if B.seq != nil then s = json.encode({ "op": 1, "d": B.seq }) end
+    if os.getenv("LUC_WSDEBUG") != nil then print("discord> " .. s) end
+    B.ws:send(s)
+end
+
 create function heartbeat()
     create g = B.gen
     while not B.hello do
         task.wait(0.1)
         if not B.running or B.gen != g then return end
     end
-    gw_send({ "op": 1, "d": B.seq })
+    send_beat()
     while B.running and B.gen == g do
         task.wait(B.hb)
         if B.running and B.gen == g then
             if not B.hback then
-                B.ws:close()
+                pcall(function() B.ws:close() end)
+                B.ws = nil
                 return
             end
             B.hback = false
-            gw_send({ "op": 1, "d": B.seq })
+            send_beat()
         end
     end
 end
 
 create function handle_packet(m)
-    create t = json.decode(m)
+    -- one bad packet must never kill the pump: skip it and show it
+    create ok, t = pcall(function() return json.decode(m) end)
+    if not ok then
+        if os.getenv("LUC_WSDEBUG") != nil then
+            print("discord: bad packet skipped (" .. tostring(t) .. "): " .. string.sub(m, 1, 160))
+        end
+        return
+    end
     if t == nil or t.op == nil then return end
     if t.op == 10 then
         B.hb = t.d.heartbeat_interval / 1000
@@ -171,18 +228,31 @@ create function handle_packet(m)
     create d = t.d
     if d == nil then return end
     if ev == "READY" then
-        B.session = t.session_id
-        if t.application != nil then B.app = t.application.id end
+        B.session = d.session_id
+        if d.application != nil then B.app = d.application.id end
         if d.guilds != nil then
             repeat g, i in d.guilds do
                 B.guilds[g.id] = g
             end
         end
+        if d.user != nil then
+            bot.debug.username = d.user.username
+            bot.debug.id = d.user.id
+            if d.user.global_name != nil then bot.debug.name = d.user.global_name
+            else bot.debug.name = d.user.username end
+        end
+        debug_servers()
         flush_pending()
         return
     end
     if ev == "GUILD_CREATE" then
         cache_guild(d)
+        debug_servers()
+        return
+    end
+    if ev == "GUILD_DELETE" then
+        if d != nil and d.id != nil then B.guilds[d.id] = nil end
+        debug_servers()
         return
     end
     if ev == "MESSAGE_CREATE" then
@@ -191,6 +261,18 @@ create function handle_packet(m)
         B.msgq:append({ "kind": "msg", "id": d.id, "content": d.content,
             "channel": d.channel_id, "guild": d.guild_id,
             "author": d.author.username, "uid": d.author.id })
+        -- live cache for all-channel lookups (non-destructive, capped)
+        B.recent:append({ "content": d.content, "channel": d.channel_id,
+            "author": d.author.username, "uid": d.author.id })
+        if B.recent:len() > 200 then
+            create nq = []
+            create k = 1
+            while k < B.recent:len() do
+                nq:append(B.recent[k])
+                k = k + 1
+            end
+            B.recent = nq
+        end
         return
     end
     if ev == "INTERACTION_CREATE" then
@@ -214,22 +296,12 @@ create function handle_packet(m)
     end
 end
 
-create function pump()
-    while B.running do
-        create m, e = B.ws:recv(65535)
-        if m != nil then handle_packet(m)
-        else
-            task.wait(0.5)
-            if B.ws == nil then return end
-        end
-    end
-end
-
 create function reconnect()
     B.gen = B.gen + 1
     if B.ws != nil then pcall(function() B.ws:close() end) end
     B.ws = nil
     B.hello = false
+    B.hback = true
     create delay = 3
     while B.running do
         create ws, e = dn.ws_connect(GW)
@@ -245,6 +317,33 @@ create function reconnect()
         if delay < 60 then delay = delay * 2 end
     end
     return false
+end
+
+create function do_recv()
+    if B.ws == nil then return nil, "no socket" end
+    return B.ws:recv(65535)
+end
+
+create function pump()
+    while B.running do
+        if B.ws == nil then
+            if not reconnect() then return end
+        end
+        -- recv can throw (socket closed under us): never let it kill pump
+        create ok, m, e = pcall(do_recv)
+        if not ok then m, e = nil, tostring(m) end
+        if m != nil then handle_packet(m)
+        else
+            -- gateway dropped the connection: drop it here,
+            -- reconnect() (backoff) runs on the next pass; queued events kept
+            if os.getenv("LUC_WSDEBUG") != nil then
+                print("discord: connection lost (" .. tostring(e) .. "), reconnecting...")
+            end
+            if B.ws != nil then pcall(function() B.ws:close() end) end
+            B.ws = nil
+            B.hello = false
+        end
+    end
 end
 
 -- pop first queued event (nil when empty/paused; never blocks)
@@ -274,7 +373,7 @@ end
 
 create function connect_gw()
     create ws, e = dn.ws_connect(GW)
-    if ws == nil then return false end
+    if ws == nil then return false, e end
     B.ws = ws
     B.hback = true
     B.hello = false
@@ -292,31 +391,39 @@ bot.token = function(a, b)
     create t = a
     if t == bot then t = b end
     if t != nil and type(t) == "table" then t = t.token end
+    -- tokens are often pasted with stray spaces/newlines: trim them,
+    -- a single stray byte fails both REST (401) and gateway (no READY)
+    if t != nil and type(t) == "string" then t = string.trim(t) end
     B.token = t
     return { "token": t }
 end
 
-bot.run = function(a, b, c)
-    if a == bot then a, b, c = b, c, nil end
+bot.run = function(a, b)
+    if a == bot then a, b = b, nil end
+    if b != nil then
+        return nil, "bot:run takes only a token - it starts the bot, no do-block"
+    end
     create tok = a
-    create fn = b
     if tok != nil and type(tok) == "table" then tok = tok.token end
     if tok == nil then tok = B.token end
     B.token = tok
     if B.token == nil then return nil, "no token (bot.token first)" end
     B.running = true
     B.paused = false
-    if not connect_gw() then
+    create ok, why = connect_gw()
+    if not ok then
         B.running = false
-        return nil, "cannot reach gateway"
+        error("cannot reach gateway (" .. tostring(why) .. ")")
     end
     create t0 = os.clock()
     while B.session == nil do
-        if os.clock() - t0 > 20 then return nil, "no READY from gateway" end
+        if os.clock() - t0 > 20 then
+            B.running = false
+            error("no READY from gateway (bad token?)")
+        end
         task.wait(0.1)
     end
     flush_pending()
-    if fn != nil then fn() end
     return true
 end
 
@@ -381,10 +488,16 @@ bot.msg.send = function(a, b, c)
         text = b
     end
     if channel == nil then return nil, "no channel in context" end
-    if type(channel) == "string" and string.sub(channel, 1, 1) == "#" then
-        channel = string.sub(channel, 2)
-        channel = channel_id(channel)
-        if channel == nil then return nil, "unknown channel" end
+    if type(channel) == "string" then
+        create cid = channel
+        if string.sub(channel, 1, 1) == "#" then
+            cid = channel_id(string.sub(channel, 2))
+        else
+            -- plain name ("general") first, raw id as fallback
+            cid = channel_id(channel) or channel
+        end
+        if cid == nil then return nil, "unknown channel" end
+        channel = cid
     end
     create r, code = rest("POST", "/channels/" .. channel .. "/messages", { "content": text })
     if r == nil then return nil, code end
@@ -423,6 +536,83 @@ bot.msg.delete = function(a, b, c)
     return nil, r
 end
 
+-- newest message in a channel right now (text, author).
+-- non-blocking: call again later for newer ones. In a command,
+-- the channel can be omitted (uses where the command came from).
+bot.msg.last = function(a, b)
+    if a == bot.msg then a, b = b, nil end
+    create channel = a
+    if channel == nil then
+        if B.cur != nil and B.cur.channel != nil then channel = B.cur.channel
+        else return nil, "need a channel (or call inside a command)" end
+    end
+    create cid = resolve_channel(channel)
+    if cid == nil then return nil, "unknown channel" end
+    create list, e = fetch_history(cid, 1)
+    if list == nil then return nil, e end
+    if list:len() == 0 then return nil, "no messages" end
+    create m = list[0]
+    return m.content, m.author.username
+end
+
+-- newest text from a user (text, author). Channel optional: omitted
+-- means the command's channel inside a command, all channels otherwise.
+-- With no args at all inside a command: the invoker's latest there.
+bot.msg.lastby = function(a, b, c)
+    if a == bot.msg then a, b, c = b, c, nil end
+    create name, channel = a, b
+    if name == nil then
+        if B.cur != nil then name = B.cur.author
+        else return nil, "need a name (or call inside a command)" end
+    end
+    if channel == nil and B.cur != nil then channel = B.cur.channel end
+    if channel != nil then
+        create cid = resolve_channel(channel)
+        if cid == nil then return nil, "unknown channel" end
+        create list, e = fetch_history(cid, 50)
+        if list == nil then return nil, e end
+        repeat m, i in list do
+            if m.author != nil and (m.author.username == name or m.author.id == name) then
+                return m.content, m.author.username
+            end
+        end
+        return nil, "not found"
+    end
+    create found = nil
+    repeat m, i in B.recent do
+        if m.author == name or m.uid == name then found = m end
+    end
+    if found == nil then return nil, "not found" end
+    return found.content, found.author
+end
+
+-- who sent exactly this text (name, id). Channel optional: omitted
+-- means the command's channel inside a command, all channels otherwise.
+bot.msg.sender = function(a, b, c)
+    if a == bot.msg then a, b, c = b, c, nil end
+    create text, channel = a, b
+    if text == nil then return nil, "need a text" end
+    if channel == nil and B.cur != nil then channel = B.cur.channel end
+    if channel != nil then
+        create cid = resolve_channel(channel)
+        if cid == nil then return nil, "unknown channel" end
+        create list, e = fetch_history(cid, 50)
+        if list == nil then return nil, e end
+        repeat m, i in list do
+            if m.content == text and m.author != nil then
+                return m.author.username, m.author.id
+            end
+        end
+        return nil, "not found"
+    end
+    create found = nil
+    repeat m, i in B.recent do
+        if m.content == text then found = m end
+    end
+    if found == nil then return nil, "not found" end
+    return found.author, found.uid
+end
+
 bot.send = function(a, b, c)
     if a == bot then a, b, c = b, c, nil end
     if b == nil then return bot.msg.send(a) end
@@ -437,7 +627,11 @@ bot.slash = {}
 bot.slash.new = function(a, b, c, d)
     if a == bot.slash then a, b, c, d = b, c, d, nil end
     create bb = { "name": a, "description": a, "type": 1 }
-    B.pending:append({ "b": bb, "scope": b, "guild": c })
+    create scope = b
+    -- "global" (or "gobal" typo, or nil) = global command;
+    -- "guild" + guild id = guild-only command
+    if scope == nil or scope == "global" or scope == "gobal" then scope = nil end
+    B.pending:append({ "b": bb, "scope": scope, "guild": c })
     flush_pending()
     return true
 end

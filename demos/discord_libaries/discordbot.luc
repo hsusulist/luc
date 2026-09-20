@@ -1,0 +1,18 @@
+-- demos/discordbot.luc -- minimal Discord ping bot (import discord)
+-- 1. create a bot at https://discord.com/developers/applications
+-- 2. turn on MESSAGE CONTENT INTENT (Bot page) to read text
+-- 3. invite it (bot scope), put the token below
+-- run: luc "demos/discord libaries/discordbot.luc"
+-- chat in Discord: !ping -> pong!
+
+import discord("bot")
+
+create token = bot.token("TOKEN_HERE")
+
+bot:run(token)
+while bot.run do
+    create cmd = bot.prefix("!")
+    if cmd == "ping" then
+        bot.msg:send("pong!")
+    end
+end

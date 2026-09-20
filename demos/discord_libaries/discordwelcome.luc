@@ -1,0 +1,19 @@
+-- demos/discordwelcome.luc -- greet newcomers in DM (import discord)
+-- turn on SERVER MEMBERS INTENT (Bot page) for join events
+-- run: luc "demos/discord libaries/discordwelcome.luc"
+
+import discord("bot")
+
+create token = bot.token("TOKEN_HERE")
+create log = bot.debug
+create msg = bot.msg
+create user = bot.user
+
+bot:run(token)
+print("Login as " + log.username)
+
+while true do
+    create uid = user:join()
+    print("new member: " + uid)
+    msg.dm(uid, "Welcome to the server!")
+end

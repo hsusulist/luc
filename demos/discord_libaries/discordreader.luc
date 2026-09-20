@@ -1,0 +1,41 @@
+-- demos/discordreader.luc -- read back messages (import discord)
+-- shows msg.last / msg.lastby / msg.sender (instant reads, no waiting)
+-- run: luc "demos/discord libaries/discordreader.luc"
+-- chat in Discord: !last, !mine, !who <text>
+
+import discord("bot")
+
+create token = bot.token("TOKEN_HERE")
+create log = bot.debug
+create msg = bot.msg
+
+bot:run(token)
+print("Login as " + log.username + " and in " + log.servers + " servers")
+
+-- text after the first word ("!who hello world" -> "hello world")
+create function parse_after(s)
+    if s == nil then return nil end
+    create sp = string.find(s, " ")
+    if sp == nil then return nil end
+    return string.sub(s, sp + 1)
+end
+
+while bot.run do
+    create cmd = bot.prefix("!")
+    if cmd == "last" then
+        create text, who = msg:last()
+        msg:send("newest here: " + text + " (by " + who + ")")
+    elseif cmd == "mine" then
+        create text = msg:lastby()
+        msg:send("your newest here: " + text)
+    elseif cmd == "who" then
+        create full = msg:lastby()
+        create text = parse_after(full)
+        create name = msg:sender(text)
+        if name == nil then
+            msg:send("nobody sent that here")
+        else
+            msg:send(text + " was sent by " + name)
+        end
+    end
+end

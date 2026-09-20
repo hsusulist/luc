@@ -1,0 +1,25 @@
+-- demos/discordslash.luc -- slash commands + stop/on (import discord)
+-- needs the applications.commands scope when inviting the bot
+-- run: luc "demos/discord libaries/discordslash.luc"
+-- use in Discord: /hi -> bot answers, /stop -> bot pauses 5s
+
+import discord("bot")
+
+create token = bot.token("TOKEN_HERE")
+
+create cmd = bot.slash
+cmd.new("hi", "gobal")
+cmd.new("stop", "gobal")
+
+bot:run(token)
+while bot.on do
+    if cmd.slash("hi") then
+        create msg = bot.msg
+        msg:send("hi")
+    end
+    if cmd.slash("stop") then
+        bot:stop()
+        task.wait(5)
+        bot:on()
+    end
+end

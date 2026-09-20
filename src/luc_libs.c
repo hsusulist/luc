@@ -3508,8 +3508,14 @@ static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
             inb.cBuffers=2; inb.pBuffers=inbuf;
         }
         DWORD outf=0;
+        /* NOTE: this MinGW header declares InitializeSecurityContextA with
+         * 12 params including phNewContext (like AcceptSecurityContext).
+         * phNewContext MUST receive &s->ctx: it carries the partial/new
+         * context handle across calls. Passing NULL here "works" for the
+         * first call but every later call fails with SEC_E_QOP_NOT_SUPPORTED
+         * (0x80090301) because s->ctx was never filled in. */
         st=InitializeSecurityContextA(&s->cred,first?NULL:&s->ctx,
-            (SEC_CHAR*)hostname,flags,0,0,first?NULL:&inb,0,NULL,&outb,&outf,NULL);
+            (SEC_CHAR*)hostname,flags,0,0,first?NULL:&inb,0,&s->ctx,&outb,&outf,NULL);
         s->ctx_ok=1;
         if(outbuf[0].cbBuffer>0){
             if(!tls_send_all(fd,(const char*)outbuf[0].pvBuffer,outbuf[0].cbBuffer)){
@@ -3603,16 +3609,18 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
             if(st!=SEC_E_OK&&st!=SEC_I_RENEGOTIATE) return -1;
             {
                 char *data=NULL; size_t dlen=0, extralen=0;
+                char *extra=NULL;
                 for(int i=0;i<4;i++){
                     if(bufs[i].BufferType==SECBUFFER_DATA&&bufs[i].cbBuffer>0){
                         data=(char*)bufs[i].pvBuffer; dlen=bufs[i].cbBuffer;
                     }
                     if(bufs[i].BufferType==SECBUFFER_EXTRA&&bufs[i].cbBuffer>0){
-                        memmove(s->enc,bufs[i].pvBuffer,bufs[i].cbBuffer);
-                        extralen=bufs[i].cbBuffer;
+                        extra=(char*)bufs[i].pvBuffer; extralen=bufs[i].cbBuffer;
                     }
                 }
-                s->enclen=extralen;
+                /* NOTE: data/extra both alias s->enc: copy data OUT first,
+                 * then compact EXTRA. (The old order moved EXTRA first and
+                 * clobbered data -> garbage frames on coalesced bursts.) */
                 if(dlen>0){
                     size_t k=dlen>max?max:dlen;
                     memcpy(out,data,k);
@@ -3627,8 +3635,12 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
                         memcpy(s->pend+s->pendlen,data+k,dlen-k);
                         s->pendlen+=dlen-k;
                     }
+                    if(extra) memmove(s->enc,extra,extralen);
+                    s->enclen=extralen;
                     return (int)k;
                 }
+                if(extra) memmove(s->enc,extra,extralen);
+                s->enclen=extralen;
                 if(st==SEC_I_RENEGOTIATE) continue;
                 return 0;
             }
@@ -3642,9 +3654,10 @@ void net_socket_close_fd(Socket *s){
     if(!s||s->closed) return;
     s->closed=1;
     if(s->isws && (sock_t)s->fd!=SOCK_INVALID){
-        /* best-effort closing handshake (ignored when it fails) */
-        unsigned char cf[2]={0x88,0x00};
-        send((sock_t)s->fd,(const char*)cf,2,0);
+        /* best-effort closing handshake (ignored when it fails).
+         * Client frames MUST be masked: header + 4-byte mask + masked empty payload. */
+        unsigned char cf[6]={0x88,0x80,0x12,0x34,0x56,0x78};
+        send((sock_t)s->fd,(const char*)cf,6,0);
     }
     if((sock_t)s->fd!=SOCK_INVALID) sock_closefd((sock_t)s->fd);
     s->fd=(intptr_t)SOCK_INVALID;
@@ -3932,11 +3945,11 @@ static int net_http(const char *url,const char *method,const char *body,int body
     char req[4096];
     int rn;
     if(body && bodylen>0)
-        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %d\r\n%s\r\n",
+        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %d\r\n%s\r\n\r\n",
                     method,path,host,ctype?ctype:"application/json",bodylen,
                     xhdrs?xhdrs:"");
     else
-        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n",
+        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n\r\n",
                     method,path,host,xhdrs?xhdrs:"");
     if(rn<=0||rn>=(int)sizeof req-1){ snprintf(err,errcap,"url too long"); return 0; }
     sock_t fd=net_connect_to(host,port,10,err,errcap);
@@ -4061,6 +4074,14 @@ static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
 /* try to extract one message from s->rbuf (non-blocking).
  * Returns: 1 message ready (*outp/*outn malloc'd), 0 need more data,
  * -1 fatal protocol error, -2 orderly close. Ping is auto-answered. */
+/* hexdump of the offending bytes when LUC_WSDEBUG is set */
+static void ws_debug_dump(Socket *s,const char *why){
+    if(!getenv("LUC_WSDEBUG")) return;
+    fprintf(stderr,"ws-debug [%s] rlen=%d head:",why,(int)s->rlen);
+    size_t n=s->rlen>48?48:s->rlen;
+    for(size_t i=0;i<n;i++) fprintf(stderr," %02x",(unsigned char)s->rbuf[i]);
+    fprintf(stderr,"\n");
+}
 static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *outn,
                            size_t maxmsg,char *err,size_t errcap){
     TLSSession *tls=(TLSSession*)tlsv;
@@ -4068,7 +4089,7 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
         if(s->rlen<2) return 0;
         unsigned char *b=(unsigned char*)s->rbuf;
         int fin=(b[0]&0x80)!=0, op=b[0]&0x0F;
-        if(b[1]&0x80){ snprintf(err,errcap,"ws: server sent masked frame"); return -1; }
+        if(b[1]&0x80){ snprintf(err,errcap,"ws: server sent masked frame"); ws_debug_dump(s,"masked"); return -1; }
         unsigned long long pay=b[1]&0x7F;
         size_t hlen=2;
         if(pay==126){
@@ -4082,11 +4103,22 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
             if(pay>16*1024*1024){ snprintf(err,errcap,"ws: frame too large"); return -1; }
         }
         if(op>=0x8 && (!fin || pay>125)){
-            snprintf(err,errcap,"ws: bad control frame"); return -1;
+            snprintf(err,errcap,"ws: bad control frame"); ws_debug_dump(s,"badctl"); return -1;
         }
         if((unsigned long long)(s->rlen-hlen)<pay) return 0;  /* partial: wait */
         const char *payload=(const char*)(b+hlen);
-        if(op==0x8){ return -2; }                              /* close */
+        if(op==0x8){   /* close: report code+reason, consume the frame */
+            if(pay>=2){
+                int code=((unsigned char)payload[0]<<8)|(unsigned char)payload[1];
+                size_t rlen=(size_t)pay-2;
+                if(rlen>120) rlen=120;
+                if(rlen>0) snprintf(err,errcap,"ws closed (%d) %.*s",code,(int)rlen,payload+2);
+                else snprintf(err,errcap,"ws closed (%d)",code);
+            } else snprintf(err,errcap,"ws closed");
+            memmove(s->rbuf,s->rbuf+hlen+(size_t)pay,s->rlen-hlen-(size_t)pay);
+            s->rlen-=hlen+(size_t)pay;
+            return -2;
+        }
         if(op==0x9){   /* ping -> pong, then continue with next frame */
             unsigned char pong[130]; size_t pl=pay>125?125:(size_t)pay;
             pong[0]=0x8A; pong[1]=(unsigned char)(0x80|pl);
@@ -4105,7 +4137,7 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
             continue;
         }
         if(op!=0x0 && op!=0x1 && op!=0x2){
-            snprintf(err,errcap,"ws: bad opcode %d",op); return -1;
+            snprintf(err,errcap,"ws: bad opcode %d",op); ws_debug_dump(s,"badop"); return -1;
         }
         /* text/binary/continuation: append to reassembly */
         if(s->fraglen+(size_t)pay>maxmsg){ snprintf(err,errcap,"ws: message too large"); return -1; }
@@ -4157,6 +4189,7 @@ static int ws_fill(Socket *s,sock_t fd,void *tlsv){
     }
     TLSSession *tls=(TLSSession*)tlsv;
     int n;
+    int rl0=(int)s->rlen;
     if(tls){
         n=tls_recv(tls,fd,s->rbuf+s->rlen,4096);
         if(n==-2) return 0;
@@ -4172,6 +4205,7 @@ static int ws_fill(Socket *s,sock_t fd,void *tlsv){
     }
     if(n<0) return -1;
     if(n>0) s->rlen+=(size_t)n;
+    if(getenv("LUC_TLSDEBUG")) fprintf(stderr,"tlsfill: n=%d rlen=%d->%d\n",n,rl0,(int)s->rlen);
     return n>0?1:0;
 }
 LFN(f_net_ws_connect){

@@ -2416,12 +2416,12 @@ static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Val
         }
     }
     Value nv;
-    if(which==0 && (oldv.t==LT_STR||oldv.t==LT_NUM)&&(vv.t==LT_STR||vv.t==LT_NUM)){
-        nv=vm_concat(oldv,vv);
-    } else if(oldv.t==LT_NUM && vv.t==LT_NUM){
+    if(oldv.t==LT_NUM && vv.t==LT_NUM){
         double r=which==0?oldv.u.n+vv.u.n : which==1?oldv.u.n-vv.u.n :
                   which==2?oldv.u.n*vv.u.n : oldv.u.n/vv.u.n;
         nv=mknum(r);
+    } else if(which==0 && (oldv.t==LT_STR||oldv.t==LT_NUM)&&(vv.t==LT_STR||vv.t==LT_NUM)){
+        nv=vm_concat(oldv,vv);
     } else {
         ci->savedpc=pc; Value mr;
         if(vm_metabin(L,oldv,vv,mnames[which],&mr)){
@@ -3530,7 +3530,7 @@ static int pkg_install_window(int force){
       } }
     printf("installed window support.\n");
     if(moved_old) printf("note: the old interpreter is kept as luc.exe.old (safe to delete).\n");
-    printf("try: luc demos/pong.luc\n");
+    printf("try: luc \"demos/window libaries/pong.luc\"\n");
     return 0;
 }
 
