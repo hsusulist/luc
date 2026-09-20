@@ -1,0 +1,22 @@
+-- demos/chat.luc -- echo chat server (import net)
+-- run: luc demos/chat.luc
+-- test: telnet 127.0.0.1 8000  (or run a second luc script as client)
+
+import net("n")
+
+create PORT = 8000
+create s = n.serve(PORT)
+print("chat server on port " + tostring(PORT))
+
+while true do
+    create cli = s:accept()
+    task.spawn(function()
+        cli:send("welcome! type something:\n")
+        while true do
+            create m = cli:recv()
+            if m == nil then break end
+            cli:send("echo:" .. m)
+        end
+        cli:close()
+    end)
+end

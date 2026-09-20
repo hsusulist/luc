@@ -1,0 +1,8 @@
+create i = 0
+create function a()
+    print("hi" + i)
+    i += 1
+end
+repeat 1, 10 do
+    a()
+end

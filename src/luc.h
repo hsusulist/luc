@@ -32,12 +32,13 @@ typedef struct Closure  Closure;
 typedef struct CFunc    CFunc;
 typedef struct Buffer   Buffer;
 typedef struct FileH    FileH;
+typedef struct Socket   Socket;
 typedef struct Upval    Upval;
 typedef struct LucState LucState;
 
 enum {
     LT_NIL=0, LT_BOOL, LT_NUM, LT_STR, LT_TABLE, LT_LIST, LT_FUNC,
-    LT_CFUNC, LT_BUFFER, LT_CORO, LT_FILE, LT_PROTO, LT_UPVAL
+    LT_CFUNC, LT_BUFFER, LT_CORO, LT_FILE, LT_PROTO, LT_UPVAL, LT_SOCKET
 };
 
 typedef struct {
@@ -82,6 +83,8 @@ struct CFunc { Obj o; CFn fn; const char *name; int nup; Value *up; };
 
 struct Buffer { Obj o; int len; unsigned char *b; };
 struct FileH  { Obj o; FILE *f; int closed, isstd, ispipe; };
+struct Socket { Obj o; intptr_t fd; int closed; unsigned char isserver; void *tlsctx;
+                unsigned char isws; char *rbuf, *frag; size_t rlen, rcap, fraglen, fragcap; };
 
 typedef struct CallInfo {
     Closure *cl;
@@ -114,6 +117,33 @@ extern Value NIL;
 #define AS_BUF(v)   ((Buffer*)(v).u.o)
 #define AS_CO(v)    ((LucState*)(v).u.o)
 #define AS_FILE(v)  ((FileH*)(v).u.o)
+#define AS_SOCK(v)  ((Socket*)(v).u.o)
+
+/* 1b. bytecode opcodes + instruction codecs (shared by luc_core.c and luc_trans.c) */
+enum {
+    OP_MOVE, OP_LOADK, OP_LOADNIL, OP_LOADBOOL,
+    OP_GETGLOBAL, OP_SETGLOBAL, OP_GETUPVAL, OP_SETUPVAL,
+    OP_GETTABLE, OP_SETTABLE, OP_NEWTABLE, OP_SETLIST, OP_SELF,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
+    OP_UNM, OP_NOT, OP_LEN, OP_CONCAT,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_IN,
+    OP_JMP, OP_JMPIF, OP_JMPIFNOT,
+    OP_CALL, OP_RETURN, OP_CLOSURE, OP_VARARG, OP_CLOSE,
+    OP_FORPREP, OP_FORLOOP, OP_TFORLOOP, OP_SLICE, OP_NEXT,
+    OP_APPEND, OP_ADDEQ, OP_SUBEQ, OP_MULEQ, OP_DIVEQ,
+    OP_COUNT
+};
+
+#define I_ABC(o,a,b,c) (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|(((uint32_t)(b)&0xFFu)<<8)|((uint32_t)(c)&0xFFu))
+#define I_ABx(o,a,bx)  (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|((uint32_t)(bx)&0xFFFFu))
+#define I_AsBx(o,a,s)  I_ABx(o,a,(int)(s)+32767)
+
+#define GET_OP(i)   ((int)((i)>>24))
+#define GET_A(i)    ((int)(((i)>>16)&0xFFu))
+#define GET_B(i)    ((int)(((i)>>8)&0xFFu))
+#define GET_C(i)    ((int)((i)&0xFFu))
+#define GET_Bx(i)   ((int)((i)&0xFFFFu))
+#define GET_sBx(i)  (GET_Bx(i)-32767)
 
 /* 2. global VM state (defined in luc_core.c) */
 
@@ -131,6 +161,7 @@ typedef struct LucV {
     Table *stringlib, *listmeta, *bufferlib, *filelib;
     Table *listcore;         /* core list methods that shadow listmeta (remove) */
     Table *tabmeta;          /* dict methods reachable through dot access */
+    Table *socklib;          /* socket methods (import net) */
 
     LucState *mainco, *cur;
 
@@ -195,6 +226,7 @@ int    val_rawequal(Value a,Value b);
 Buffer   *buf_new(int n);
 CFunc    *cfunc_new(CFn fn,const char *name,int nup);
 FileH    *file_new(FILE *f,int isstd);
+Socket   *sock_new(intptr_t fd,int isserver);
 LucState *state_new(int stacksize);
 void      ensure_stack(LucState *L,int need);
 
@@ -211,6 +243,7 @@ int  co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres);
 void sched_add(LucState *co,double wake);
 void sched_remove(int i);
 void sched_run(void);
+void sched_poll(void);   /* run due tasks now, never sleep (main-thread waits) */
 
 /* compiler + module system (used by require/import) */
 Closure *luc_compile(const char *src,int len,const char *chunkname);
@@ -253,7 +286,10 @@ void  lucL_open_os(void);                   /* luc_lib_os.c     */
 void  lucL_open_io(void);                   /* luc_lib_io.c     */
 void  lucL_open_buffer(void);               /* luc_lib_buffer.c */
 void  lucL_open_coro(void);                 /* luc_lib_coro.c   */
+void  lucL_open_net(void);                  /* luc_lib_net.c    */
 Value lucL_json_module(void);               /* luc_lib_json.c   (require)  */
 Value lucL_window_module(void);             /* luc_lib_window.c (require)  */
+Value lucL_net_module(LucState *L);         /* luc_lib_net.c    (import)   */
+void  net_socket_close_fd(Socket *s);       /* luc_lib_net.c (GC fd cleanup) */
 
 #endif /* LUC_H */

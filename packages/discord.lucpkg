@@ -1,0 +1,494 @@
+#=lucpkg:discord
+#=lucfile: discord.luc
+-- luc_modules/discord.luc -- Discord bot (import discord).
+-- Needs a bot token: https://discord.com/developers/applications
+-- Turn on MESSAGE CONTENT INTENT (to read text) and SERVER MEMBERS INTENT
+-- (for full member lists + join events) on the Bot page.
+--
+--   import discord("bot")
+--   create token = bot.token("TOKEN")
+--   bot:run(token) do
+--       create p = bot.prefix("!")
+--       while true do
+--           if p == "ping" then bot.msg:send("general", "pong!") end
+--       end
+--   end
+-- NOTE: bot.prefix / bot.user.join / cmd.slash BLOCK until their event
+-- arrives (each in its own task). Unmatched events stay queued.
+import net("dn")
+create json = require("json")
+
+create API = "https://discord.com/api/v10"
+create GW = "wss://gateway.discord.gg/?v=10&encoding=json"
+if gw_test_url != nil then GW = gw_test_url end
+
+create B = {
+    "token": nil, "ws": nil, "seq": nil, "session": nil, "app": nil,
+    "hb": 30, "hback": true, "gen": 0, "hello": false,
+    "msgq": [], "joinq": [], "intq": [],
+    "guilds": {}, "channels": {}, "members": {},
+    "pending": [], "cur": nil,
+    "paused": false, "running": false, "on": true,
+}
+
+create bot = {}
+
+-- drop a leading self (dot and colon forms both work everywhere)
+create function unself(a, b, c)
+    if a == bot or a == bot.msg or a == bot.user or a == bot.slash then
+        return b, c, nil
+    end
+    return a, b, c
+end
+
+create function auth()
+    return "Authorization: Bot " .. B.token .. "\r\nUser-Agent: DiscordBot (luc, 0.1)"
+end
+
+-- REST with one 429 retry. Returns body, code.
+create function rest(method, path, body)
+    create url = API .. path
+    create payload = nil
+    if body != nil then payload = json.encode(body) end
+    create r = nil
+    create code = 0
+    if method == "GET" then
+        r, code = dn.get(url, auth())
+    else
+        r, code = dn.post(url, payload, "application/json", auth())
+    end
+    if code == 429 and r != nil then
+        create t = json.decode(r)
+        create wait = 1
+        if t.retry_after != nil then wait = t.retry_after end
+        task.wait(wait)
+        if method == "GET" then
+            r, code = dn.get(url, auth())
+        else
+            r, code = dn.post(url, payload, "application/json", auth())
+        end
+    end
+    return r, code
+end
+
+create function gw_send(t)
+    B.ws:send(json.encode(t))
+end
+
+create function cache_guild(g)
+    if g == nil or g.id == nil then return end
+    B.guilds[g.id] = g
+    if g.channels != nil then
+        repeat ch, i in g.channels do
+            B.channels[ch.id] = { "name": ch.name, "guild": g.id }
+        end
+    end
+    if g.members != nil then
+        repeat m, i in g.members do
+            if m.user != nil and m.user.id != nil then
+                B.members[m.user.id] = { "name": m.user.username }
+            end
+        end
+    end
+end
+
+create function flush_pending()
+    if B.app == nil then return end
+    create keep = []
+    repeat p, i in B.pending do
+        create path = "/applications/" .. B.app .. "/commands"
+        if p.scope == "guild" and p.guild != nil then
+            path = "/applications/" .. B.app .. "/guilds/" .. p.guild .. "/commands"
+        end
+        create r, code = rest("POST", path, p.b)
+        if code == 429 then keep:append(p) end
+    end
+    B.pending = keep
+end
+
+create function interaction_reply(text)
+    create cur = B.cur
+    if cur == nil or cur.kind != "int" then return nil, "no interaction" end
+    create r, code = rest("POST",
+        "/interactions/" .. cur.iid .. "/" .. cur.itoken .. "/callback",
+        { "type": 4, "data": { "content": text } })
+    if r == nil then return nil, code end
+    if code == 204 or code == 200 then return true end
+    return nil, r
+end
+
+create function channel_id(name)
+    repeat id, c in B.channels do
+        if c.name == name then return id end
+    end
+    return nil
+end
+
+create function heartbeat()
+    create g = B.gen
+    while not B.hello do
+        task.wait(0.1)
+        if not B.running or B.gen != g then return end
+    end
+    gw_send({ "op": 1, "d": B.seq })
+    while B.running and B.gen == g do
+        task.wait(B.hb)
+        if B.running and B.gen == g then
+            if not B.hback then
+                B.ws:close()
+                return
+            end
+            B.hback = false
+            gw_send({ "op": 1, "d": B.seq })
+        end
+    end
+end
+
+create function handle_packet(m)
+    create t = json.decode(m)
+    if t == nil or t.op == nil then return end
+    if t.op == 10 then
+        B.hb = t.d.heartbeat_interval / 1000
+        B.hello = true
+        if B.session != nil and B.seq != nil then
+            gw_send({ "op": 6, "d": { "token": B.token, "session_id": B.session, "seq": B.seq } })
+        else
+            gw_send({ "op": 2, "d": { "token": B.token, "intents": 33283,
+                "properties": { "os": "windows", "browser": "luc", "device": "luc" } } })
+        end
+        return
+    end
+    if t.op == 11 then
+        B.hback = true
+        return
+    end
+    if t.op == 7 or t.op == 9 then
+        if t.op == 9 then B.session = nil end
+        B.ws:close()
+        return
+    end
+    if t.op != 0 then return end
+    if t.s != nil then B.seq = t.s end
+    create ev = t.t
+    create d = t.d
+    if d == nil then return end
+    if ev == "READY" then
+        B.session = t.session_id
+        if t.application != nil then B.app = t.application.id end
+        if d.guilds != nil then
+            repeat g, i in d.guilds do
+                B.guilds[g.id] = g
+            end
+        end
+        flush_pending()
+        return
+    end
+    if ev == "GUILD_CREATE" then
+        cache_guild(d)
+        return
+    end
+    if ev == "MESSAGE_CREATE" then
+        if d.author == nil then return end
+        B.members[d.author.id] = { "name": d.author.username }
+        B.msgq:append({ "kind": "msg", "id": d.id, "content": d.content,
+            "channel": d.channel_id, "guild": d.guild_id,
+            "author": d.author.username, "uid": d.author.id })
+        return
+    end
+    if ev == "INTERACTION_CREATE" then
+        if d.data == nil then return end
+        create uid = nil
+        if d.member != nil and d.member.user != nil then uid = d.member.user.id
+        elseif d.user != nil then uid = d.user.id
+        end
+        if d.application_id != nil then B.app = d.application_id end
+        B.intq:append({ "kind": "int", "id": d.id, "token": d.token,
+            "name": d.data.name, "channel": d.channel_id, "uid": uid, "app": d.application_id })
+        return
+    end
+    if ev == "GUILD_MEMBER_ADD" then
+        if d.user != nil then
+            B.members[d.user.id] = { "name": d.user.username }
+            B.joinq:append({ "kind": "join", "uid": d.user.id,
+                "name": d.user.username, "guild": d.guild_id })
+        end
+        return
+    end
+end
+
+create function pump()
+    while B.running do
+        create m, e = B.ws:recv(65535)
+        if m != nil then handle_packet(m)
+        else
+            task.wait(0.5)
+            if B.ws == nil then return end
+        end
+    end
+end
+
+create function reconnect()
+    B.gen = B.gen + 1
+    if B.ws != nil then pcall(function() B.ws:close() end) end
+    B.ws = nil
+    B.hello = false
+    create delay = 3
+    while B.running do
+        create ws, e = dn.ws_connect(GW)
+        if ws != nil then
+            B.ws = ws
+            B.gen = B.gen + 1
+            task.spawn(function()
+                heartbeat()
+            end)
+            return true
+        end
+        task.wait(delay)
+        if delay < 60 then delay = delay * 2 end
+    end
+    return false
+end
+
+-- pop first queued event (nil when empty/paused; never blocks)
+create function qtake(q)
+    if B.paused then return nil end
+    if q:len() == 0 then return nil end
+    create ev = q[0]
+    create nq = []
+    create k = 1
+    while k < q:len() do
+        nq:append(q[k])
+        k = k + 1
+    end
+    if q == B.msgq then B.msgq = nq end
+    if q == B.joinq then B.joinq = nq end
+    if q == B.intq then B.intq = nq end
+    return ev
+end
+
+create function wait_ev(q)
+    while true do
+        create ev = qtake(q)
+        if ev != nil then return ev end
+        task.wait(0.01)
+    end
+end
+
+create function connect_gw()
+    create ws, e = dn.ws_connect(GW)
+    if ws == nil then return false end
+    B.ws = ws
+    B.hback = true
+    B.hello = false
+    task.spawn(function()
+        pump()
+    end)
+    task.spawn(function()
+        heartbeat()
+    end)
+    return true
+end
+
+-- ---- public surface (dot and colon forms both work) ----
+bot.token = function(a, b)
+    create t = a
+    if t == bot then t = b end
+    if t != nil and type(t) == "table" then t = t.token end
+    B.token = t
+    return { "token": t }
+end
+
+bot.run = function(a, b, c)
+    if a == bot then a, b, c = b, c, nil end
+    create tok = a
+    create fn = b
+    if tok != nil and type(tok) == "table" then tok = tok.token end
+    if tok == nil then tok = B.token end
+    B.token = tok
+    if B.token == nil then return nil, "no token (bot.token first)" end
+    B.running = true
+    B.paused = false
+    if not connect_gw() then
+        B.running = false
+        return nil, "cannot reach gateway"
+    end
+    create t0 = os.clock()
+    while B.session == nil do
+        if os.clock() - t0 > 20 then return nil, "no READY from gateway" end
+        task.wait(0.1)
+    end
+    flush_pending()
+    if fn != nil then fn() end
+    return true
+end
+
+-- prefix watcher: blocks until a message starts with p, returns the word
+-- after it. Each call waits for the NEXT one; others stay queued.
+bot.prefix = function(a, b)
+    if a == bot then a = b end
+    create p = a
+    while true do
+        create ev = wait_ev(B.msgq)
+        create c = ev.content
+        if c != nil and string.startswith(c, p) then
+            create rest = string.sub(c, string.len(p) + 1)
+            B.cur = { "kind": "channel", "channel": ev.channel,
+                      "guild": ev.guild, "author": ev.author }
+            create sp = string.find(rest, " ")
+            if sp != nil then return string.sub(rest, 1, sp - 1) end
+            return rest
+        end
+        B.msgq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+bot.user = {}
+bot.user.join = function(a)
+    while true do
+        create ev = wait_ev(B.joinq)
+        B.cur = { "kind": "channel", "channel": nil,
+                  "guild": ev.guild, "author": ev.name }
+        return ev.uid
+    end
+end
+bot.user.getid = function(a, b)
+    if a == bot.user then a = b end
+    create name = a
+    repeat id, info in B.members do
+        if info.name == name then return id end
+    end
+    return nil
+end
+bot.user.name = function(a, b)
+    if a == bot.user then a = b end
+    create m = B.members[a]
+    if m == nil then return nil end
+    return m.name
+end
+
+bot.msg = {}
+bot.msg.send = function(a, b, c)
+    if a == bot.msg then a, b, c = b, c, nil end
+    create channel = nil
+    create text = nil
+    if b == nil then
+        text = a
+        if B.cur != nil and B.cur.kind == "int" then
+            return interaction_reply(text)
+        end
+        if B.cur != nil then channel = B.cur.channel end
+    else
+        channel = a
+        text = b
+    end
+    if channel == nil then return nil, "no channel in context" end
+    if type(channel) == "string" and string.sub(channel, 1, 1) == "#" then
+        channel = string.sub(channel, 2)
+        channel = channel_id(channel)
+        if channel == nil then return nil, "unknown channel" end
+    end
+    create r, code = rest("POST", "/channels/" .. channel .. "/messages", { "content": text })
+    if r == nil then return nil, code end
+    if code == 200 or code == 201 then
+        create t = json.decode(r)
+        return true, t.id
+    end
+    return nil, r
+end
+bot.msg.dm = function(a, b, c)
+    if a == bot.msg then a, b, c = b, c, nil end
+    create who = a
+    create text = b
+    create uid = who
+    if type(who) == "string" and bot.user.getid(who) != nil then
+        uid = bot.user.getid(who)
+    end
+    create r, code = rest("POST", "/users/@me/channels", { "recipient_id": uid })
+    if r == nil then return nil, code end
+    if code != 200 then return nil, r end
+    create t = json.decode(r)
+    return bot.msg.send(t.id, text)
+end
+bot.msg.edit = function(a, b, c, d)
+    if a == bot.msg then a, b, c, d = b, c, d, nil end
+    create r, code = rest("PATCH", "/channels/" .. a .. "/messages/" .. b, { "content": c })
+    if r == nil then return nil, code end
+    if code == 200 then return true end
+    return nil, r
+end
+bot.msg.delete = function(a, b, c)
+    if a == bot.msg then a, b = b, c end
+    create r, code = rest("DELETE", "/channels/" .. a .. "/messages/" .. b, nil)
+    if r == nil then return nil, code end
+    if code == 204 then return true end
+    return nil, r
+end
+
+bot.send = function(a, b, c)
+    if a == bot then a, b, c = b, c, nil end
+    if b == nil then return bot.msg.send(a) end
+    return bot.msg.send(a, b)
+end
+bot.dm = function(a, b, c)
+    if a == bot then a, b, c = b, c, nil end
+    return bot.msg.dm(a, b)
+end
+
+bot.slash = {}
+bot.slash.new = function(a, b, c, d)
+    if a == bot.slash then a, b, c, d = b, c, d, nil end
+    create bb = { "name": a, "description": a, "type": 1 }
+    B.pending:append({ "b": bb, "scope": b, "guild": c })
+    flush_pending()
+    return true
+end
+bot.slash.slash = function(a, b)
+    if a == bot.slash then a = b end
+    create name = a
+    while true do
+        create ev = wait_ev(B.intq)
+        if ev.name == name then
+            B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
+                      "channel": ev.channel, "app": ev.app }
+            return true
+        end
+        B.intq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- pause switch: bot:on() reads state, "bot":stop() pauses, "bot":on(true) resumes
+bot.on = function(a, b)
+    if a == bot then a = b end
+    if a != nil then
+        if a then B.paused = false else B.paused = true end
+    end
+    return not B.paused
+end
+bot.stop = function(a)
+    B.paused = true
+    return true
+end
+
+bot.me = function(a)
+    create r, code = rest("GET", "/users/@me", nil)
+    if r == nil or code != 200 then return nil, code end
+    create t = json.decode(r)
+    return { "name": t.username, "id": t.id }
+end
+bot.channel = function(a, b)
+    if a == bot then a = b end
+    create c = B.channels[a]
+    if c == nil then return nil end
+    return { "name": c.name, "id": a }
+end
+bot.guild = function(a, b)
+    if a == bot then a = b end
+    create g = B.guilds[a]
+    if g == nil then return nil end
+    return { "name": g.name, "id": a }
+end
+
+return bot
+#=endpkg

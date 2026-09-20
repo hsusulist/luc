@@ -1,5 +1,9 @@
 /* luc_libs.c - all standard libraries merged into one translation unit */
 /* update 2026-09-01: comment cleanup */
+#if defined(_WIN32) && !defined(WIN32_LEAN_AND_MEAN)
+#define WIN32_LEAN_AND_MEAN      /* keep windows.h lean: no winsock.h v1, so
+                                    luc_lib_net can include winsock2 below */
+#endif
 #include "luc.h"
 
 
@@ -154,7 +158,7 @@ LFN(f_require){ UNUSED_SELF;
     RET(0,res); return 1;
 }
 /* import loads the system libraries that ship with LUC itself:
-     import window        import ai        import json
+     import window        import ai        import json        import net
    plus the short-name form:  import window("w")
    Third-party modules never go through import - they use require:
      create mywin = require("mywin")                                     */
@@ -169,6 +173,20 @@ LFN(f_import){ UNUSED_SELF;
         m=lucL_window_module();         /* throws when built without SDL2 */
     }else if(strcmp(name->s,"json")==0){
         m=lucL_json_module();
+    }else if(strcmp(name->s,"net")==0){
+        m=lucL_net_module(L);
+    }else if(strcmp(name->s,"discord")==0){
+        int len=0; char found[1024];
+        char *src=find_system_module(name->s,&len,found,sizeof found);
+        if(!src) luc_error("module 'discord' not found\ninstall it with: luc install discord");
+        int scratch=base+nargs+2;
+        ensure_stack(L,scratch+16);
+        Closure *cl=luc_compile(src,len,found);
+        free(src);
+        L->stack[scratch]=mkobj(LT_FUNC,cl);
+        vm_call(L,scratch,0,1);
+        m=L->stack[scratch];
+        if(m.t==LT_NIL) m=mkbool(1);
     }else if(strcmp(name->s,"ai")==0){
         int len=0; char found[1024];
         char *src=find_system_module(name->s,&len,found,sizeof found);
@@ -182,7 +200,7 @@ LFN(f_import){ UNUSED_SELF;
         m=L->stack[scratch];
         if(m.t==LT_NIL) m=mkbool(1);
     }else{
-        luc_error("module '%s' is not a LUC system library (system: window, ai, json)\n"
+        luc_error("module '%s' is not a LUC system library (system: window, ai, json, net, discord)\n"
                   "third-party modules use: create %s = require(\"%s\")",
                   name->s,name->s,name->s);
     }
@@ -482,8 +500,17 @@ static LucState *make_task(LucState *L,int base,int nargs,int firstarg){
 LFN(f_task_wait){ UNUSED_SELF;
     double n = nargs>=1? checknum(L,base,nargs,0,"wait") : 0;
     if(n<0) n=0;
-    if(!g_yp || g_yp->co!=L){        /* main thread: block */
-        double t0=luc_now(); luc_sleep(n);
+    if(!g_yp || g_yp->co!=L){
+        /* main thread: sleep in slices, pumping due tasks so spawned
+         * tasks keep running while main waits (servers/bots need this) */
+        double t0=luc_now(), end=t0+n;
+        for(;;){
+            sched_poll();
+            double now=luc_now();
+            if(now>=end) break;
+            double left=end-now;
+            luc_sleep(left<0.01?left:0.01);
+        }
         RET(0,mknum(luc_now()-t0)); return 1;
     }
     L->waketime=n;
@@ -3300,3 +3327,1034 @@ Value lucL_window_module(void){
     return NIL;
 }
 #endif /* LUC_WINDOW */
+
+
+/* luc_lib_net.c */
+/* luc_lib_net -- TCP + HTTP client/server (import net).
+ *
+ * Sockets are always non-blocking. The raw CFuncs (__recv_try /
+ * __accept_try) attempt exactly once and never wait; the user-facing
+ * recv / accept are LUC closures (built once at first import) that loop
+ * the raw attempt with task.wait between tries. Because the retry lives in
+ * ordinary LUC code, coroutine yield/resume works by construction and the
+ * plain blocking-style API stays concurrent across task.spawn clients:
+ *
+ *   import net("n")
+ *   create s = n.serve(8000)
+ *   while true do
+ *     create cli = s:accept()
+ *     task.spawn(function()
+ *       while true do
+ *         create m = cli:recv()
+ *         if m == nil then break end
+ *         cli:send("echo:" .. m)
+ *       end
+ *     end)
+ *   end
+ *
+ * Error contract: success returns the value; failure returns nil + message.
+ * recv distinguishes empty (nil, no error: retry) from closed (nil +
+ * "closed") from timeout (nil + "timeout"). Only http:// URLs (no TLS).
+ * Windows needs ws2_32 at link time. */
+#if defined(_WIN32)
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+   typedef SOCKET sock_t;
+#  define SOCK_INVALID INVALID_SOCKET
+#  define sock_closefd closesocket
+#  define sock_wouldblock() (WSAGetLastError()==WSAEWOULDBLOCK)
+#  define sock_eintr() (WSAGetLastError()==WSAEINTR)
+#  define sock_errcode() ((int)WSAGetLastError())
+#else
+#  include <sys/types.h>
+#  include <sys/socket.h>
+#  include <netdb.h>
+#  include <unistd.h>
+#  include <fcntl.h>
+#  include <errno.h>
+#  include <string.h>
+   typedef int sock_t;
+#  define SOCK_INVALID (-1)
+#  define sock_closefd close
+#  define sock_wouldblock() (errno==EWOULDBLOCK||errno==EAGAIN)
+#  define sock_eintr() (errno==EINTR)
+#  define sock_errcode() (errno)
+#endif
+
+static int net_started=0;
+static void net_startup(void){
+    if(net_started) return;
+#if defined(_WIN32)
+    WSADATA wd;
+    if(WSAStartup(MAKEWORD(2,2),&wd)!=0) luc_error("net: WSAStartup failed");
+#endif
+    srand((unsigned)time(NULL)^(unsigned)luc_now());
+    net_started=1;
+}
+static Socket *checksock(LucState *L,int base,int nargs,int i,const char *fn){
+    Value v=AR(i);
+    if(v.t!=LT_SOCKET) luc_error("bad argument #%d to '%s' (socket expected, got %s)",i+1,fn,type_name(v));
+    Socket *s=AS_SOCK(v);
+    if(s->closed) luc_error("'%s' on a closed socket",fn);
+    return s;
+}
+static int ws_build_frame(const char *p,size_t n,char **out,size_t *outlen);
+static int ws_fill(Socket *s,sock_t fd,void *tls);
+static int ws_pull_message(Socket *s,sock_t fd,void *tls,char **outp,size_t *outn,
+                           size_t maxmsg,char *err,size_t errcap);
+static void sock_set_nonblock(sock_t fd){
+#if defined(_WIN32)
+    u_long m=1; ioctlsocket(fd,FIONBIO,&m);
+#else
+    int f=fcntl(fd,F_GETFL,0); if(f>=0) fcntl(fd,F_SETFL,f|O_NONBLOCK);
+#endif
+}
+/* block-or-timeout helpers for one-shot operations (connect, HTTP):
+ * single select(), no scheduler involvement (they complete fast). */
+static int sock_wait_writable(sock_t fd,double timeout){
+    fd_set w; FD_ZERO(&w);
+#if defined(_WIN32)
+    FD_SET(fd,&w);
+#else
+    if(fd<0||fd>=FD_SETSIZE) return 0;
+    FD_SET(fd,&w);
+#endif
+    struct timeval tv;
+    tv.tv_sec=(long)timeout; tv.tv_usec=(long)((timeout-(long)timeout)*1000000);
+    return select((int)(fd+1),NULL,&w,NULL,&tv)>0;
+}
+static void sock_set_timeout(sock_t fd,int isrecv,double sec){
+    if(sec<0) return;
+#if defined(_WIN32)
+    DWORD ms=(DWORD)(sec*1000);
+    setsockopt(fd,SOL_SOCKET,isrecv?SO_RCVTIMEO:SO_SNDTIMEO,(const char*)&ms,sizeof ms);
+#else
+    struct timeval tv;
+    tv.tv_sec=(long)sec; tv.tv_usec=(long)((sec-(long)sec)*1000000);
+    setsockopt(fd,SOL_SOCKET,isrecv?SO_RCVTIMEO:SO_SNDTIMEO,&tv,sizeof tv);
+#endif
+}
+static void sock_set_blocking(sock_t fd,int blocking){
+#if defined(_WIN32)
+    u_long m=blocking?0:1; ioctlsocket(fd,FIONBIO,&m);
+#else
+    int f=fcntl(fd,F_GETFL,0);
+    if(f>=0) fcntl(fd,F_SETFL,blocking?(f&~O_NONBLOCK):(f|O_NONBLOCK));
+#endif
+}
+static void net_errmsg(char *buf,size_t sz,const char *what){
+    snprintf(buf,sz,"%s (network error %d)",what,sock_errcode());
+}
+/* ---- TLS client via Schannel (Windows). POSIX builds: unavailable. ----
+ * Used with BLOCKING sockets only (the HTTP path flips to blocking after
+ * connect, with 30s timeouts as backstop). Certificate chain + hostname
+ * are validated against the system store by default. */
+#if defined(_WIN32)
+#  ifndef SECURITY_WIN32
+#  define SECURITY_WIN32
+#  endif
+#  include <sspi.h>
+#  include <schannel.h>
+typedef struct {
+    CredHandle cred; CtxtHandle ctx;
+    SecPkgContext_StreamSizes sizes;
+    int cred_ok, ctx_ok;
+    char *enc;   size_t enclen, enccap;   /* undecrypted leftover bytes */
+    char *pend;  size_t pendlen, pendcap; /* decrypted, unread bytes    */
+} TLSSession;
+static void tls_free_session(TLSSession *s){
+    if(!s) return;
+    if(s->ctx_ok) DeleteSecurityContext(&s->ctx);
+    if(s->cred_ok) FreeCredentialsHandle(&s->cred);
+    free(s->enc); free(s->pend); free(s);
+}
+static int tls_send_all(sock_t fd,const char *p,size_t n){
+    while(n>0){
+        int r=send(fd,p,(int)(n>16384?16384:n),0);
+        if(r<=0) return 0;
+        p+=r; n-=(size_t)r;
+    }
+    return 1;
+}
+/* full client handshake on a blocking socket. 0 ok, -1 error (err set). */
+static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
+                          char *err,size_t errcap){
+    TLSSession *s=(TLSSession*)calloc(1,sizeof(TLSSession));
+    if(!s){ snprintf(err,errcap,"out of memory"); return -1; }
+    *out=NULL;
+    TimeStamp expiry;
+    SECURITY_STATUS st=AcquireCredentialsHandleA(NULL,UNISP_NAME,
+        SECPKG_CRED_OUTBOUND,NULL,NULL,NULL,NULL,&s->cred,&expiry);
+    if(st!=SEC_E_OK){ snprintf(err,errcap,"tls: no credentials (%ld)",(long)st); free(s); return -1; }
+    s->cred_ok=1;
+    DWORD flags=ISC_REQ_SEQUENCE_DETECT|ISC_REQ_REPLAY_DETECT|
+                ISC_REQ_CONFIDENTIALITY|ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_STREAM;
+    SecBufferDesc inb, outb;
+    SecBuffer inbuf[2], outbuf[1];
+    int first=1, done=0, nread=0;
+    char rbuf[16384];
+    while(!done){
+        outbuf[0].pvBuffer=NULL; outbuf[0].cbBuffer=0;
+        outbuf[0].BufferType=SECBUFFER_TOKEN;
+        outb.ulVersion=SECBUFFER_VERSION; outb.cBuffers=1; outb.pBuffers=outbuf;
+        inb.ulVersion=SECBUFFER_VERSION;
+        if(first){
+            inb.cBuffers=0; inb.pBuffers=NULL;
+        } else {
+            inbuf[0].pvBuffer=rbuf; inbuf[0].cbBuffer=(unsigned long)nread;
+            inbuf[0].BufferType=SECBUFFER_TOKEN;
+            inbuf[1].pvBuffer=NULL; inbuf[1].cbBuffer=0;
+            inbuf[1].BufferType=SECBUFFER_EMPTY;
+            inb.cBuffers=2; inb.pBuffers=inbuf;
+        }
+        DWORD outf=0;
+        st=InitializeSecurityContextA(&s->cred,first?NULL:&s->ctx,
+            (SEC_CHAR*)hostname,flags,0,0,first?NULL:&inb,0,NULL,&outb,&outf,NULL);
+        s->ctx_ok=1;
+        if(outbuf[0].cbBuffer>0){
+            if(!tls_send_all(fd,(const char*)outbuf[0].pvBuffer,outbuf[0].cbBuffer)){
+                snprintf(err,errcap,"tls: handshake send failed");
+                FreeContextBuffer(outbuf[0].pvBuffer);
+                tls_free_session(s); return -1;
+            }
+            FreeContextBuffer(outbuf[0].pvBuffer);
+        }
+        if(st==SEC_E_OK){ done=1; break; }
+        if(st!=SEC_I_CONTINUE_NEEDED){
+            snprintf(err,errcap,"tls: handshake failed (%ld)",(long)st);
+            tls_free_session(s); return -1;
+        }
+        first=0;
+        nread=recv(fd,rbuf,sizeof rbuf,0);
+        if(nread<=0){
+            snprintf(err,errcap,"tls: handshake cut off");
+            tls_free_session(s); return -1;
+        }
+    }
+    if(QueryContextAttributesA(&s->ctx,SECPKG_ATTR_STREAM_SIZES,&s->sizes)!=SEC_E_OK){
+        snprintf(err,errcap,"tls: cannot query stream sizes");
+        tls_free_session(s); return -1;
+    }
+    *out=s;
+    return 0;
+}
+static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
+    size_t chunk=s->sizes.cbMaximumMessage;
+    if(chunk<1024) chunk=1024;
+    size_t total=s->sizes.cbHeader+chunk+s->sizes.cbTrailer;
+    char *b=(char*)malloc(total);
+    if(!b) return -1;
+    while(n>0){
+        size_t k=n>chunk?chunk:n;
+        SecBuffer bufs[4];
+        SecBufferDesc d;
+        bufs[0].BufferType=SECBUFFER_STREAM_HEADER;
+        bufs[0].pvBuffer=b; bufs[0].cbBuffer=s->sizes.cbHeader;
+        bufs[1].BufferType=SECBUFFER_DATA;
+        bufs[1].pvBuffer=b+s->sizes.cbHeader; bufs[1].cbBuffer=(unsigned long)k;
+        memcpy(bufs[1].pvBuffer,p,k);
+        bufs[2].BufferType=SECBUFFER_STREAM_TRAILER;
+        bufs[2].pvBuffer=b+s->sizes.cbHeader+k; bufs[2].cbBuffer=s->sizes.cbTrailer;
+        bufs[3].BufferType=SECBUFFER_EMPTY; bufs[3].pvBuffer=NULL; bufs[3].cbBuffer=0;
+        d.ulVersion=SECBUFFER_VERSION; d.cBuffers=4; d.pBuffers=bufs;
+        if(EncryptMessage(&s->ctx,0,&d,0)!=SEC_E_OK){ free(b); return -1; }
+        size_t w=bufs[0].cbBuffer+bufs[1].cbBuffer+bufs[2].cbBuffer;
+        if(!tls_send_all(fd,b,w)){ free(b); return -1; }
+        p+=k; n-=k;
+    }
+    free(b);
+    return 0;
+}
+/* returns >0 bytes out, 0 on orderly close, -1 on error */
+static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
+    if(s->pendlen>0){
+        size_t k=s->pendlen>max?max:s->pendlen;
+        memcpy(out,s->pend,k);
+        memmove(s->pend,s->pend+k,s->pendlen-k);
+        s->pendlen-=k;
+        return (int)k;
+    }
+    char rbuf[16384];
+    for(;;){
+        size_t off=s->enclen;
+        if(off+sizeof rbuf>s->enccap){
+            size_t nc=s->enccap?s->enccap*2:32768;
+            while(nc<off+sizeof rbuf) nc*=2;
+            char *np=(char*)realloc(s->enc,nc);
+            if(!np) return -1;
+            s->enc=np; s->enccap=nc;
+        }
+        int n=recv(fd,rbuf,sizeof rbuf,0);
+        if(n==0) return 0;
+        if(n<0) return sock_wouldblock()?-2:-1;
+        memcpy(s->enc+off,rbuf,(size_t)n);
+        s->enclen=off+(size_t)n;
+        for(;;){
+            SecBuffer bufs[4];
+            bufs[0].pvBuffer=s->enc; bufs[0].cbBuffer=(unsigned long)s->enclen;
+            bufs[0].BufferType=SECBUFFER_DATA;
+            bufs[1].BufferType=SECBUFFER_EMPTY; bufs[1].pvBuffer=NULL; bufs[1].cbBuffer=0;
+            bufs[2].BufferType=SECBUFFER_EMPTY; bufs[2].pvBuffer=NULL; bufs[2].cbBuffer=0;
+            bufs[3].BufferType=SECBUFFER_EMPTY; bufs[3].pvBuffer=NULL; bufs[3].cbBuffer=0;
+            SecBufferDesc d;
+            d.ulVersion=SECBUFFER_VERSION; d.cBuffers=4; d.pBuffers=bufs;
+            SECURITY_STATUS st=DecryptMessage(&s->ctx,&d,0,NULL);
+            if(st==SEC_E_INCOMPLETE_MESSAGE) break;   /* recv more above */
+            if(st!=SEC_E_OK&&st!=SEC_I_RENEGOTIATE) return -1;
+            {
+                char *data=NULL; size_t dlen=0, extralen=0;
+                for(int i=0;i<4;i++){
+                    if(bufs[i].BufferType==SECBUFFER_DATA&&bufs[i].cbBuffer>0){
+                        data=(char*)bufs[i].pvBuffer; dlen=bufs[i].cbBuffer;
+                    }
+                    if(bufs[i].BufferType==SECBUFFER_EXTRA&&bufs[i].cbBuffer>0){
+                        memmove(s->enc,bufs[i].pvBuffer,bufs[i].cbBuffer);
+                        extralen=bufs[i].cbBuffer;
+                    }
+                }
+                s->enclen=extralen;
+                if(dlen>0){
+                    size_t k=dlen>max?max:dlen;
+                    memcpy(out,data,k);
+                    if(dlen>k){   /* stash the rest decrypted */
+                        if(s->pendlen+dlen-k>s->pendcap){
+                            size_t nc=s->pendcap?s->pendcap*2:8192;
+                            while(nc<s->pendlen+dlen-k) nc*=2;
+                            char *np=(char*)realloc(s->pend,nc);
+                            if(!np) return -1;
+                            s->pend=np; s->pendcap=nc;
+                        }
+                        memcpy(s->pend+s->pendlen,data+k,dlen-k);
+                        s->pendlen+=dlen-k;
+                    }
+                    return (int)k;
+                }
+                if(st==SEC_I_RENEGOTIATE) continue;
+                return 0;
+            }
+        }
+    }
+}
+static Socket *sock_wrap(sock_t fd,int isserver){
+    return sock_new((intptr_t)fd,isserver);
+}
+void net_socket_close_fd(Socket *s){
+    if(!s||s->closed) return;
+    s->closed=1;
+    if(s->isws && (sock_t)s->fd!=SOCK_INVALID){
+        /* best-effort closing handshake (ignored when it fails) */
+        unsigned char cf[2]={0x88,0x00};
+        send((sock_t)s->fd,(const char*)cf,2,0);
+    }
+    if((sock_t)s->fd!=SOCK_INVALID) sock_closefd((sock_t)s->fd);
+    s->fd=(intptr_t)SOCK_INVALID;
+    tls_free_session((TLSSession*)s->tlsctx); s->tlsctx=NULL;
+    free(s->rbuf); s->rbuf=NULL; s->rlen=s->rcap=0;
+    free(s->frag); s->frag=NULL; s->fraglen=s->fragcap=0;
+}
+#else
+typedef struct { int unused; } TLSSession;
+static void tls_free_session(TLSSession *s){ (void)s; }
+static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
+                          char *err,size_t errcap){
+    (void)fd; (void)hostname; (void)out;
+    snprintf(err,errcap,"tls: https needs a Windows build in this version");
+    return -1;
+}
+static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
+    (void)s; (void)fd; (void)p; (void)n; return -1;
+}
+static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
+    (void)s; (void)fd; (void)out; (void)max; return -1;
+}
+#endif
+/* blocking-style connect with timeout, scheduler-pumped. */
+static sock_t net_connect_to(const char *host,int port,double timeout,char *err,size_t errcap){
+    char ports[16]; snprintf(ports,sizeof ports,"%d",port);
+    struct addrinfo hints, *list=NULL, *ai;
+    memset(&hints,0,sizeof hints);
+    hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
+    if(getaddrinfo(host,ports,&hints,&list)!=0 || !list){
+        snprintf(err,errcap,"cannot resolve '%s'",host);
+        return SOCK_INVALID;
+    }
+    sock_t out=SOCK_INVALID;
+    for(ai=list;ai;ai=ai->ai_next){
+        sock_t fd=socket(ai->ai_family,ai->ai_socktype,ai->ai_protocol);
+        if(fd==SOCK_INVALID) continue;
+        sock_set_nonblock(fd);
+        if(connect(fd,ai->ai_addr,(int)ai->ai_addrlen)==0){ out=fd; break; }
+#if defined(_WIN32)
+        if(WSAGetLastError()!=WSAEWOULDBLOCK){ sock_closefd(fd); continue; }
+#else
+        if(errno!=EINPROGRESS){ sock_closefd(fd); continue; }
+#endif
+        /* one-shot wait (connect completes fast; caller picks timeout) */
+        int ok=0;
+        if(sock_wait_writable(fd,timeout<0?5:timeout)){
+            int e=0; socklen_t el=sizeof e;
+            getsockopt(fd,SOL_SOCKET,SO_ERROR,(char*)&e,&el);
+            if(e==0) ok=1;
+        }
+        if(ok){ out=fd; break; }
+        sock_closefd(fd);
+    }
+    freeaddrinfo(list);
+    if(out==SOCK_INVALID) snprintf(err,errcap,"cannot connect to %s:%d",host,port);
+    return out;
+}
+LFN(f_net_connect){
+    Str *host=checkstr(L,base,nargs,0,"connect");
+    int port=nargs>=2?checkint(L,base,nargs,1,"connect"):80;
+    double timeout=nargs>=3?checknum(L,base,nargs,2,"connect"):5;
+    char *h=(char*)malloc((size_t)host->len+1);
+    if(!h) luc_error("net: out of memory");
+    memcpy(h,host->s,(size_t)host->len); h[host->len]=0;
+    char err[160]; err[0]=0;
+    sock_t fd=net_connect_to(h,port,timeout,err,sizeof err);
+    free(h);
+    if(fd==SOCK_INVALID){ RET(0,NIL); RET(1,cstrv(err)); return 2; }
+    RET(0,mkobj(LT_SOCKET,sock_wrap(fd,0))); return 1;
+}
+LFN(f_net_serve){
+    int port=nargs>=1?checkint(L,base,nargs,0,"serve"):8000;
+    int backlog=nargs>=2?checkint(L,base,nargs,1,"serve"):16;
+    if(backlog<1) backlog=1; if(backlog>128) backlog=128;
+    sock_t fd=socket(AF_INET,SOCK_STREAM,0);
+    if(fd==SOCK_INVALID){ char e[96]; net_errmsg(e,sizeof e,"serve: socket"); RET(0,NIL); RET(1,cstrv(e)); return 2; }
+    {
+        int one=1;
+        setsockopt(fd,SOL_SOCKET,SO_REUSEADDR,(const char*)&one,sizeof one);
+    }
+    struct sockaddr_in a; memset(&a,0,sizeof a);
+    a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port);
+    a.sin_addr.s_addr=htonl(INADDR_ANY);
+    if(bind(fd,(struct sockaddr*)&a,sizeof a)!=0||listen(fd,backlog)!=0){
+        char e[96]; net_errmsg(e,sizeof e,"serve: bind/listen");
+        sock_closefd(fd); RET(0,NIL); RET(1,cstrv(e)); return 2;
+    }
+    sock_set_nonblock(fd);
+    RET(0,mkobj(LT_SOCKET,sock_wrap(fd,1))); return 1;
+}
+/* single non-blocking attempt: client socket, or nil (empty for now) */
+LFN(f_sock_accept_try){
+    Socket *s=checksock(L,base,nargs,0,"accept");
+    if(!s->isserver) luc_error("'accept' on a client socket (serve() first)");
+    sock_t c=accept((sock_t)s->fd,NULL,NULL);
+    if(c!=SOCK_INVALID){
+        sock_set_nonblock(c);
+        RET(0,mkobj(LT_SOCKET,sock_wrap(c,0))); return 1;
+    }
+    if(!sock_wouldblock()){ char e[96]; net_errmsg(e,sizeof e,"accept"); RET(0,NIL); RET(1,cstrv(e)); return 2; }
+    RET(0,NIL); return 1;
+}
+LFN(f_sock_send){
+    Socket *s=checksock(L,base,nargs,0,"send");
+    Str *d=nargs>=2?checkstr(L,base,nargs,1,"send"):NULL;
+    if(!d||d->len<=0){ RET(0,mknum(0)); return 1; }
+    const char *p=d->s; size_t total=(size_t)d->len;
+    char *frame=NULL; size_t framelen=0;
+    if(s->isws){
+        /* flip to blocking around the frame write (single-threaded: atomic
+         * w.r.t. other tasks), backstop via the 30s timeouts below */
+        if(ws_build_frame(d->s,(size_t)d->len,&frame,&framelen)!=0){
+            RET(0,NIL); RET(1,cstrv("message too large")); return 2;
+        }
+        p=frame; total=framelen;
+        sock_set_blocking((sock_t)s->fd,1);
+    }
+    int sent=0;
+    double t0=luc_now();
+    while((size_t)sent<total){
+        if(s->tlsctx){
+            /* blocking socket here: all-or-nothing per call */
+            if(tls_send((TLSSession*)s->tlsctx,(sock_t)s->fd,p+sent,total-(size_t)sent)!=0){
+                char e[96];
+                snprintf(e,sizeof e,"send: %s",luc_now()-t0>20?"timeout":"failed");
+                free(frame);
+                if(s->isws) sock_set_blocking((sock_t)s->fd,0);
+                RET(0,NIL); RET(1,cstrv(e)); return 2;
+            }
+            sent=(int)total; break;
+        }
+#if defined(_WIN32)
+        int n=send((sock_t)s->fd,p+sent,(int)(total-(size_t)sent),0);
+#else
+        ssize_t n=send((sock_t)s->fd,p+sent,total-(size_t)sent,0);
+#endif
+        if(n>0){ sent+=n; continue; }
+        if(n==0||!sock_wouldblock()){ char e[96]; net_errmsg(e,sizeof e,"send"); free(frame);
+            if(s->isws) sock_set_blocking((sock_t)s->fd,0);
+            RET(0,NIL); RET(1,cstrv(e)); return 2; }
+        if(luc_now()-t0>30){ free(frame);
+            if(s->isws) sock_set_blocking((sock_t)s->fd,0);
+            RET(0,NIL); RET(1,cstrv("send: timeout")); return 2; }
+        luc_sleep(0.005);
+    }
+    free(frame);
+    if(s->isws) sock_set_blocking((sock_t)s->fd,0);
+    RET(0,mknum((double)(d->len))); return 1;
+}
+/* single non-blocking attempt: data | nil,"closed" | nil (empty for now).
+ * The user-facing recv is a LUC closure looping this with task.wait. */
+LFN(f_sock_recv_try){
+    if(getenv("LUC_RAWLOG")){
+        fprintf(stderr,"RAW nargs=%d t0=%d t1=%d\n",nargs,
+            nargs>0?AR(0).t:-9,nargs>1?AR(1).t:-9);
+    }
+    Socket *s=checksock(L,base,nargs,0,"recv");
+    int max=8192;
+    if(nargs>=2 && AR(1).t!=LT_NIL) max=checkint(L,base,nargs,1,"recv");
+    if(max<1) max=1; if(max>65536) max=65536;
+    if(s->isws){
+        int fr=ws_fill(s,(sock_t)s->fd,s->tlsctx);
+        if(fr<0){ RET(0,NIL); RET(1,cstrv("closed")); return 2; }
+        char *msg=NULL; size_t mlen=0; char err[128]; err[0]=0;
+        int pr=ws_pull_message(s,(sock_t)s->fd,(TLSSession*)s->tlsctx,
+                               &msg,&mlen,(size_t)max,err,sizeof err);
+        if(pr>0){ Value v=strv(msg,mlen); free(msg); RET(0,v); return 1; }
+        if(pr<0){ free(msg); RET(0,NIL); RET(1,cstrv(err[0]?err:"closed")); return 2; }
+        RET(0,NIL); return 1;
+    }
+    char *buf=(char*)malloc((size_t)max+1);
+    if(!buf) luc_error("net: out of memory");
+#if defined(_WIN32)
+    int n=recv((sock_t)s->fd,buf,max,0);
+#else
+    ssize_t n=recv((sock_t)s->fd,buf,(size_t)max,0);
+#endif
+    if(n>0){ Value v=strv(buf,(int)n); free(buf); RET(0,v); return 1; }
+    if(n==0){ free(buf); RET(0,NIL); RET(1,cstrv("closed")); return 2; }
+    if(!sock_wouldblock()){ char e[96]; net_errmsg(e,sizeof e,"recv"); free(buf); RET(0,NIL); RET(1,cstrv(e)); return 2; }
+    free(buf);
+    RET(0,NIL); return 1;
+}
+LFN(f_sock_close){
+    Value v=AR(0);
+    if(v.t!=LT_SOCKET) luc_error("bad argument #1 to 'close' (socket expected, got %s)",type_name(v));
+    net_socket_close_fd(AS_SOCK(v));
+    RET(0,mkbool(1)); return 1;
+}
+/* ---- minimal HTTP/1.0 over the above (no TLS: https:// rejected) ---- */
+static int http_has_chunked(const char *h,size_t n){
+    /* case-insensitive search for "transfer-encoding" containing "chunked" */
+    for(size_t i=0;i+17<n;i++){
+        size_t k=0;
+        const char *needle="transfer-encoding";
+        while(k<17 && i+k<n &&
+              (h[i+k]==needle[k]||h[i+k]==needle[k]-32)) k++;
+        if(k==17){
+            size_t j=i+17;
+            while(j<n && h[j]!='\r' && h[j]!='\n') j++;
+            for(size_t t=i;t<j;t++){
+                const char *c="chunked"; size_t q=0;
+                while(q<7 && t+q<j && (h[t+q]==c[q]||h[t+q]==c[q]-32)) q++;
+                if(q==7) return 1;
+            }
+            return 0;
+        }
+    }
+    return 0;
+}
+static int http_status(const char *h,size_t n){
+    /* "HTTP/1.x CODE ..." */
+    size_t i=0;
+    while(i<n && h[i]!=' ') i++;
+    int code=0;
+    while(i<n && h[i]==' ') i++;
+    while(i<n && h[i]>='0' && h[i]<='9'){ code=code*10+(h[i]-'0'); i++; }
+    return code;
+}
+/* decode chunked body in place; returns new length */
+static size_t http_dechunk(char *p,size_t n){
+    size_t r=0, w=0;
+    while(r<n){
+        while(r<n && (p[r]=='\r' || p[r]=='\n')) r++;
+        unsigned sz=0;
+        while(r<n && p[r]!='\r' && p[r]!='\n'){
+            char c=p[r];
+            sz*=16;
+            if(c>='0'&&c<='9') sz+=(unsigned)(c-'0');
+            else if(c>='a'&&c<='f') sz+=(unsigned)(c-'a'+10);
+            else if(c>='A'&&c<='F') sz+=(unsigned)(c-'A'+10);
+            else break;
+            r++;
+        }
+        while(r<n && p[r]!='\n') r++;
+        if(r<n) r++;
+        if(sz==0) break;
+        if(r+sz>n) sz=n-r;
+        memmove(p+w,p+r,sz); r+=sz; w+=sz;
+    }
+    return w;
+}
+/* one transport for plain and TLS bytes inside net_http */
+static int hsend(TLSSession *tls,sock_t fd,const char *p,size_t n,
+                 char *err,size_t errcap){
+    size_t off=0;
+    while(off<n){
+        int r;
+        if(tls) r=(tls_send(tls,fd,p+off,n-off)==0)?(int)(n-off):-1;
+#if defined(_WIN32)
+        else r=send(fd,p+off,(int)(n-off),0);
+#else
+        else r=(int)send(fd,p+off,n-off,0);
+#endif
+        if(r>0){ off+=(size_t)r; continue; }
+        snprintf(err,errcap,"http: send failed"); return 0;
+    }
+    return 1;
+}
+static int net_http(const char *url,const char *method,const char *body,int bodylen,
+                    const char *ctype,const char *xhdrs,
+                    char **out_body,size_t *out_len,int *out_code,
+                    char *err,size_t errcap){
+    const char *p=url;
+    int ishttps=0;
+    if(strncmp(p,"http://",7)==0) p+=7;
+    else if(strncmp(p,"https://",8)==0){ p+=8; ishttps=1; }
+    else { snprintf(err,errcap,"bad url (need http(s)://host/path)"); return 0; }
+    const char *slash=strchr(p,'/');
+    const char *hostend=slash?slash:p+strlen(p);
+    char host[256]; int port=ishttps?443:80;
+    const char *colon=strchr(p,':');
+    if(colon && colon<hostend){
+        size_t hl=(size_t)(colon-p);
+        if(hl>=sizeof host) hl=sizeof host-1;
+        memcpy(host,p,hl); host[hl]=0;
+        port=atoi(colon+1); if(port<=0||port>65535) port=ishttps?443:80;
+    } else {
+        size_t hl=(size_t)(hostend-p);
+        if(hl>=sizeof host) hl=sizeof host-1;
+        memcpy(host,p,hl); host[hl]=0;
+    }
+    const char *path=slash?slash:"/";
+    char req[4096];
+    int rn;
+    if(body && bodylen>0)
+        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\nContent-Type: %s\r\nContent-Length: %d\r\n%s\r\n",
+                    method,path,host,ctype?ctype:"application/json",bodylen,
+                    xhdrs?xhdrs:"");
+    else
+        rn=snprintf(req,sizeof req,"%s %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n%s\r\n",
+                    method,path,host,xhdrs?xhdrs:"");
+    if(rn<=0||rn>=(int)sizeof req-1){ snprintf(err,errcap,"url too long"); return 0; }
+    sock_t fd=net_connect_to(host,port,10,err,errcap);
+    if(fd==SOCK_INVALID) return 0;
+    /* HTTP is one-shot: flip to blocking with backstop timeouts */
+    sock_set_blocking(fd,1);
+    sock_set_timeout(fd,1,30); sock_set_timeout(fd,0,30);
+    TLSSession *tls=NULL;
+    if(ishttps){
+        if(tls_connect_fd(fd,host,&tls,err,errcap)!=0){ sock_closefd(fd); return 0; }
+    }
+    if(!hsend(tls,fd,req,(size_t)rn,err,errcap)){ tls_free_session(tls); sock_closefd(fd); return 0; }
+    if(body && bodylen>0){
+        if(!hsend(tls,fd,body,(size_t)bodylen,err,errcap)){ tls_free_session(tls); sock_closefd(fd); return 0; }
+    }
+    size_t cap=16384, len=0;
+    char *resp=(char*)malloc(cap);
+    if(!resp){ tls_free_session(tls); sock_closefd(fd); snprintf(err,errcap,"out of memory"); return 0; }
+    for(;;){
+        if(len+4096>cap){ cap*=2; char *np=(char*)realloc(resp,cap); if(!np){ free(resp); tls_free_session(tls); sock_closefd(fd); snprintf(err,errcap,"out of memory"); return 0; } resp=np; }
+        int n;
+        if(tls) n=tls_recv(tls,fd,resp+len,4096);
+#if defined(_WIN32)
+        else n=recv(fd,resp+len,4096,0);
+#else
+        else n=(int)recv(fd,resp+len,4096,0);
+#endif
+        if(n>0){ len+=(size_t)n; continue; }
+        break;
+    }
+    tls_free_session(tls);
+    sock_closefd(fd);
+    size_t hs=0;
+    while(hs+3<len && !(resp[hs]=='\r'&&resp[hs+1]=='\n'&&resp[hs+2]=='\r'&&resp[hs+3]=='\n')) hs++;
+    if(hs+3>=len){ free(resp); snprintf(err,errcap,"http: bad response"); return 0; }
+    size_t hlen=hs, blen=len-(hs+4);
+    char *bpart=resp+hs+4;
+    *out_code=http_status(resp,hlen);
+    if(http_has_chunked(resp,hlen)) blen=http_dechunk(bpart,blen);
+    char *out=(char*)malloc(blen+1);
+    if(!out){ free(resp); snprintf(err,errcap,"out of memory"); return 0; }
+    memcpy(out,bpart,blen); out[blen]=0;
+    free(resp);
+    *out_body=out; *out_len=blen;
+    return 1;
+}
+/* ---- WebSocket client (RFC 6455). Only the client role: we always mask.
+ * Control frames: ping is auto-answered, pong ignored, close ends the
+ * stream. Fragmented messages are reassembled. wire format knowledge stays
+ * here; Socket carries rbuf (unparsed bytes) + frag (partial message). */
+static unsigned ws_rotl(unsigned x,int n){ return (x<<n)|(x>>(32-n)); }
+static void ws_sha1(const unsigned char *msg,size_t len,unsigned char out[20]){
+    unsigned h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+    unsigned long long bitlen=(unsigned long long)len*8;
+    size_t newlen=len+1;
+    while(newlen%64!=56) newlen++;
+    unsigned char *m=(unsigned char*)malloc(newlen+8);
+    if(!m){ memset(out,0,20); return; }
+    memcpy(m,msg,len); m[len]=0x80;
+    memset(m+len+1,0,newlen-len-1);
+    for(int i=0;i<8;i++) m[newlen+i]=(unsigned char)(bitlen>>(56-8*i));
+    newlen+=8;
+    for(size_t off=0;off<newlen;off+=64){
+        unsigned w[80];
+        for(int i=0;i<16;i++)
+            w[i]=((unsigned)m[off+4*i]<<24)|((unsigned)m[off+4*i+1]<<16)|
+                 ((unsigned)m[off+4*i+2]<<8)|(unsigned)m[off+4*i+3];
+        for(int i=16;i<80;i++)
+            w[i]=ws_rotl(w[i-3]^w[i-8]^w[i-14]^w[i-16],1);
+        unsigned a=h0,b=h1,c=h2,d=h3,e=h4;
+        for(int i=0;i<80;i++){
+            unsigned f,k;
+            if(i<20){ f=(b&c)|((~b)&d); k=0x5A827999; }
+            else if(i<40){ f=b^c^d; k=0x6ED9EBA1; }
+            else if(i<60){ f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDC; }
+            else { f=b^c^d; k=0xCA62C1D6; }
+            unsigned t=ws_rotl(a,5)+f+e+k+w[i];
+            e=d; d=c; c=ws_rotl(b,30); b=a; a=t;
+        }
+        h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    }
+    free(m);
+    unsigned hs[5]={h0,h1,h2,h3,h4};
+    for(int i=0;i<5;i++){
+        out[4*i]=(unsigned char)(hs[i]>>24); out[4*i+1]=(unsigned char)(hs[i]>>16);
+        out[4*i+2]=(unsigned char)(hs[i]>>8); out[4*i+3]=(unsigned char)hs[i];
+    }
+}
+static void ws_b64(const unsigned char *in,size_t n,char *out){
+    static const char *A="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i=0,o=0;
+    while(i+3<=n){ out[o++]=A[in[i]>>2]; out[o++]=A[((in[i]&3)<<4)|(in[i+1]>>4)];
+        out[o++]=A[((in[i+1]&15)<<2)|(in[i+2]>>6)]; out[o++]=A[in[i+2]&63]; i+=3; }
+    if(i<n){ out[o++]=A[in[i]>>2];
+        if(i+1<n){ out[o++]=A[((in[i]&3)<<4)|(in[i+1]>>4)]; out[o++]=A[(in[i+1]&15)<<2]; }
+        else { out[o++]=A[(in[i]&3)<<4]; out[o++]='='; }
+        out[o++]='=';
+        if(i+1>=n) out[o-2]='=';
+    }
+    out[o]=0;
+}
+/* send one masked text frame over fd (+tls). Blocking, like HTTP. */
+static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
+                         char *err,size_t errcap){
+    unsigned char h[10]; size_t hl=2;
+    h[0]=0x81;   /* FIN + text */
+    unsigned char mask[4];
+    unsigned rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+    mask[0]=(unsigned char)(rnd>>24); mask[1]=(unsigned char)(rnd>>16);
+    mask[2]=(unsigned char)(rnd>>8); mask[3]=(unsigned char)rnd;
+    if(n<126){ h[1]=(unsigned char)(0x80|n); }
+    else if(n<65536){ h[1]=0x80|126; h[2]=(unsigned char)(n>>8); h[3]=(unsigned char)(n&255); hl=4; }
+    else return 0;   /* messages bigger than 64K are split by callers */
+    char *frame=(char*)malloc(hl+4+n);
+    if(!frame) return 0;
+    memcpy(frame,h,hl); memcpy(frame+hl,mask,4);
+    for(size_t i=0;i<n;i++) frame[hl+4+i]=p[i]^mask[i&3];
+    int ok=hsend(tls,fd,frame,hl+4+n,err,errcap);
+    free(frame);
+    return ok;
+}
+/* try to extract one message from s->rbuf (non-blocking).
+ * Returns: 1 message ready (*outp/*outn malloc'd), 0 need more data,
+ * -1 fatal protocol error, -2 orderly close. Ping is auto-answered. */
+static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *outn,
+                           size_t maxmsg,char *err,size_t errcap){
+    TLSSession *tls=(TLSSession*)tlsv;
+    for(;;){
+        if(s->rlen<2) return 0;
+        unsigned char *b=(unsigned char*)s->rbuf;
+        int fin=(b[0]&0x80)!=0, op=b[0]&0x0F;
+        if(b[1]&0x80){ snprintf(err,errcap,"ws: server sent masked frame"); return -1; }
+        unsigned long long pay=b[1]&0x7F;
+        size_t hlen=2;
+        if(pay==126){
+            if(s->rlen<4) return 0;
+            pay=((unsigned long long)b[2]<<8)|b[3]; hlen=4;
+        } else if(pay==127){
+            if(s->rlen<10) return 0;
+            pay=0;
+            for(int i=0;i<8;i++) pay=(pay<<8)|b[2+i];
+            hlen=10;
+            if(pay>16*1024*1024){ snprintf(err,errcap,"ws: frame too large"); return -1; }
+        }
+        if(op>=0x8 && (!fin || pay>125)){
+            snprintf(err,errcap,"ws: bad control frame"); return -1;
+        }
+        if((unsigned long long)(s->rlen-hlen)<pay) return 0;  /* partial: wait */
+        const char *payload=(const char*)(b+hlen);
+        if(op==0x8){ return -2; }                              /* close */
+        if(op==0x9){   /* ping -> pong, then continue with next frame */
+            unsigned char pong[130]; size_t pl=pay>125?125:(size_t)pay;
+            pong[0]=0x8A; pong[1]=(unsigned char)(0x80|pl);
+            unsigned char mk[4]={0x12,0x34,0x56,0x78};
+            memcpy(pong+2,mk,4);
+            for(size_t i=0;i<pl;i++) pong[6+i]=payload[i]^mk[i&3];
+            if(tls) tls_send(tls,fd,(const char*)pong,6+pl);
+            else send(fd,(const char*)pong,(int)(6+pl),0);
+            memmove(s->rbuf,s->rbuf+hlen+(size_t)pay,s->rlen-hlen-(size_t)pay);
+            s->rlen-=hlen+(size_t)pay;
+            continue;
+        }
+        if(op==0xA){   /* pong: drop */
+            memmove(s->rbuf,s->rbuf+hlen+(size_t)pay,s->rlen-hlen-(size_t)pay);
+            s->rlen-=hlen+(size_t)pay;
+            continue;
+        }
+        if(op!=0x0 && op!=0x1 && op!=0x2){
+            snprintf(err,errcap,"ws: bad opcode %d",op); return -1;
+        }
+        /* text/binary/continuation: append to reassembly */
+        if(s->fraglen+(size_t)pay>maxmsg){ snprintf(err,errcap,"ws: message too large"); return -1; }
+        if(s->fraglen+(size_t)pay>s->fragcap){
+            size_t nc=s->fragcap?s->fragcap*2:4096;
+            while(nc<s->fraglen+(size_t)pay) nc*=2;
+            char *np=(char*)realloc(s->frag,nc);
+            if(!np){ snprintf(err,errcap,"out of memory"); return -1; }
+            s->frag=np; s->fragcap=nc;
+        }
+        memcpy(s->frag+s->fraglen,payload,(size_t)pay);
+        s->fraglen+=(size_t)pay;
+        memmove(s->rbuf,s->rbuf+hlen+(size_t)pay,s->rlen-hlen-(size_t)pay);
+        s->rlen-=hlen+(size_t)pay;
+        if(fin){
+            *outp=s->frag; *outn=s->fraglen;
+            s->frag=NULL; s->fraglen=s->fragcap=0;
+            return 1;
+        }
+    }
+}
+/* build one masked client text frame; caller frees *out. 0 ok. */
+static int ws_build_frame(const char *p,size_t n,char **out,size_t *outlen){
+    if(n>65535) return -1;
+    size_t hl=n<126?2:4;
+    char *f=(char*)malloc(hl+4+n);
+    if(!f) return -1;
+    unsigned char mask[4];
+    unsigned rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+    mask[0]=(unsigned char)(rnd>>24); mask[1]=(unsigned char)(rnd>>16);
+    mask[2]=(unsigned char)(rnd>>8); mask[3]=(unsigned char)rnd;
+    f[0]=(char)0x81;
+    if(n<126){ f[1]=(char)(0x80|n); }
+    else { f[1]=(char)(0x80|126); f[2]=(char)(n>>8); f[3]=(char)(n&255); }
+    memcpy(f+hl,mask,4);
+    for(size_t i=0;i<n;i++) f[hl+4+i]=p[i]^mask[i&3];
+    *out=f; *outlen=hl+4+n;
+    return 0;
+}
+/* read available bytes into rbuf once (non-blocking).
+ * 1 = new data, 0 = none right now, -1 = dead/closed. */
+static int ws_fill(Socket *s,sock_t fd,void *tlsv){
+    if(s->rlen+4096>s->rcap){
+        size_t nc=s->rcap?s->rcap*2:16384;
+        while(nc<s->rlen+4096) nc*=2;
+        char *np=(char*)realloc(s->rbuf,nc);
+        if(!np) return -1;
+        s->rbuf=np; s->rcap=nc;
+    }
+    TLSSession *tls=(TLSSession*)tlsv;
+    int n;
+    if(tls){
+        n=tls_recv(tls,fd,s->rbuf+s->rlen,4096);
+        if(n==-2) return 0;
+        if(n==0) return -1;
+    } else {
+#if defined(_WIN32)
+        n=recv(fd,s->rbuf+s->rlen,4096,0);
+#else
+        n=(int)recv(fd,s->rbuf+s->rlen,4096,0);
+#endif
+        if(n==0) return -1;
+        if(n<0) return sock_wouldblock()?0:-1;
+    }
+    if(n<0) return -1;
+    if(n>0) s->rlen+=(size_t)n;
+    return n>0?1:0;
+}
+LFN(f_net_ws_connect){
+    Str *u=checkstr(L,base,nargs,0,"ws_connect");
+    double timeout=nargs>=2?checknum(L,base,nargs,1,"ws_connect"):10;
+    char *url=(char*)malloc((size_t)u->len+1);
+    if(!url) luc_error("net: out of memory");
+    memcpy(url,u->s,(size_t)u->len); url[u->len]=0;
+    char err[192]; err[0]=0;
+    const char *p=url;
+    int iswss=0;
+    if(strncmp(p,"ws://",5)==0) p+=5;
+    else if(strncmp(p,"wss://",6)==0){ p+=6; iswss=1; }
+    else { snprintf(err,sizeof err,"bad url (need ws(s)://host/path)"); goto failurl; }
+    {
+        const char *slash=strchr(p,'/');
+        const char *hostend=slash?slash:p+strlen(p);
+        char host[256]; int port=iswss?443:80;
+        const char *colon=strchr(p,':');
+        if(colon && colon<hostend){
+            size_t hl=(size_t)(colon-p);
+            if(hl>=sizeof host) hl=sizeof host-1;
+            memcpy(host,p,hl); host[hl]=0;
+            port=atoi(colon+1); if(port<=0||port>65535) port=iswss?443:80;
+        } else {
+            size_t hl=(size_t)(hostend-p);
+            if(hl>=sizeof host) hl=sizeof host-1;
+            memcpy(host,p,hl); host[hl]=0;
+        }
+        const char *path=slash?slash:"/";
+        sock_t fd=net_connect_to(host,port,timeout,err,sizeof err);
+        if(fd==SOCK_INVALID) goto failurl;
+        sock_set_blocking(fd,1);
+        sock_set_timeout(fd,1,30); sock_set_timeout(fd,0,30);
+        TLSSession *tls=NULL;
+        if(iswss){
+            if(tls_connect_fd(fd,host,&tls,err,sizeof err)!=0){ sock_closefd(fd); goto failurl; }
+        }
+        /* handshake */
+        unsigned char nonce[16];
+        for(int i=0;i<16;i++) nonce[i]=(unsigned char)(rand()&255);
+        char key[32]; ws_b64(nonce,16,key);
+        char hs[1024];
+        int hn=snprintf(hs,sizeof hs,
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            path,host,key);
+        if(hn<=0||hn>=(int)sizeof hs-1){ snprintf(err,sizeof err,"url too long"); tls_free_session(tls); sock_closefd(fd); goto failurl; }
+        if(!hsend(tls,fd,hs,(size_t)hn,err,sizeof err)){ tls_free_session(tls); sock_closefd(fd); goto failurl; }
+        char resp[4096]; size_t rlen=0;
+        int got101=0;
+        for(;;){
+            int n;
+            if(tls) n=tls_recv(tls,fd,resp+rlen,sizeof resp-rlen-1);
+#if defined(_WIN32)
+            else n=recv(fd,resp+rlen,(int)(sizeof resp-rlen-1),0);
+#else
+            else n=(int)recv(fd,resp+rlen,sizeof resp-rlen-1,0);
+#endif
+            if(n<=0) break;
+            rlen+=(size_t)n;
+            resp[rlen]=0;
+            if(strstr(resp,"\r\n\r\n")){ got101=strstr(resp," 101 ")!=NULL; break; }
+            if(rlen>sizeof resp-512) break;
+        }
+        if(!got101){ snprintf(err,sizeof err,"ws: handshake rejected"); tls_free_session(tls); sock_closefd(fd); goto failurl; }
+        /* verify Sec-WebSocket-Accept */
+        {
+            char combo[128]; unsigned char digest[20]; char expect[32];
+            snprintf(combo,sizeof combo,"%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11",key);
+            ws_sha1((unsigned char*)combo,strlen(combo),digest);
+            ws_b64(digest,20,expect);
+            if(!strstr(resp,expect)){ snprintf(err,sizeof err,"ws: bad accept key"); tls_free_session(tls); sock_closefd(fd); goto failurl; }
+        }
+        sock_set_blocking(fd,0);
+        Socket *s=sock_wrap(fd,0);
+        s->isws=1; s->tlsctx=tls;
+        free(url);
+        RET(0,mkobj(LT_SOCKET,s)); return 1;
+    }
+failurl:
+    free(url);
+    RET(0,NIL); RET(1,cstrv(err)); return 2;
+}
+LFN(f_net_get){
+    Str *u=checkstr(L,base,nargs,0,"get");
+    Str *h=nargs>=2&&AR(1).t!=LT_NIL?checkstr(L,base,nargs,1,"get"):NULL;
+    char *url=(char*)malloc((size_t)u->len+1);
+    if(!url) luc_error("net: out of memory");
+    memcpy(url,u->s,(size_t)u->len); url[u->len]=0;
+    char *hdrs=NULL;
+    if(h){ hdrs=(char*)malloc((size_t)h->len+1); if(hdrs){ memcpy(hdrs,h->s,(size_t)h->len); hdrs[h->len]=0; } }
+    char err[192]; err[0]=0;
+    char *body=NULL; size_t blen=0; int code=0;
+    int ok=net_http(url,"GET",NULL,0,NULL,hdrs,&body,&blen,&code,err,sizeof err);
+    free(url); free(hdrs);
+    if(!ok){ RET(0,NIL); RET(1,cstrv(err)); return 2; }
+    Value v=strv(body,blen); free(body);
+    RET(0,v); RET(1,mknum((double)code)); return 2;
+}
+LFN(f_net_post){
+    Str *u=checkstr(L,base,nargs,0,"post");
+    Str *b=(nargs>=2&&AR(1).t!=LT_NIL)?checkstr(L,base,nargs,1,"post"):NULL;
+    Str *ct=(nargs>=3&&AR(2).t!=LT_NIL)?checkstr(L,base,nargs,2,"post"):NULL;
+    Str *hd=(nargs>=4&&AR(3).t!=LT_NIL)?checkstr(L,base,nargs,3,"post"):NULL;
+    char *url=(char*)malloc((size_t)u->len+1);
+    if(!url) luc_error("net: out of memory");
+    memcpy(url,u->s,(size_t)u->len); url[u->len]=0;
+    char err[192]; err[0]=0;
+    char *rbody=NULL; size_t rlen=0; int code=0;
+    char *hdrs=NULL;
+    if(hd){ hdrs=(char*)malloc((size_t)hd->len+1); if(hdrs){ memcpy(hdrs,hd->s,(size_t)hd->len); hdrs[hd->len]=0; } }
+    int ok=net_http(url,"POST",b?b->s:NULL,b?(int)b->len:0,ct?ct->s:NULL,hdrs,
+                    &rbody,&rlen,&code,err,sizeof err);
+    free(url); free(hdrs);
+    if(!ok){ RET(0,NIL); RET(1,cstrv(err)); return 2; }
+    Value v=strv(rbody,rlen); free(rbody);
+    RET(0,v); RET(1,mknum((double)code)); return 2;
+}
+/* The user-facing recv/accept retry in ordinary LUC (so task.wait yields
+ * correctly and the call transparently retries). Raw attempts ride in as
+ * factory parameters, becoming upvalues of the two methods. */
+static const char *net_methods_src =
+"return function(raw_recv, raw_accept)\n"
+"  create methods = {}\n"
+"  methods.recv = function(s, max, timeout)\n"
+"    create t0 = os.clock()\n"
+"    while true do\n"
+"      create m, e = raw_recv(s, max)\n"
+"      if m != nil then return m end\n"
+"      if e != nil then return nil, e end\n"
+"      if timeout != nil and os.clock() - t0 >= timeout then return nil, \"timeout\" end\n"
+"      task.wait(0.01)\n"
+"    end\n"
+"  end\n"
+"  methods.accept = function(s, timeout)\n"
+"    create t0 = os.clock()\n"
+"    while true do\n"
+"      create c = raw_accept(s)\n"
+"      if c != nil then return c end\n"
+"      if timeout != nil and os.clock() - t0 >= timeout then return nil, \"timeout\" end\n"
+"      task.wait(0.01)\n"
+"    end\n"
+"  end\n"
+"  return methods\n"
+"end\n";
+static int net_methods_built=0;
+static void net_build_methods(LucState *L){
+    if(net_methods_built) return;
+    net_methods_built=1;
+    Closure *cl=luc_compile(net_methods_src,(int)strlen(net_methods_src),"net methods");
+    int sc=L->top;
+    ensure_stack(L,sc+16);
+    L->stack[sc]=mkobj(LT_FUNC,cl);
+    L->top=sc+1;
+    vm_call(L,sc,0,1);             /* outer() -> inner factory at [sc] */
+    L->stack[sc+1]=mkobj(LT_CFUNC,cfunc_new(f_sock_recv_try,"__recv_try",0));
+    L->stack[sc+2]=mkobj(LT_CFUNC,cfunc_new(f_sock_accept_try,"__accept_try",0));
+    L->top=sc+3;
+    vm_call(L,sc,2,1);             /* inner(raw1,raw2) -> methods at [sc] */
+    Value methods=L->stack[sc];
+    if(methods.t!=LT_TABLE) luc_error("net: internal error building methods");
+    L->top=sc+3;   /* keep everything rooted while interning below */
+    tab_set(V.socklib,cstrv("__recv_try"),L->stack[sc+1]);
+    tab_set(V.socklib,cstrv("__accept_try"),L->stack[sc+2]);
+    tab_set(V.socklib,cstrv("recv"),tab_get(AS_TAB(methods),cstrv("recv")));
+    tab_set(V.socklib,cstrv("accept"),tab_get(AS_TAB(methods),cstrv("accept")));
+    L->top=sc;
+}
+Value lucL_net_module(LucState *L){
+    net_startup();
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("connect"),mkobj(LT_CFUNC,cfunc_new(f_net_connect,"connect",0)));
+    tab_set(t,cstrv("serve"),mkobj(LT_CFUNC,cfunc_new(f_net_serve,"serve",0)));
+    tab_set(t,cstrv("get"),mkobj(LT_CFUNC,cfunc_new(f_net_get,"get",0)));
+    tab_set(t,cstrv("post"),mkobj(LT_CFUNC,cfunc_new(f_net_post,"post",0)));
+    tab_set(t,cstrv("ws_connect"),mkobj(LT_CFUNC,cfunc_new(f_net_ws_connect,"ws_connect",0)));
+    tab_set(t,cstrv("raw_recv"),mkobj(LT_CFUNC,cfunc_new(f_sock_recv_try,"raw_recv",0)));
+    tab_set(t,cstrv("raw_accept"),mkobj(LT_CFUNC,cfunc_new(f_sock_accept_try,"raw_accept",0)));
+    net_build_methods(L);
+    return mkobj(LT_TABLE,t);
+}
+void lucL_open_net(void){
+    net_startup();
+    V.socklib=tab_new(0);
+    reg(V.socklib,"send",f_sock_send); reg(V.socklib,"close",f_sock_close);
+}

@@ -182,6 +182,71 @@ print(type(ai.Tokenizer))    -- table
 
 ---
 
+##  Network (net)
+
+TCP + HTTP client/server, built in (Winsock on Windows, no extra DLLs):
+
+```lua
+import net("n")
+
+-- HTTP: one line
+create page, code = n.get("http://example.com")
+print(code)   -- 200
+
+-- echo server: one task per client, blocking-style recv just works
+create s = n.serve(8000)
+while true do
+    create cli = s:accept()
+    task.spawn(function()
+        while true do
+            create m = cli:recv()
+            if m == nil then break end
+            cli:send("echo:" .. m)
+        end
+        cli:close()
+    end)
+end
+```
+
+`n.connect(host, port, timeout?)`, `cli:send/recv/close`, `recv` returns
+`nil, "closed"` on disconnect and `nil, "timeout"` on timeout.
+`http://` and `https://` both work, plus `n.ws_connect(url)` WebSocket
+(`ws://`/`wss://`, ping auto-answered, fragmented messages reassembled).
+
+---
+
+##  Discord bot (discord)
+
+Needs a bot token (https://discord.com/developers/applications, turn on
+MESSAGE CONTENT INTENT to read text) and the library itself:
+
+```
+luc install discord
+```
+
+```lua
+import discord("bot")
+
+create token = bot.token("TOKEN_HERE")
+
+bot:run(token) do
+    while true do
+        create cmd = bot.prefix("!")
+        if cmd == "ping" then
+            bot.msg:send("pong!")
+        end
+    end
+end
+```
+
+More: `bot.msg:send(channel, text)` / `bot.msg:dm(name_or_id, text)` /
+`bot.msg:edit/delete`, `bot.user:join()` (new-member id) /
+`bot.user:getid(name)`, slash commands (`cmd.new("hi", "global")` then
+`cmd.slash("hi")`), `bot:stop()` pause (queues up) / `bot:on(true)` resume /
+`while bot:on() do` status. See `demos/discordbot.luc`.
+
+---
+
 ## Built-in Libraries
 
 | Library | Description |
@@ -197,6 +262,8 @@ print(type(ai.Tokenizer))    -- table
 | `coroutine` | create, resume, yield, wrap |
 | `require("json")` | encode, decode |
 | `import window` | GUI windows, drawing, input (`import window("w")` để đặt tên ngắn) |
+| `import net` | TCP + HTTP(S) client/server, WebSocket (`import net("n")` để đặt tên ngắn) |
+| `import discord` | Discord bot (`luc install discord` first, needs a bot token) |
 
 ---
 
@@ -254,13 +321,13 @@ io.write("\n")
 
 ```bash
 # Console build (no window)
-gcc -O2 -std=c99 -o luc-core src/luc_core.c src/luc_libs.c -lm
+gcc -O2 -std=gnu99 -o luc-core src/luc_core.c src/luc_libs.c src/luc_trans.c -lm -lws2_32
 
 # Window build (Windows MinGW)
-gcc -O2 -std=c99 -DLUC_WINDOW -o luc.exe src/luc_core.c src/luc_libs.c -lm -lSDL2 -lwinhttp
+gcc -O2 -std=gnu99 -DLUC_WINDOW -o luc.exe src/luc_core.c src/luc_libs.c src/luc_trans.c -lm -lSDL2 -lwinhttp -lws2_32
 
 # Window build (Linux)
-gcc -O2 -std=c99 -DLUC_WINDOW -o luc src/luc_core.c src/luc_libs.c -lm -lSDL2
+gcc -O2 -std=gnu99 -DLUC_WINDOW -o luc src/luc_core.c src/luc_libs.c src/luc_trans.c -lm -lSDL2
 ```
 
 ---

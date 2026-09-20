@@ -34,6 +34,7 @@ $AppDir = Join-Path $ProjectDir 'dist\app'
 $InstallerScript = Join-Path $ProjectDir 'installer\luc-installer.iss'
 $SrcCore = Join-Path $ProjectDir 'src\luc_core.c'
 $SrcLibs = Join-Path $ProjectDir 'src\luc_libs.c'
+$SrcTrans = Join-Path $ProjectDir 'src\luc_trans.c'
 
 # luc.exe dang chay se khoa file -> tat het truoc khi lam viec
 Get-Process luc, luc-core, luc-win, luc-fallback -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -68,7 +69,7 @@ function Build-Console {
     param([string]$Gcc)
     Write-Host 'Building luc-core.exe (console)...'
     # -lwinhttp: HTTP client used by the built-in 'luc install' command
-    & $Gcc -O2 -s -std=c99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs -lm -lwinhttp
+    & $Gcc -O2 -s -std=gnu99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs $SrcTrans -lm -lwinhttp -lws2_32 -lsecur32
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-core.exe failed.' }
 }
 
@@ -85,10 +86,20 @@ SDL2 dev files not found. Install them in an MSYS2 MinGW64 shell:
     # NOTE: no -lSDL2_ttf/-lSDL2_image/-lSDL2_mixer here on purpose: the satellite
     # DLLs bind at RUNTIME (LoadLibrary), so the exe starts without them.
     # -lwinhttp: HTTP client used by the built-in 'luc install' command
-    & $Gcc -O2 -s -std=c99 -static-libgcc `
-        -o (Join-Path $AppDir 'luc-win.exe') $SrcCore $SrcLibs `
+    # NOTE: console subsystem on purpose (IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
+    # GUI is 2). Never -mwindows: a GUI-subsystem exe detaches from the
+    # console at launch, so the shell prints the next prompt immediately
+    # and our output arrives late (or never) -- this broke `luc`, `luc
+    # build` and `luc install` for anyone installing the window component
+    # (the installer maps luc-win.exe to luc.exe). -lSDL2main drags in a
+    # WinMain entry that flips the linker to GUI, so force console twice:
+    # -mconsole plus a trailing -Wl,--subsystem,console (last flag wins).
+    # SDL2 windows work fine from a console exe; a console window simply
+    # stays behind GUI apps instead.
+    & $Gcc -O2 -s -std=gnu99 -static-libgcc -mconsole `
+        -o (Join-Path $AppDir 'luc-win.exe') $SrcCore $SrcLibs $SrcTrans `
         -DLUC_WINDOW `
-        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -lwinhttp -mwindows
+        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -lwinhttp -lws2_32 -lsecur32 "-Wl,--subsystem,console"
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-win.exe failed.' }
     Copy-Item $sdlDll (Join-Path $AppDir 'SDL2.dll') -Force
     # minimal SDL2_image/SDL2_mixer (PNG/JPG/GIF + WAV/MP3/OGG/FLAC/OPUS, ~2MB

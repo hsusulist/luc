@@ -3,7 +3,11 @@
 /* update 2026-09-01: added luc install command */
 
 #include "luc.h"
-
+#define LUC_JIT_FALLBACK (-1)
+int  luc_jit_run(Closure *cl);
+int  luc_jit_call(LucState *L,int func,int nargs,int nres);
+int  luc_aot_build(const char *src,int srclen,const char *outpath);
+int  luc_aot_embedded(char **psrc,int *plen);
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <winhttp.h>
@@ -147,6 +151,12 @@ CFunc *cfunc_new(CFn fn,const char *name,int nup){
 FileH *file_new(FILE *f,int isstd){
     FileH *h=(FileH*)newobj(sizeof(FileH),LT_FILE);
     h->f=f; h->isstd=isstd; h->closed=0; return h;
+}
+Socket *sock_new(intptr_t fd,int isserver){
+    Socket *s=(Socket*)newobj(sizeof(Socket),LT_SOCKET);
+    s->fd=fd; s->closed=0; s->isserver=(unsigned char)(isserver!=0); s->tlsctx=NULL;
+    s->isws=0; s->rbuf=NULL; s->frag=NULL;
+    s->rlen=s->rcap=s->fraglen=s->fragcap=0; return s;
 }
 LucState *state_new(int stacksize){
     LucState *L=(LucState*)newobj(sizeof(LucState),LT_CORO);
@@ -381,6 +391,7 @@ static void free_obj(Obj *o){
             pclose(f->f);
 #endif
         } else fclose(f->f); } break; }
+        case LT_SOCKET: { Socket*s=(Socket*)o; if(!s->closed) net_socket_close_fd(s); break; }
         default: break;
     }
     free(o);
@@ -388,10 +399,12 @@ static void free_obj(Obj *o){
 
 void gc_collect(void){
     if(V.gcoff) return;
+    if(getenv("LUC_NOGC")) return;   /* debug escape hatch, off by default */
 /* mark roots */
     mark_obj((Obj*)V.globals);
     mark_obj((Obj*)V.stringlib); mark_obj((Obj*)V.listmeta);
     mark_obj((Obj*)V.bufferlib); mark_obj((Obj*)V.filelib);
+    if(V.socklib) mark_obj((Obj*)V.socklib);
     if(V.listcore) mark_obj((Obj*)V.listcore);
     if(V.tabmeta) mark_obj((Obj*)V.tabmeta);
     mark_obj((Obj*)V.mainco);
@@ -428,7 +441,7 @@ const char *type_name(Value v){
         case LT_TABLE:return "table"; case LT_LIST:return "list";
         case LT_FUNC: case LT_CFUNC:return "function";
         case LT_BUFFER:return "buffer"; case LT_CORO:return "thread";
-        case LT_FILE:return "file";
+        case LT_FILE:return "file"; case LT_SOCKET:return "socket";
     }
     return "userdata";
 }
@@ -1328,6 +1341,24 @@ static Stat *parse_statement(Parser *ps){
                 return s;
             }
             if(e->k!=E_CALL&&e->k!=E_METHCALL) perr(ps,"syntax error near unexpected expression");
+            if(ps->lx.t==TK_DO && ps->lx.tline==e->line){
+                /* trailing-do block, generic sugar for one extra closure
+                 * argument:  f(x) do ... end  ==  f(x, function() ... end).
+                 * Same-line only, so a do-block starting on the next line
+                 * stays a separate statement. No VM/compiler change: the
+                 * block compiles to an ordinary anonymous function. */
+                int bl=ps->lx.tline;
+                lx_next(&ps->lx);
+                FuncBody *fb=(FuncBody*)anew(sizeof(FuncBody));
+                ps->fndepth++;
+                fb->name=NULL; fb->line=bl;
+                fb->params=(Str**)anew(sizeof(Str*)*64);
+                fb->body=parse_block(ps);
+                expect(ps,TK_END);
+                ps->fndepth--;
+                Expr *fn=new_expr(E_FUNC,bl); fn->fb=fb;
+                el_add(&e->args,fn);
+            }
             Stat *s=new_stat(S_CALL,line); s->e1=e;
             return s; }
     }
@@ -1344,31 +1375,7 @@ static Block *parse_block(Parser *ps){
     return b;
 }
 
-/* 9. BYTECODE */
-
-enum {
-    OP_MOVE, OP_LOADK, OP_LOADNIL, OP_LOADBOOL,
-    OP_GETGLOBAL, OP_SETGLOBAL, OP_GETUPVAL, OP_SETUPVAL,
-    OP_GETTABLE, OP_SETTABLE, OP_NEWTABLE, OP_SETLIST, OP_SELF,
-    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
-    OP_UNM, OP_NOT, OP_LEN, OP_CONCAT,
-    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_IN,
-    OP_JMP, OP_JMPIF, OP_JMPIFNOT,
-    OP_CALL, OP_RETURN, OP_CLOSURE, OP_VARARG, OP_CLOSE,
-    OP_FORPREP, OP_FORLOOP, OP_TFORLOOP, OP_SLICE, OP_NEXT,
-    OP_COUNT
-};
-
-#define I_ABC(o,a,b,c) (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|(((uint32_t)(b)&0xFFu)<<8)|((uint32_t)(c)&0xFFu))
-#define I_ABx(o,a,bx)  (((uint32_t)(o)<<24)|(((uint32_t)(a)&0xFFu)<<16)|((uint32_t)(bx)&0xFFFFu))
-#define I_AsBx(o,a,s)  I_ABx(o,a,(int)(s)+32767)
-
-#define GET_OP(i)   ((int)((i)>>24))
-#define GET_A(i)    ((int)(((i)>>16)&0xFFu))
-#define GET_B(i)    ((int)(((i)>>8)&0xFFu))
-#define GET_C(i)    ((int)((i)&0xFFu))
-#define GET_Bx(i)   ((int)((i)&0xFFFFu))
-#define GET_sBx(i)  (GET_Bx(i)-32767)
+/* 9. BYTECODE (opcodes + codecs now shared via luc.h) */
 
 /* 10. COMPILER (AST -> bytecode) */
 
@@ -1506,7 +1513,36 @@ static int exprtmp(FuncState *fs,Expr *e){
     return r;
 }
 
+/* fused x.append(args): dot-form call whose method is the literal "append".
+ * Colon-form (E_METHCALL) is deliberately NOT fused: its generic path
+ * passes self explicitly, a different contract. */
+static int is_append_call(Expr *e,Expr **pself){
+    if(e->k==E_CALL && e->a && e->a->k==E_INDEX && e->a->b && e->a->b->k==E_STR &&
+       e->a->b->str && e->a->b->str->len==6 &&
+       memcmp(e->a->b->str->s,"append",6)==0){ *pself=e->a->a; return 1; }
+    return 0;
+}
+
 static int comp_call(FuncState *fs,Expr *e,int nres){
+    Expr *aself=NULL;
+    if(is_append_call(e,&aself)){
+        /* layout: self at func, explicit args at func+1.. (no method slot,
+         * no bound-method object). OP_APPEND B = explicit count (0 = take
+         * from stack top, for multiret tails), C = nres encoding as CALL. */
+        int func=fs->freereg;
+        reserve(fs,1);
+        exprd(fs,aself,func);
+        int nargs=0, multi=0;
+        for(int i=0;i<e->args.n;i++){
+            Expr *a=e->args.e[i];
+            if(i==e->args.n-1 && multiret(a)){ comp_multi(fs,a,-1); multi=1; }
+            else { int r=reserve(fs,1); exprd(fs,a,r); nargs++; }
+        }
+        emit(fs,I_ABC(OP_APPEND,func,multi?0:nargs,nres<0?0:nres+1),e->line);
+        fs->freereg = func + (nres<0?1:(nres>0?nres:0));
+        checkreg(fs,fs->freereg+1);
+        return func;
+    }
     int func=fs->freereg;
     int nargs=0;
     if(e->k==E_METHCALL){
@@ -1680,6 +1716,48 @@ static void adjust_assign(FuncState *fs,int nvars,EList *rhs,int base){
     checkreg(fs,fs->freereg);
 }
 
+/* side-effect-free index expressions: safe to evaluate once instead of
+ * twice when fusing X[k] <op>= e into a single read-modify-write */
+static int pure_index_expr(Expr *e){
+    switch(e->k){
+        case E_NAME: case E_NUM: case E_STR:
+        case E_NIL: case E_TRUE: case E_FALSE: return 1;
+        case E_INDEX: return pure_index_expr(e->a)&&pure_index_expr(e->b);
+        default: return 0;
+    }
+}
+static int same_index_expr(Expr *a,Expr *b){
+    if(!a||!b||a->k!=b->k) return 0;
+    switch(a->k){
+        case E_NAME: return a->name==b->name;      /* interned */
+        case E_NUM: return a->num==b->num;
+        case E_STR: return a->str==b->str;
+        case E_NIL: case E_TRUE: case E_FALSE: return 1;
+        case E_INDEX: return same_index_expr(a->a,b->a)&&same_index_expr(a->b,b->b);
+        default: return 0;
+    }
+}
+/* X[k] <op>= e  with X,k pure and repeated identically -> one opcode.
+ * Returns 1 when fused (registers restored), 0 to use the generic path. */
+static int try_compound(FuncState *fs,Stat *s){
+    if(s->lhs.n!=1||s->rhs.n!=1) return 0;
+    Expr *lhs=s->lhs.e[0], *rhs=s->rhs.e[0];
+    if(!lhs||lhs->k!=E_INDEX||!rhs||rhs->k!=E_BIN) return 0;
+    int op=0;
+    if(rhs->op=='+') op=OP_ADDEQ; else if(rhs->op=='-') op=OP_SUBEQ;
+    else if(rhs->op=='*') op=OP_MULEQ; else if(rhs->op=='/') op=OP_DIVEQ;
+    else return 0;
+    if(!rhs->a||rhs->a->k!=E_INDEX||!rhs->b) return 0;
+    if(!same_index_expr(lhs,rhs->a)) return 0;
+    if(!pure_index_expr(lhs->a)||!pure_index_expr(lhs->b)) return 0;
+    int save=fs->freereg;
+    int rt=exprtmp(fs,lhs->a), rk=exprtmp(fs,lhs->b);
+    int rv=reserve(fs,1); exprd(fs,rhs->b,rv);
+    emit(fs,I_ABC(op,rt,rk,rv),s->line);
+    fs->freereg=save;
+    return 1;
+}
+
 static void store_to(FuncState *fs,Expr *lhs,int valreg,int line){
     if(lhs->k==E_NAME){
         int r=findlocal(fs,lhs->name);
@@ -1714,6 +1792,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             fs->freereg=fs->nlocals;
             break; }
         case S_ASSIGN: {
+            if(try_compound(fs,s)){ fs->freereg=fs->nlocals; break; }
             int base=fs->freereg;
             adjust_assign(fs,s->lhs.n,&s->rhs,base);
             for(int i=s->lhs.n-1;i>=0;i--) store_to(fs,s->lhs.e[i],base+i,s->line);
@@ -1997,6 +2076,30 @@ int vm_lessthan(Value a,Value b,int orequal){
    obj:append(x) passes self explicitly (E_METHCALL), so when the first
    argument already IS the bound object the trampoline must not inject it again. */
 static int meth_trampoline(LucState *L,int base,int nargs,CFunc *cf){
+    if(cf->up[1].t==LT_FUNC){
+        /* User override (e.g. list.append = function...): call the closure
+         * with self injected, unless self is already first (colon-form).
+         * The frame is rebuilt IN PLACE so results land at base directly
+         * and this C frame does nothing after vm_call returns (tail
+         * position): a yield inside unwinds past us safely, and resumption
+         * continues inside the callee -- never skipping needed epilogue.
+         * (The old code cast it to CFunc* and jumped to a wild address;
+         * a tmp-frame + post-copy version corrupted results whenever a
+         * yield/resume cycle intervened.) */
+        Value meth=cf->up[1], self=cf->up[0];   /* heap-stable across GC */
+        int has_self=nargs>0 && val_rawequal(L->stack[base],self);
+        if(has_self){
+            ensure_stack(L,base+nargs+8);
+            for(int i=nargs-1;i>0;i--) L->stack[base+i+1]=L->stack[base+i];
+            L->stack[base]=meth; L->stack[base+1]=self;
+            return vm_call(L,base,nargs,-1);
+        } else {
+            ensure_stack(L,base+nargs+16);
+            for(int i=nargs-1;i>=0;i--) L->stack[base+i+2]=L->stack[base+i];
+            L->stack[base]=meth; L->stack[base+1]=self;
+            return vm_call(L,base,nargs+1,-1);
+        }
+    }
     CFunc *t=(CFunc*)cf->up[1].u.o;
     if(nargs>0 && val_rawequal(L->stack[base],cf->up[0]))
         return t->fn(L,base,nargs,t);   /* self passed explicitly: use as-is */
@@ -2077,6 +2180,11 @@ static Value vm_index(Value t,Value k){
         case LT_FILE: {
             if(k.t!=LT_STR) return NIL;
             Value m=tab_get(V.filelib,k);
+            return m.t==LT_NIL? NIL : bind_method(t,m);
+        }
+        case LT_SOCKET: {
+            if(k.t!=LT_STR) return NIL;
+            Value m=V.socklib? tab_get(V.socklib,k) : NIL;
             return m.t==LT_NIL? NIL : bind_method(t,m);
         }
         default:
@@ -2217,6 +2325,8 @@ int vm_call(LucState *L,int func,int nargs,int nres){
         return n;
     }
     if(f.t==LT_FUNC){
+        int jn=luc_jit_call(L,func,nargs,nres);      /* add these two lines */
+        if(jn!=LUC_JIT_FALLBACK) return jn;
         int level=L->nci;
         pushframe(L,func,nargs,nres);
         g_cdepth++;
@@ -2258,6 +2368,75 @@ static int vm_metabin(LucState *L,Value x,Value y,const char *ev,Value *out){
     return 0;
 }
 
+/* OP_APPEND fast-path validation: the stock list.append method, resolved
+ * once at startup. If scripts override list.append the pointer differs and
+ * APPEND takes the generic (but still fused, alloc-free) method-call path. */
+static Str *g_appendStr=NULL;
+static Value g_origAppend;
+static void append_cache_init(void){
+    g_appendStr=str_fromc("append");
+    g_origAppend=tab_get(V.listmeta,mkobj(LT_STR,g_appendStr));
+}
+
+/* fused X[k] <op>= v (which: 0:+ 1:- 2:* 3:/). Fast path mirrors the
+ * interpreter's GETTABLE/SETTABLE list fast paths plus a numeric op; the
+ * generic path is GETTABLE semantics + ADD/SUB/MUL/DIV-label semantics +
+ * SETTABLE semantics, so behavior (including concat/metamethods/errors)
+ * is identical to the unfused triple. pc = dispatch pc (post-increment). */
+static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Value vv){
+    static const char *mnames[4]={"__add","__sub","__mul","__div"};
+    if(tv.t==LT_LIST && kv.t==LT_NUM && vv.t==LT_NUM){
+        double d=kv.u.n;
+        if(d>=-2147483648.0 && d<2147483648.0){
+            int i=(int)d;
+            if((double)i==d){
+                Table *tb=AS_TAB(tv); int n=tb->alen;
+                if(i<0) i+=n;
+                if(i>=0 && i<n && n>0 && tb->arr[n-1].t!=LT_NIL){
+                    Value old=tb->arr[i];
+                    if(old.t==LT_NUM){
+                        double r=which==0?old.u.n+vv.u.n : which==1?old.u.n-vv.u.n :
+                                  which==2?old.u.n*vv.u.n : old.u.n/vv.u.n;
+                        tb->arr[i]=mknum(r);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    CallInfo *ci=&L->ci[L->nci-1]; Value *base=L->stack+ci->base;
+    Value oldv=vm_index(tv,kv);
+    if(oldv.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
+        Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+        if(h.t==LT_FUNC||h.t==LT_CFUNC){
+            ci->savedpc=pc;
+            oldv=meta_callv(L,h,(Value[]){tv,kv},2);
+            ci=&L->ci[L->nci-1]; base=L->stack+ci->base;
+            L->top=ci->base+ci->cl->p->maxstack;
+        }
+    }
+    Value nv;
+    if(which==0 && (oldv.t==LT_STR||oldv.t==LT_NUM)&&(vv.t==LT_STR||vv.t==LT_NUM)){
+        nv=vm_concat(oldv,vv);
+    } else if(oldv.t==LT_NUM && vv.t==LT_NUM){
+        double r=which==0?oldv.u.n+vv.u.n : which==1?oldv.u.n-vv.u.n :
+                  which==2?oldv.u.n*vv.u.n : oldv.u.n/vv.u.n;
+        nv=mknum(r);
+    } else {
+        ci->savedpc=pc; Value mr;
+        if(vm_metabin(L,oldv,vv,mnames[which],&mr)){
+            ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+            L->top=ci->base+ci->cl->p->maxstack;
+            nv=mr;
+        } else if(which==0) nv=mknum(arith_num(oldv)+arith_num(vv));
+        else if(which==1) nv=mknum(arith_num(oldv)-arith_num(vv));
+        else if(which==2) nv=mknum(arith_num(oldv)*arith_num(vv));
+        else nv=mknum(arith_num(oldv)/arith_num(vv));
+    }
+    (void)base;
+    vm_setindex(tv,kv,nv);
+}
+
 static void vm_execute(LucState *L,int baselevel){
     CallInfo *ci; Closure *cl; Proto *pr; uint32_t *pc; Value *base; Value *K;
     V.cur=L;
@@ -2274,7 +2453,8 @@ static void vm_execute(LucState *L,int baselevel){
         &&vm_op_GT, &&vm_op_GE, &&vm_op_IN, &&vm_op_JMP, &&vm_op_JMPIF,
         &&vm_op_JMPIFNOT, &&vm_op_CALL, &&vm_op_RETURN, &&vm_op_CLOSURE,
         &&vm_op_VARARG, &&vm_op_CLOSE, &&vm_op_FORPREP, &&vm_op_FORLOOP,
-        &&vm_op_TFORLOOP, &&vm_op_SLICE, &&vm_op_NEXT
+        &&vm_op_TFORLOOP, &&vm_op_SLICE, &&vm_op_NEXT, &&vm_op_APPEND,
+        &&vm_op_ADDEQ, &&vm_op_SUBEQ, &&vm_op_MULEQ, &&vm_op_DIVEQ
     };
 #else
 #define VM_LABEL(name) case OP_##name:
@@ -2309,6 +2489,20 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(SETUPVAL) { *UPVAL_PTR(cl->up[GET_B(ins)])=base[A]; } VM_NEXT;
         VM_LABEL(GETTABLE) {
             Value tv=base[GET_B(ins)], kv=base[GET_C(ins)];
+            if(tv.t==LT_LIST && kv.t==LT_NUM){
+                /* fast path: exact in-range int key. Anything else
+                 * (NaN, fractional, negative-miss, out of range) falls
+                 * through to vm_index, which is behavior-identical. */
+                double d=kv.u.n;
+                if(d>=-2147483648.0 && d<2147483648.0){
+                    int i=(int)d;
+                    if((double)i==d){
+                        Table *tb=AS_TAB(tv); int n=tb->alen;
+                        if(i<0) i+=n;
+                        if(i>=0 && i<n){ base[A]=tb->arr[i]; VM_NEXT; }
+                    }
+                }
+            }
             Value r=vm_index(tv,kv);
             if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
                 Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
@@ -2321,7 +2515,26 @@ static void vm_execute(LucState *L,int baselevel){
             }
             base[A]=r;
         } VM_NEXT;
-        VM_LABEL(SETTABLE) { vm_setindex(base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(SETTABLE) {
+            Value tv=base[A], kv=base[GET_B(ins)], vv=base[GET_C(ins)];
+            if(tv.t==LT_LIST && kv.t==LT_NUM && vv.t!=LT_NIL){
+                /* fast path: in-bounds store of non-nil with a non-nil
+                 * tail (so tab_set's trailing trim is a proven no-op).
+                 * Growth, nil-store, errors -> generic path, identical. */
+                double d=kv.u.n;
+                if(d>=-2147483648.0 && d<2147483648.0){
+                    int i=(int)d;
+                    if((double)i==d){
+                        Table *tb=AS_TAB(tv); int n=tb->alen;
+                        if(i<0) i+=n;
+                        if(i>=0 && i<n && n>0 && tb->arr[n-1].t!=LT_NIL){
+                            tb->arr[i]=vv; VM_NEXT;
+                        }
+                    }
+                }
+            }
+            vm_setindex(base[A],base[GET_B(ins)],base[GET_C(ins)]);
+        } VM_NEXT;
         VM_LABEL(NEWTABLE) {
             if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
             base[A]=mkobj(GET_B(ins)?LT_LIST:LT_TABLE,tab_new(GET_B(ins)));
@@ -2484,6 +2697,39 @@ static void vm_execute(LucState *L,int baselevel){
                     f=hf; na=na+1;
                 } else luc_error("attempt to call a %s value",type_name(f));
             }
+            if(f.t==LT_CFUNC && AS_CF(f)->fn==meth_trampoline &&
+               AS_CF(f)->up[1].t==LT_FUNC){
+                /* bound user-method (obj:method / obj.method where the
+                 * method is a LUC closure): splice into a direct closure
+                 * call here in the interpreter -- no C frame involved, so
+                 * a yield inside unwinds past nothing pending and results
+                 * land via CallInfo/RETURN exactly like a plain call.
+                 * (Routing this through the trampoline CFunc cannot be
+                 * made yield-safe: any C post-processing after the nested
+                 * call is skipped on unwind, corrupting the caller's
+                 * result slot with the stale bound-method object.) */
+                CFunc *tr=AS_CF(f);
+                Value meth=tr->up[1], self=tr->up[0];
+                int has_self=na>0 && val_rawequal(L->stack[func+1],self);
+                ci->savedpc=pc;
+                if(has_self){
+                    /* args already home: [func+1]=self, rest after.
+                     * Only the callee slot needs the method. (No shift:
+                     * unlike the trampoline's arg-base layout, nothing
+                     * moves here -- shifting would duplicate self.) */
+                    ensure_stack(L,func+na+8);
+                    L->stack[func]=meth;
+                    pushframe(L,func,na,nres);
+                } else {
+                    /* explicit args live at [func+1..func+na]; shift only
+                     * those (never the callee slot itself). */
+                    ensure_stack(L,func+na+16);
+                    for(int i=na;i>=1;i--) L->stack[func+i+1]=L->stack[func+i];
+                    L->stack[func]=meth; L->stack[func+1]=self;
+                    pushframe(L,func,na+1,nres);
+                }
+                goto reentry;
+            }
             if(f.t==LT_CFUNC){
                 CFunc *cf=AS_CF(f);
                 ci->savedpc=pc; L->yield_A=A; L->yield_C=nres;
@@ -2496,10 +2742,82 @@ static void vm_execute(LucState *L,int baselevel){
                 L->top = (nres<0)? func+n : ci->base+pr->maxstack;
             } else if(f.t==LT_FUNC){
                 ci->savedpc=pc;
-                pushframe(L,func,na,nres);
-                goto reentry;
+                int jn=luc_jit_call(L,func,na,nres);
+                if(jn!=LUC_JIT_FALLBACK){
+                    base=L->stack+ci->base;   /* ensure_stack may have moved it */
+                    L->top = (nres<0)? func+jn : ci->base+pr->maxstack;
+                } else {
+                    pushframe(L,func,na,nres);
+                    goto reentry;
+                }
             } else luc_error("attempt to call a %s value",type_name(f));
         } VM_NEXT;
+        VM_LABEL(APPEND) {
+            /* fused x.append(args...): A=self, B=explicit arg count
+             * (0 = rest from stack top, multiret tail), C=nres as CALL */
+            int b=GET_B(ins), c=GET_C(ins);
+            int n = b? b : (int)(L->top-(ci->base+A+1));
+            int nres = c? c-1 : -1;
+            Value self=base[A];
+            if(self.t==LT_LIST &&
+               val_rawequal(tab_get(V.listmeta,mkobj(LT_STR,g_appendStr)),g_origAppend)){
+                /* stock list.append: push directly, no method object, no
+                 * call. list_push never allocates GC-visible memory and
+                 * never errors, so no savedpc/GC bookkeeping is needed. */
+                Table *t=AS_TAB(self);
+                for(int i=0;i<n;i++) list_push(t,base[A+1+i]);
+                base[A]=self;
+                if(nres>=0){ for(int i=1;i<nres;i++) base[A+i]=NIL; L->top=ci->base+pr->maxstack; }
+                else L->top=ci->base+A+1;
+                VM_NEXT;
+            }
+            /* Generic .append: identical to GETTABLE "append" + CALL with
+             * (args...) and no self (dot-form contract). The callee runs
+             * IN PLACE at A so its results land at A directly and this
+             * label does nothing after vm_call returns (tail position):
+             * a yield inside unwinds safely, resumption continues inside
+             * the callee -- never skipping needed epilogue (same hazard
+             * class as meth_trampoline's old tmp-frame, now fixed there
+             * too). Self is parked in a keep-slot above top so the
+             * overwrite of A can't unroot a temporary self mid-call. */
+            ci->savedpc=pc; L->yield_A=A; L->yield_C=nres;
+            ensure_stack(L,L->top+2*n+16);
+            base=L->stack+ci->base;
+            Value kv=mkobj(LT_STR,g_appendStr);
+            Value m=vm_index(base[A],kv);
+            if(m.t==LT_NIL && base[A].t==LT_TABLE && AS_TAB(base[A])->meta){
+                Value h=tab_get(AS_TAB(base[A])->meta,mkobj(LT_STR,str_fromc("__index")));
+                if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                    m=meta_callv(L,h,(Value[]){base[A],kv},2);
+                    ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                    L->top=ci->base+pr->maxstack;
+                }
+            }
+            int got, nargs=n, plain=1;
+            if(m.t==LT_TABLE){
+                Table *mtb=AS_TAB(m)->meta;
+                Value hf=mtb?tab_get(mtb,mkobj(LT_STR,str_fromc("__call"))):NIL;
+                if(hf.t==LT_FUNC||hf.t==LT_CFUNC){
+                    /* shift [A..A+n] right by one: [A]=hf [A+1]=m, args */
+                    for(int i=n;i>=0;i--) base[A+i+1]=base[A+i];
+                    base[A]=hf; nargs=n+1; plain=0;
+                }
+            }
+            if(plain){
+                /* park self above top (stay rooted), method goes at A */
+                int keep=L->top;
+                L->stack[keep]=base[A];
+                L->top=keep+1;
+                base[A]=m;
+            }
+            got=vm_call(L,ci->base+A,nargs,nres);
+            ci=&L->ci[L->nci-1];   /* vm_call may grow frames */
+            L->top=nres>=0?ci->base+pr->maxstack:ci->base+A+got;
+        } VM_NEXT;
+        VM_LABEL(ADDEQ) { vm_compound(L,0,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(SUBEQ) { vm_compound(L,1,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(MULEQ) { vm_compound(L,2,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(DIVEQ) { vm_compound(L,3,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
         VM_LABEL(RETURN) {
             int b=GET_B(ins);
             int n = b? b-1 : (int)(L->top-(ci->base+A));
@@ -2691,6 +3009,27 @@ void sched_run(void){
         }
     }
 }
+/* run tasks whose wake time already passed; never sleep. Lets main-thread
+ * waits (task.wait at top level) pump other tasks instead of freezing. */
+void sched_poll(void){
+    Value res[32]; int nres;
+    double now=luc_now();
+    for(int i=0;i<V.nsched;){
+        if(V.sched[i].wake>now){ i++; continue; }
+        LucState *co=V.sched[i].co;
+        double wake=V.sched[i].wake;
+        sched_remove(i);
+        if(co->status==CO_DEAD) continue;
+        double elapsed=now-(wake-co->waketime);
+        Value arg=mknum(elapsed>0?elapsed:0);
+        if(co_resume(co,&arg,1,res,&nres)){
+            Str *s=tostr(V.errval);
+            fprintf(stderr,"luc: error in task: %s\n",s->s);
+        }
+        now=luc_now();
+    }
+}
+
 
 const char *const HEXD="0123456789abcdef";
 
@@ -2842,10 +3181,12 @@ static void luc_openlibs(void){
     lucL_open_io();
     lucL_open_buffer();
     lucL_open_coro();
+    lucL_open_net();
 /* core-level additions on top of the libs */
     V.listcore=tab_new(0);
     reg(V.listcore,"remove",f_core_remove);       /* by value, returns bool */
     V.tabmeta=tab_new(0);
+    append_cache_init();
     reg(V.tabmeta,"keys",f_dict_keys);
     reg(V.tabmeta,"values",f_dict_values);
     tab_set(V.globals,cstrv("len"),mkobj(LT_CFUNC,cfunc_new(f_core_len,"len",0)));
@@ -2918,6 +3259,7 @@ typedef struct { const char *name; const char *desc; } PkgInfo;
 static const PkgInfo PKGS[]={
     {"window","SDL2 window support (2D graphics, PNG/JPG sprites, TTF text, WAV/OGG/MP3 sound)"},
     {"ai",    "lanternl AI library - import ai (tensor, nn, tokenizer)"},
+    {"discord","Discord bot library - import discord (needs a bot token)"},
 };
 
 static const char *pkg_base_url(void){
@@ -3265,6 +3607,41 @@ static int pkg_install_ai(void){
     return 0;
 }
 
+static int pkg_install_discord(void){
+    char mods[1200],tmp[1300],url[1200],pkg[1300];
+    long sz=0;
+    int offline;
+    pkg_install_path(mods,sizeof mods,"luc_modules");
+    pkg_mkdir(mods);
+    /* the installer ships packages/discord.lucpkg next to luc.exe: try it first */
+    pkg_install_path(pkg,sizeof pkg,"packages/discord.lucpkg");
+    offline=pkg_file_exists(pkg);
+    if(offline){
+        printf("using bundled package: %s\n",pkg);
+        snprintf(tmp,sizeof tmp,"%s",pkg);
+    } else {
+        snprintf(tmp,sizeof tmp,"%s/discord.lucpkg.tmp",mods);
+        pkg_join_url(url,sizeof url,"packages/discord.lucpkg");
+        printf("downloading %s\n",url);
+        if(!pkg_http_get(url,tmp,&sz)){
+            fprintf(stderr,"luc install: download failed (no internet, and no\n");
+            fprintf(stderr,"  packages/discord.lucpkg folder next to luc.exe)\n");
+            remove(tmp); return 1;
+        }
+        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
+        printf("  discord.lucpkg  %s\n",hs);
+    }
+    int n=pkg_unpack_bundle(tmp,mods);
+    if(!offline) remove(tmp);
+    if(n<=0){
+        fprintf(stderr,"luc install: package file is empty or invalid\n");
+        return 1;
+    }
+    printf("installed %d modules -> %s\n",n,mods);
+    printf("get a bot token at https://discord.com/developers/applications\n");
+    return 0;
+}
+
 static int cmd_install(int argc,char **argv){
     if(argc<3){
         char dir[1024];
@@ -3276,12 +3653,13 @@ static int cmd_install(int argc,char **argv){
             int inst=0;
             if(have){
                 if(!strcmp(PKGS[k].name,"window")) snprintf(p,sizeof p,"%s/SDL2.dll",dir);
-                else snprintf(p,sizeof p,"%s/luc_modules/ai.luc",dir);
+                else if(!strcmp(PKGS[k].name,"ai")) snprintf(p,sizeof p,"%s/luc_modules/ai.luc",dir);
+                else snprintf(p,sizeof p,"%s/luc_modules/discord.luc",dir);
                 inst=pkg_file_exists(p);
             }
             printf("  %-8s %-58s [%s]\n",PKGS[k].name,PKGS[k].desc,inst?"installed":"not installed");
         }
-        printf("\nusage: luc install <name>            install a package (window, ai)\n");
+        printf("\nusage: luc install <name>            install a package (window, ai, discord)\n");
         printf("       luc install window --force    redownload window support\n");
         return 0;
     }
@@ -3289,7 +3667,8 @@ static int cmd_install(int argc,char **argv){
     int force=(argc>3 && (!strcmp(argv[3],"--force")||!strcmp(argv[3],"-f")));
     if(!strcmp(name,"window")) return pkg_install_window(force);
     if(!strcmp(name,"ai"))     return pkg_install_ai();
-    fprintf(stderr,"luc install: unknown package '%s' (available: window, ai)\n",name);
+    if(!strcmp(name,"discord")) return pkg_install_discord();
+    fprintf(stderr,"luc install: unknown package '%s' (available: window, ai, discord)\n",name);
     return 1;
 }
 
@@ -3299,7 +3678,7 @@ static void print_help(void){
     "usage: luc [options] [script [args...]]\n\n"
     "  script.luc          run a LUC source file\n"
     "  -e \"chunk\"          execute LUC code from the command line\n"
-    "  install [pkg]       list or install a package  (window, ai)\n"
+    "  install [pkg]       list or install a package  (window, ai, discord)\n"
     "  -v, --version       print version and exit\n"
     "  -h, --help          print this help and exit\n\n"
     "variables\n"
@@ -3373,11 +3752,20 @@ int main(int argc,char **argv){
     luc_win_attach_console();
     if(argc>0) snprintf(g_exepath,sizeof g_exepath,"%s",argv[0]);
     luc_init();
+    {   char *esrc=NULL; int elen=0;
+        if(luc_aot_embedded(&esrc,&elen)){          /* we are a built executable */
+            set_scriptdir(argv[0]);
+            int rc=run_chunk(esrc,elen,"=(embedded)",argc,argv,1);
+            free(esrc);
+            return rc;
+        }
+    }
 
     if(argc<2){ print_help(); return 0; }
+    
 
     if(strcmp(argv[1],"--version")==0||strcmp(argv[1],"-v")==0){
-        printf("%s  [C99 register VM]\n",LUC_VERSION);
+        printf("%s  [C99 register VM + x86-64 JIT]\n",LUC_VERSION);
         return 0;
     }
     if(strcmp(argv[1],"--help")==0||strcmp(argv[1],"-h")==0){
@@ -3388,6 +3776,21 @@ int main(int argc,char **argv){
         if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
         return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);
     }
+
+    if(strcmp(argv[1],"build")==0){
+        if(argc<3){ fprintf(stderr,"luc build: usage: luc build in.luc -o out.exe\n"); return 1; }
+        const char *outp="out.exe";
+        for(int i=3;i+1<argc;i++)
+            if(strcmp(argv[i],"-o")==0){ outp=argv[i+1]; break; }
+        int blen=0; char *bsrc=read_file(argv[2],&blen);
+        if(!bsrc){ fprintf(stderr,"luc: cannot open '%s'\n",argv[2]); return 1; }
+        int off=0; if(blen>1 && bsrc[0]=='#'){ while(off<blen && bsrc[off]!='\n') off++; }
+        set_scriptdir(argv[2]);
+        int rc=luc_aot_build(bsrc+off,blen-off,outp);
+        free(bsrc);
+    return rc;
+    }
+
     if(strcmp(argv[1],"install")==0)
         return cmd_install(argc,argv);
 

@@ -127,9 +127,11 @@ Source: "..\demos\*"; DestDir: "{app}\demos"; Flags: ignoreversion
 ; external: {srcexe} resolves at run time, not compile time
 Source: "{srcexe}"; DestDir: "{app}"; DestName: "luc-installer.exe"; Flags: external ignoreversion; Check: NotSelfCopy
 ; lanternl AI library (loaded via 'import ai', also reachable through LUC_PATH)
-Source: "..\luc_modules\*"; DestDir: "{app}\luc_modules"; Components: ailib; Flags: ignoreversion recursesubdirs createallsubdirs
+; (discord.luc ships separately via "luc install discord", not with ailib)
+Source: "..\luc_modules\*"; DestDir: "{app}\luc_modules"; Components: ailib; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "discord.luc"
 ; Offline package source for "luc install ai|window" (works with no internet)
 Source: "..\packages\ai.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\packages\discord.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\luc-win.exe"; DestDir: "{app}\packages\window"; DestName: "luc-win.exe"; Flags: ignoreversion
 Source: "..\dist\app\SDL2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
 Source: "..\dist\app\SDL2_ttf.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
