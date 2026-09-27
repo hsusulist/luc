@@ -1,0 +1,23 @@
+-- demos/libs_libaries/block.luc -- `name:` + body + `end` calls a command
+-- with the body as its block argument (needs `import libs` first)
+-- run: luc "demos/libs_libaries/block.luc"
+
+import libs
+
+-- config stores the block; train runs it later
+create saved = nil
+
+command config(b)
+    saved = b
+end
+
+command train()
+    print("training")
+    saved()
+end
+
+config:
+    print("cfg loaded")
+end
+
+train()

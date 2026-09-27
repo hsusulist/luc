@@ -1,0 +1,17 @@
+-- demos/libs_libaries/use.luc -- use a packed lib (no require, no paths)
+-- needs demos/libs_libaries/mymath.luic next to this file
+-- (run pack.luc once to build it)
+-- run: luc "demos/libs_libaries/use.luc"   (from the repo root)
+
+import libs
+
+-- whole part, bound as a table:
+import add from mymath
+import sub from mymath
+print(add.plus(3, 4))     -- 7
+print(sub.minus(9, 5))    -- 4
+print(add.tag)            -- A
+
+-- single symbol, found inside whichever part exports it:
+import plus from mymath
+print(plus(1, 2))         -- 3

@@ -1,6 +1,6 @@
 -- demos/discordslash.luc -- slash commands + stop/on (import discord)
 -- needs the applications.commands scope when inviting the bot
--- run: luc "demos/discord libaries/discordslash.luc"
+-- run: luc "demos/discord_libaries/discordslash.luc"
 -- use in Discord: /hi -> bot answers, /stop -> bot pauses 5s
 
 import discord("bot")

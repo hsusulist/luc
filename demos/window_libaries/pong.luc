@@ -1,7 +1,7 @@
 import window
 -- settings
 create WW, WH      = 900, 560
-create WIN_SCORE   = 7
+create WIN_SCORE   = 5
 create PW, PH      = 14, 96
 create MARGIN      = 26
 create P_SPEED     = 430
@@ -66,7 +66,7 @@ create function score_point(who)
     if who == "p" then pscore += 1 else ascore += 1 end
     if pscore >= WIN_SCORE or ascore >= WIN_SCORE then
         state = "over"
-        winner = (pscore >= WIN_SCORE) and "BAN THANG!" or "MAY THANG!"
+        winner = (pscore >= WIN_SCORE) and "You win!" or "Computer win!"
     else
         serve(who == "p" and 1 or -1)
     end
@@ -170,16 +170,16 @@ create function draw()
     window.text(tostring(pscore), WW/2 - 112, 24, TXT_C, 60)
     window.text(tostring(ascore), WW/2 + 70, 24, TXT_C, 60)
     if state == "serve" then
-        center_text("SAP PHAT BONG...", WH - 44, "silver", 16)
+        center_text("Starting...", WH - 44, "silver", 16)
     elseif state == "play" and paused then
         window.rect(0, 0, WW, WH, DIM_C)
-        center_text("TAM DUNG", WH/2 - 40, TXT_C, 40)
-        center_text("SPACE: TIEP TUC", WH/2 + 20, "silver", 16)
+        center_text("Pause", WH/2 - 40, TXT_C, 40)
+        center_text("SPACE: Continue", WH/2 + 20, "silver", 16)
     elseif state == "over" then
         window.rect(0, 0, WW, WH, DIM_C)
         center_text(winner, WH/2 - 60, TXT_C, 48)
         center_text(tostring(pscore) + " - " + tostring(ascore), WH/2 - 4, "gold", 32)
-        center_text("R: CHOI LAI      ESC: THOAT", WH/2 + 48, "silver", 16)
+        center_text("R: Again      ESC: Leave", WH/2 + 48, "silver", 16)
     end
 end
 

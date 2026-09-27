@@ -1,4 +1,4 @@
-# LUC 0.1 - build the Inno Setup installer (PREBUILT binaries)
+# LUC 0.2-beta1 - build the Inno Setup installer (PREBUILT binaries)
 # update 2026-09-01: -lwinhttp for both builds, no installer\sdl2 fallback
 #
 # The installer ships READY-TO-RUN exes + SDL2.dll. The USER'S PC needs
@@ -69,7 +69,7 @@ function Build-Console {
     param([string]$Gcc)
     Write-Host 'Building luc-core.exe (console)...'
     # -lwinhttp: HTTP client used by the built-in 'luc install' command
-    & $Gcc -O2 -s -std=gnu99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs $SrcTrans -lm -lwinhttp -lws2_32 -lsecur32
+    & $Gcc -O2 -s -std=gnu99 -static-libgcc -o (Join-Path $AppDir 'luc-core.exe') $SrcCore $SrcLibs $SrcTrans -lm -lwinhttp -lws2_32 -lsecur32 -lcrypt32
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-core.exe failed.' }
 }
 
@@ -99,7 +99,7 @@ SDL2 dev files not found. Install them in an MSYS2 MinGW64 shell:
     & $Gcc -O2 -s -std=gnu99 -static-libgcc -mconsole `
         -o (Join-Path $AppDir 'luc-win.exe') $SrcCore $SrcLibs $SrcTrans `
         -DLUC_WINDOW `
-        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -lwinhttp -lws2_32 -lsecur32 "-Wl,--subsystem,console"
+        "-I$sdlInc" "-L$sdlLib" -lm -lmingw32 -lSDL2main -lSDL2 -lwinhttp -lws2_32 -lsecur32 -lcrypt32 "-Wl,--subsystem,console"
     if ($LASTEXITCODE -ne 0) { throw 'Build luc-win.exe failed.' }
     Copy-Item $sdlDll (Join-Path $AppDir 'SDL2.dll') -Force
     # minimal SDL2_image/SDL2_mixer (PNG/JPG/GIF + WAV/MP3/OGG/FLAC/OPUS, ~2MB
@@ -190,4 +190,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host 'Installer created successfully: dist\luc-installer.exe'
-Write-Host 'Welcome page should say "LUC 0.1" - if not, the old .iss is being used.'
+Write-Host 'Welcome page should say "LUC 0.2-beta1" - if not, the old .iss is being used.'

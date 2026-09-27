@@ -1,4 +1,4 @@
-LUC 0.1 - BUILDING THE WINDOWS INSTALLER (prebuilt)
+LUC 0.2-beta1 - BUILDING THE WINDOWS INSTALLER (prebuilt)
 =========================================================
 
 What changed (prebuilt installer)
@@ -40,8 +40,8 @@ How to build dist\luc-installer.exe
 3. Inno Setup 6/7 (ISCC.exe) packs dist\luc-installer.exe.
 
 Verify the version: the Welcome page must say
-"LUC 0.1 - everything is prebuilt - no compiler, no MSYS2 ...".
-AppVersion is 0.1.
+"LUC 0.2-beta1 - everything is prebuilt - no compiler, no MSYS2 ...".
+AppVersion is 0.2-beta1.
 
 Component layout (Components page - large libs each have their own index)
 ----------------------------------

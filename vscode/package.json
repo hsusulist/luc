@@ -1,8 +1,8 @@
 {
   "name": "luc-language",
   "displayName": "LUC Language",
-  "description": "Language support for LUC (.luc files)",
-  "version": "0.1.0",
+  "description": "Syntax highlighting and snippets for LUC (.luc files)",
+  "version": "0.2.1",
   "publisher": "hsusulist",
   "engines": { "vscode": "^1.70.0" },
   "categories": ["Programming Languages"],
@@ -25,6 +25,12 @@
         "language": "luc",
         "scopeName": "source.luc",
         "path": "./syntaxes/luc.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "luc",
+        "path": "./snippets/luc.json"
       }
     ],
     "iconThemes": [

@@ -159,9 +159,13 @@ LFN(f_require){ UNUSED_SELF;
 }
 /* import loads the system libraries that ship with LUC itself:
      import window        import ai        import json        import net
+     import discord       import libs
    plus the short-name form:  import window("w")
+   `import libs` also unlocks the user-library syntax for the rest of the
+   chunk: make / get / pack / command / import-from.
    Third-party modules never go through import - they use require:
      create mywin = require("mywin")                                     */
+static Value libs_module(void);   /* defined with the other libs helpers below */
 LFN(f_import){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"import");
     char keybuf[512]; snprintf(keybuf,sizeof keybuf,"system:%s",name->s);
@@ -199,13 +203,317 @@ LFN(f_import){ UNUSED_SELF;
         vm_call(L,scratch,0,1);
         m=L->stack[scratch];
         if(m.t==LT_NIL) m=mkbool(1);
+    }else if(strcmp(name->s,"libs")==0){
+        m=libs_module();
     }else{
-        luc_error("module '%s' is not a LUC system library (system: window, ai, json, net, discord)\n"
+        luc_error("module '%s' is not a LUC system library (system: window, ai, json, net, discord, libs)\n"
                   "third-party modules use: create %s = require(\"%s\")",
                   name->s,name->s,name->s);
     }
     tab_set(V.loaded,key,m);
     RET(0,m); return 1;
+}
+/* libs (make/get/pack/import-from) runtime.
+   `make <name>` marks a chunk as a lib part, and the compiler makes such a
+   chunk return its export table. These three functions load and bundle parts. */
+
+/* compile src and run it for exactly 1 result (mirrors f_require) */
+static Value libs_run1(LucState *L,int base,int nargs,const char *src,int len,const char *found){
+    int scratch=base+nargs+2;
+    ensure_stack(L,scratch+16);
+    Closure *cl=luc_compile(src,len,found);
+    L->stack[scratch]=mkobj(LT_FUNC,cl);
+    vm_call(L,scratch,0,1);
+    return L->stack[scratch];
+}
+
+/* __get("part"): load a lib part by MAKE name (script dir, cwd, luc_modules, LUC_PATH) */
+LFN(f_get){ UNUSED_SELF;
+    Str *name=checkstr(L,base,nargs,0,"get");
+    int len=0; char found[1024];
+    char *src=find_module(name->s,&len,found,sizeof found);
+    if(!src) luc_error("get: part '%s' not found (looked for %s.luc next to the script, in cwd, luc_modules/ and LUC_PATH)",name->s,name->s);
+    char mk[256];
+    if(!part_make_name(found,mk,sizeof mk) || strcmp(mk,name->s)!=0){
+        char msg[640];
+        if(!part_make_name(found,mk,sizeof mk))
+            snprintf(msg,sizeof msg,"get: '%s' is not a lib part (its first line is not 'make %s')",found,name->s);
+        else snprintf(msg,sizeof msg,"get: '%s' declares 'make %s', not 'make %s' (rename the file or the make line)",found,mk,name->s);
+        free(src);
+        luc_error("%s",msg);
+    }
+    char keybuf[1152]; snprintf(keybuf,sizeof keybuf,"get:%s",found);
+    Value key=cstrv(keybuf);
+    Value cached=tab_get(V.loaded,key);
+    if(cached.t!=LT_NIL){ free(src); RET(0,cached); return 1; }
+    Value res=libs_run1(L,base,nargs,src,len,found);
+    free(src);
+    if(res.t!=LT_TABLE && res.t!=LT_LIST)
+        luc_error("get: part '%s' did not return a table",name->s);
+    tab_set(V.loaded,key,res);
+    RET(0,res); return 1;
+}
+
+/* __pack("lib", {"a","b",...}): bundle part sources into <lib>.luic */
+LFN(f_pack){ UNUSED_SELF;
+    Str *lib=checkstr(L,base,nargs,0,"pack");
+    Table *parts=checktab(L,base,nargs,1,"pack");
+    int n=tab_len(parts);
+    if(n<1) luc_error("pack: nothing to bundle (get some parts first: get a, b then pack %s)",lib->s);
+    if(n>4096) luc_error("pack: too many parts (%d)",n);
+    char **srcs=(char**)lmalloc(sizeof(char*)*(size_t)n);
+    int *lens=(int*)lmalloc(sizeof(int)*(size_t)n);
+    int got=0;
+    for(int i=0;i<n;i++){
+        Value v=tab_get(parts,mknum((double)(i+1)));
+        if(v.t!=LT_STR){
+            for(int k=0;k<got;k++) free(srcs[k]);
+            free(srcs); free(lens);
+            luc_error("pack: part name #%d must be a string",i+1);
+        }
+        Str *pn=AS_STR(v);
+        int len=0; char found[1024];
+        char *src=find_module(pn->s,&len,found,sizeof found);
+        char mk[256]; int okmk=src && part_make_name(found,mk,sizeof mk) && !strcmp(mk,pn->s);
+        if(!okmk){
+            if(src) free(src);
+            for(int k=0;k<got;k++) free(srcs[k]);
+            free(srcs); free(lens);
+            if(!src) luc_error("pack: part '%s' not found",pn->s);
+            luc_error("pack: '%s' is not 'make %s'",found,pn->s);
+        }
+        srcs[got]=src; lens[got]=len; got++;
+    }
+    const char *sd=luc_scriptdir();
+    char outp[1024];
+    if(sd&&*sd){
+        char sep=(sd[strlen(sd)-1]!='/'&&sd[strlen(sd)-1]!='\\')?'/':0;
+        if(sep) snprintf(outp,sizeof outp,"%s/%s.luic",sd,lib->s);
+        else snprintf(outp,sizeof outp,"%s%s.luic",sd,lib->s);
+    } else snprintf(outp,sizeof outp,"%s.luic",lib->s);
+    FILE *f=fopen(outp,"wb");
+    if(!f){
+        for(int k=0;k<got;k++) free(srcs[k]);
+        free(srcs); free(lens);
+        luc_error("pack: cannot write '%s'",outp);
+    }
+    fprintf(f,"!luic1\nlib %s\nparts %d\n",lib->s,n);
+    for(int i=0;i<n;i++){
+        Value v=tab_get(parts,mknum((double)(i+1)));
+        fprintf(f,"==== %s %d\n",AS_STR(v)->s,lens[i]);
+        if(lens[i]) fwrite(srcs[i],1,(size_t)lens[i],f);
+        fputc('\n',f);
+        free(srcs[i]);
+    }
+    fclose(f);
+    free(srcs); free(lens);
+    printf("[pack] %d part(s) -> %s\n",n,outp);
+    RET(0,cstrv(outp)); return 1;
+}
+
+typedef struct { char *name; const char *src; int len; } PackPart;
+static void pack_abort(PackPart *pp,int n,const char *fmt,const char *a);
+
+/* parse a .luic buffer into parts (sources point into the buffer) */
+static int pack_parse(const char *lib,char *src,int len,PackPart **out,int *nout){
+    const char *p=src,*end=src+len;
+    char line[512];
+    int cap=16, n=0;
+    PackPart *pp=(PackPart*)lmalloc(sizeof(PackPart)*(size_t)cap);
+#define NEXTLINE() do{ size_t n_=0; while(p<end&&*p!='\n'&&*p!='\r'){ if(n_+1<sizeof line) line[n_]=*p; n_++; p++; } line[n_<sizeof line?n_:sizeof line-1]=0; while(p<end&&(*p=='\n'||*p=='\r')) p++; }while(0)
+    NEXTLINE();
+    if(strcmp(line,"!luic1")!=0){ pack_abort(pp,0,"bad pack (not a .luic file)",""); }
+    NEXTLINE();
+    if(strncmp(line,"lib ",4)!=0||strcmp(line+4,lib)!=0){ pack_abort(pp,0,"pack is for lib '%s'",line+4); }
+    NEXTLINE();
+    int want=0;
+    if(sscanf(line,"parts %d",&want)!=1||want<1||want>4096){ pack_abort(pp,0,"bad pack manifest",""); }
+    while(n<want){
+        if(n==cap){ cap*=2; pp=(PackPart*)lrealloc(pp,sizeof(PackPart)*(size_t)cap); }
+        NEXTLINE();
+        char pn[256]; int blen=-1;
+        if(sscanf(line,"==== %255s %d",pn,&blen)!=2||blen<0||p+blen>end){ pack_abort(pp,n,"bad pack part header",""); }
+        { int ok=pn[0]&&(isalpha((unsigned char)pn[0])||pn[0]=='_');
+          for(int i=1;pn[i]&&ok;i++) ok=isalnum((unsigned char)pn[i])||pn[i]=='_';
+          if(!ok){ pack_abort(pp,n,"bad pack part name",""); } }
+        pp[n].name=(char*)lmalloc(strlen(pn)+1); memcpy(pp[n].name,pn,strlen(pn)+1);
+        pp[n].src=p; pp[n].len=blen;
+        p+=blen;
+        if(p<end&&*p=='\r') p++;
+        if(p<end&&*p=='\n') p++; else { pack_abort(pp,n,"bad pack body",""); }
+        n++;
+    }
+#undef NEXTLINE
+    *out=pp; *nout=n; return 1;
+}
+
+static void pack_parts_free(PackPart *pp,int n){ for(int i=0;i<n;i++) free(pp[i].name); free(pp); }
+
+/* like pack_parts_free, then throw (pack_parse error paths) */
+static void pack_abort(PackPart *pp,int n,const char *fmt,const char *a){
+    pack_parts_free(pp,n);
+    luc_error(fmt,a);
+}
+
+/* __import_from("lib","sym"): part table when sym is a part, else the symbol
+ * found in exactly one part's table (pack first, then a lone <lib>.luc file) */
+LFN(f_import_from){ UNUSED_SELF;
+    Str *lib=checkstr(L,base,nargs,0,"import-from");
+    Str *sym=checkstr(L,base,nargs,1,"import-from");
+    int plen=0; char pfound[1024];
+    char *psrc=find_pack(lib->s,&plen,pfound,sizeof pfound);
+    if(psrc){
+        PackPart *pp=NULL; int np=0;
+        pack_parse(lib->s,psrc,plen,&pp,&np);
+        /* phase 1: sym names a part -> its whole table */
+        for(int i=0;i<np;i++) if(!strcmp(pp[i].name,sym->s)){
+            char keybuf[1408]; snprintf(keybuf,sizeof keybuf,"packpart:%s#%s",pfound,pp[i].name);
+            Value key=cstrv(keybuf);
+            Value cached=tab_get(V.loaded,key);
+            if(cached.t==LT_NIL){
+                Value res=libs_run1(L,base,nargs,pp[i].src,pp[i].len,pfound);
+                if(res.t!=LT_TABLE && res.t!=LT_LIST){ pack_parts_free(pp,np); free(psrc); luc_error("lib '%s': part '%s' did not return a table",lib->s,pp[i].name); }
+                tab_set(V.loaded,key,res);
+                cached=res;
+            }
+            pack_parts_free(pp,np); free(psrc);
+            RET(0,cached); return 1;
+        }
+        /* phase 2: sym lives inside exactly one part's table */
+        int hits=0, hitat=-1; Value hitv=NIL;
+        for(int i=0;i<np;i++){
+            char keybuf[1408]; snprintf(keybuf,sizeof keybuf,"packpart:%s#%s",pfound,pp[i].name);
+            Value key=cstrv(keybuf);
+            Value t=tab_get(V.loaded,key);
+            if(t.t==LT_NIL){
+                t=libs_run1(L,base,nargs,pp[i].src,pp[i].len,pfound);
+                if(t.t!=LT_TABLE && t.t!=LT_LIST){ pack_parts_free(pp,np); free(psrc); luc_error("lib '%s': part '%s' did not return a table",lib->s,pp[i].name); }
+                tab_set(V.loaded,key,t);
+            }
+            if(t.t==LT_TABLE || t.t==LT_LIST){
+                Value v=tab_get(AS_TAB(t),mkobj(LT_STR,sym));
+                if(v.t!=LT_NIL){ hits++; hitat=i; hitv=v; }
+            }
+        }
+        pack_parts_free(pp,np); free(psrc);
+        if(hits==1){ RET(0,hitv); return 1; }
+        if(hits>1) luc_error("lib '%s': '%s' is ambiguous (in %d parts) - import the part and index it",lib->s,sym->s,hits);
+        { char parts[512]; parts[0]=0; luc_error("lib '%s' has no '%s'",lib->s,sym->s); (void)hitat; }
+    }
+    /* lone file lib: <lib>.luc */
+    {
+        int len=0; char found[1024];
+        char *src=find_module(lib->s,&len,found,sizeof found);
+        if(!src) luc_error("lib '%s' not found (looked for %s.luic and %s.luc next to the script, in cwd, luc_modules/ and LUC_PATH)",lib->s,lib->s,lib->s);
+        char keybuf[1152]; snprintf(keybuf,sizeof keybuf,"filemod:%s",found);
+        Value key=cstrv(keybuf);
+        Value rv=tab_get(V.loaded,key);
+        if(rv.t==LT_NIL){
+            rv=libs_run1(L,base,nargs,src,len,found);
+            if(rv.t==LT_NIL) rv=mkbool(1);
+            tab_set(V.loaded,key,rv);
+        }
+        free(src);
+        char mk[256]; const char *eff=lib->s;
+        char fbase[256];
+        if(part_make_name(found,mk,sizeof mk)) eff=mk;
+        else { const char *b=found+strlen(found); while(b>found&&b[-1]!='/'&&b[-1]!='\\') b--;
+               size_t n=strlen(b); if(n>4&&!strcmp(b+n-4,".luc")) n-=4;
+               if(n<sizeof fbase){ memcpy(fbase,b,n); fbase[n]=0; eff=fbase; } }
+        if(!strcmp(sym->s,eff)){ RET(0,rv); return 1; }
+        if((rv.t==LT_TABLE||rv.t==LT_LIST)){
+            Value v=tab_get(AS_TAB(rv),mkobj(LT_STR,sym));
+            if(v.t!=LT_NIL){ RET(0,v); return 1; }
+        }
+        luc_error("lib '%s' has no '%s'",lib->s,sym->s);
+    }
+    RET(0,NIL); return 1;
+}
+/* libs system module: toolkit for user libraries.
+   `import libs` returns this table AND (parser-side) unlocks the
+   make/get/pack/command/import-from syntax for the rest of the chunk. */
+static void lib_basename(const char *found,char *out,size_t cap){
+    const char *b=found+strlen(found);
+    while(b>found&&b[-1]!='/'&&b[-1]!='\\') b--;
+    size_t n=strlen(b); if(n>4&&!strcmp(b+n-4,".luc")) n-=4;
+    if(n>=cap) n=cap-1; memcpy(out,b,n); out[n]=0;
+}
+
+/* libs.info("lib") -> {name, kind ("pack"/"part"/"file"), path, parts={...}} */
+LFN(f_libs_info){ UNUSED_SELF;
+    Str *lib=checkstr(L,base,nargs,0,"info");
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("name"),mkobj(LT_STR,lib));
+    Table *pl=tab_new(1);
+    int plen=0; char pfound[1024];
+    char *psrc=find_pack(lib->s,&plen,pfound,sizeof pfound);
+    if(psrc){
+        PackPart *pp=NULL; int np=0;
+        pack_parse(lib->s,psrc,plen,&pp,&np);
+        tab_set(t,cstrv("kind"),cstrv("pack"));
+        tab_set(t,cstrv("path"),cstrv(pfound));
+        for(int i=0;i<np;i++) list_push(pl,cstrv(pp[i].name));
+        pack_parts_free(pp,np); free(psrc);
+    } else {
+        int len=0; char found[1024];
+        char *src=find_module(lib->s,&len,found,sizeof found);
+        if(!src) luc_error("libs.info: lib '%s' not found (looked for %s.luic and %s.luc next to the script, in cwd, luc_modules/ and LUC_PATH)",lib->s,lib->s,lib->s);
+        free(src);
+        char mk[256];
+        tab_set(t,cstrv("path"),cstrv(found));
+        if(part_make_name(found,mk,sizeof mk)){ tab_set(t,cstrv("kind"),cstrv("part")); list_push(pl,cstrv(mk)); }
+        else { char base[256]; lib_basename(found,base,sizeof base); tab_set(t,cstrv("kind"),cstrv("file")); list_push(pl,cstrv(base)); }
+    }
+    tab_set(t,cstrv("parts"),mkobj(LT_LIST,pl));
+    RET(0,mkobj(LT_TABLE,t)); return 1;
+}
+
+/* libs.has("lib","sym"): part/symbol lookup WITHOUT running any code */
+LFN(f_libs_has){ UNUSED_SELF;
+    Str *lib=checkstr(L,base,nargs,0,"has");
+    Str *sym=checkstr(L,base,nargs,1,"has");
+    int plen=0; char pfound[1024];
+    char *psrc=find_pack(lib->s,&plen,pfound,sizeof pfound);
+    if(psrc){
+        PackPart *pp=NULL; int np=0;
+        pack_parse(lib->s,psrc,plen,&pp,&np);
+        int hit=0;
+        for(int i=0;i<np;i++) if(!strcmp(pp[i].name,sym->s)) hit=1;
+        pack_parts_free(pp,np); free(psrc);
+        RET(0,mkbool(hit)); return 1;
+    }
+    int len=0; char found[1024];
+    char *src=find_module(lib->s,&len,found,sizeof found);
+    if(!src){ RET(0,mkbool(0)); return 1; }
+    free(src);
+    char mk[256]; int hit=0;
+    if(part_make_name(found,mk,sizeof mk)) hit=!strcmp(mk,sym->s);
+    else { char base[256]; lib_basename(found,base,sizeof base); hit=!strcmp(base,sym->s); }
+    RET(0,mkbool(hit)); return 1;
+}
+
+/* libs.reload("part"): forget cached module tables so the next get/reload re-runs the file */
+LFN(f_libs_reload){ UNUSED_SELF;
+    Str *name=checkstr(L,base,nargs,0,"reload");
+    int len=0; char found[1024];
+    char *src=find_module(name->s,&len,found,sizeof found);
+    if(!src) luc_error("libs.reload: '%s' not found",name->s);
+    free(src);
+    char keybuf[1152];
+    snprintf(keybuf,sizeof keybuf,"get:%s",found);
+    tab_set(V.loaded,cstrv(keybuf),NIL);
+    snprintf(keybuf,sizeof keybuf,"filemod:%s",found);
+    tab_set(V.loaded,cstrv(keybuf),NIL);
+    RET(0,mkbool(1)); return 1;
+}
+
+static Value libs_module(void){
+    Table *t=tab_new(0);
+    tab_set(t,cstrv("version"),cstrv("0.2"));
+    reg(t,"info",f_libs_info);
+    reg(t,"has",f_libs_has);
+    reg(t,"reload",f_libs_reload);
+    return mkobj(LT_TABLE,t);
 }
 LFN(f_setmetatable){ UNUSED_SELF;
     Value t=AR(0);
@@ -270,6 +578,9 @@ void lucL_open_base(void){
     reg(g,"collectgarbage",f_collectgarbage);
     reg(g,"require",f_require);
     reg(g,"__import",f_import);
+    reg(g,"__get",f_get);
+    reg(g,"__pack",f_pack);
+    reg(g,"__import_from",f_import_from);
     reg(g,"setmetatable",f_setmetatable);
     reg(g,"getmetatable",f_getmetatable);
     reg(g,"xpcall",f_xpcall);
@@ -1201,6 +1512,266 @@ LFN(f_m_random){ UNUSED_SELF;
 LFN(f_m_randomseed){ UNUSED_SELF;
     rngstate=(uint64_t)(int64_t)checknum(L,base,nargs,0,"randomseed")|1ULL; return 0; }
 
+/* ---- exact big-integer multiply (Karatsuba) ----
+ * math.karatsuba(a,b,...): exact decimal multiply of integer strings
+ * (or integral numbers). Small sizes use naive O(n^2); above
+ * KARAT_LIMBS limbs Karatsuba takes over automatically. Returns the
+ * exact decimal string (never a rounded double). */
+#define KBASE 1000000000u
+#define KARAT_LIMBS 32
+
+typedef struct { uint32_t *d; int n; } Big;  /* little-endian base-1e9 limbs */
+
+static void big_free(Big *b){ if(b->d) free(b->d); b->d=NULL; b->n=0; }
+static int big_is_zero(const Big *b){
+    if(b->n<=0) return 1;
+    for(int i=0;i<b->n;i++) if(b->d[i]) return 0;
+    return 1;
+}
+static void big_trim(Big *b){ while(b->n>1 && b->d[b->n-1]==0) b->n--; }
+
+static int big_is_intstr(const char *s,int len){
+    int i=0;
+    while(i<len && (s[i]==' '||s[i]=='\t')) i++;
+    if(i<len && (s[i]=='+'||s[i]=='-')) i++;
+    int nd=0;
+    while(i<len && s[i]>='0'&&s[i]<='9'){ i++; nd++; }
+    while(i<len && (s[i]==' '||s[i]=='\t')) i++;
+    return nd>0 && i==len;
+}
+
+/* significant decimal digits (sign/blanks/leading zeros skipped) */
+static int big_sigdigits(const char *s,int len){
+    int i=0;
+    while(i<len && (s[i]==' '||s[i]=='\t')) i++;
+    if(i<len && (s[i]=='+'||s[i]=='-')) i++;
+    while(i<len && s[i]=='0') i++;
+    int nd=0;
+    while(i<len && s[i]>='0'&&s[i]<='9'){ i++; nd++; }
+    return nd;
+}
+
+static int big_from_str(const char *s,int len,Big *b,int *neg){
+    int i=0;
+    while(i<len && (s[i]==' '||s[i]=='\t')) i++;
+    int sn=0;
+    if(i<len && (s[i]=='+'||s[i]=='-')){ sn=(s[i]=='-'); i++; }
+    int ds=i;
+    while(ds<len && s[ds]=='0') ds++;
+    int de=i;
+    while(de<len && s[de]>='0'&&s[de]<='9') de++;
+    if(de==ds){ b->d=(uint32_t*)malloc(sizeof(uint32_t)); if(!b->d) return 0;
+        b->d[0]=0; b->n=1; *neg=0; return 1; }
+    int ndig=de-ds, nl=(ndig+8)/9;
+    b->d=(uint32_t*)calloc((size_t)nl,sizeof(uint32_t)); if(!b->d) return 0;
+    b->n=nl;
+    int pos=de;
+    for(int k=0;k<nl;k++){
+        int st=pos-9; if(st<ds) st=ds;
+        uint32_t v=0;
+        for(int j=st;j<pos;j++) v=v*10u+(uint32_t)(s[j]-'0');
+        b->d[k]=v; pos=st;
+    }
+    big_trim(b);
+    *neg=sn && !big_is_zero(b);
+    return 1;
+}
+
+static int big_from_num(double d,Big *b,int *neg){
+    if(d!=d || d==HUGE_VAL || d==-HUGE_VAL || d!=floor(d)) return 0;
+    char tmp[64];
+    snprintf(tmp,sizeof tmp,"%.0f",d);
+    return big_from_str(tmp,(int)strlen(tmp),b,neg);
+}
+
+static int big_add(Big *r,const Big *a,const Big *b){
+    int n=a->n>b->n?a->n:b->n;
+    r->d=(uint32_t*)calloc((size_t)n+1,sizeof(uint32_t)); if(!r->d) return 0;
+    uint64_t c=0;
+    for(int i=0;i<n;i++){
+        uint64_t t=c;
+        if(i<a->n) t+=(uint64_t)a->d[i];
+        if(i<b->n) t+=(uint64_t)b->d[i];
+        r->d[i]=(uint32_t)(t%KBASE); c=t/KBASE;
+    }
+    r->d[n]=(uint32_t)c; r->n=n+1; big_trim(r);
+    return 1;
+}
+
+/* requires a>=b (magnitudes) */
+static int big_sub(Big *r,const Big *a,const Big *b){
+    r->d=(uint32_t*)calloc((size_t)a->n,sizeof(uint32_t)); if(!r->d) return 0;
+    int64_t c=0;
+    for(int i=0;i<a->n;i++){
+        int64_t t=(int64_t)a->d[i]-c-(i<b->n?(int64_t)b->d[i]:0);
+        if(t<0){ t+=(int64_t)KBASE; c=1; } else c=0;
+        r->d[i]=(uint32_t)t;
+    }
+    r->n=a->n; big_trim(r);
+    return 1;
+}
+
+static int big_shl(Big *r,const Big *a,int k){
+    if(big_is_zero(a)||k<=0){
+        int n=k<=0?a->n:1;
+        r->d=(uint32_t*)calloc((size_t)(n>0?n:1),sizeof(uint32_t)); if(!r->d) return 0;
+        if(k<=0 && a->n>0) memcpy(r->d,a->d,(size_t)a->n*sizeof(uint32_t));
+        r->n=n>0?n:1; big_trim(r);
+        return 1;
+    }
+    r->d=(uint32_t*)calloc((size_t)a->n+k,sizeof(uint32_t)); if(!r->d) return 0;
+    memcpy(r->d+k,a->d,(size_t)a->n*sizeof(uint32_t));
+    r->n=a->n+k; big_trim(r);
+    return 1;
+}
+
+static int big_mul_naive(Big *r,const Big *a,const Big *b){
+    if(big_is_zero(a)||big_is_zero(b)){
+        r->d=(uint32_t*)calloc(1,sizeof(uint32_t)); if(!r->d) return 0;
+        r->d[0]=0; r->n=1; return 1;
+    }
+    int n=a->n+b->n;
+    r->d=(uint32_t*)calloc((size_t)n,sizeof(uint32_t)); if(!r->d) return 0;
+    r->n=n;
+    for(int i=0;i<a->n;i++){
+        uint64_t c=0;
+        for(int j=0;j<b->n;j++){
+            uint64_t t=(uint64_t)a->d[i]*(uint64_t)b->d[j]+r->d[i+j]+c;
+            r->d[i+j]=(uint32_t)(t%KBASE); c=t/KBASE;
+        }
+        r->d[i+b->n]=(uint32_t)((uint64_t)r->d[i+b->n]+c);
+    }
+    /* propagate leftover carries from the direct add above */
+    for(int i=0;i+1<n;i++){
+        if(r->d[i]>=KBASE){ r->d[i+1]+=(uint32_t)(r->d[i]/KBASE); r->d[i]%=KBASE; }
+    }
+    big_trim(r);
+    return 1;
+}
+
+/* split src at k limbs: lo gets [0,k), hi gets [k,n) (copies, either may be zero) */
+static int big_split(const Big *s,int k,Big *lo,Big *hi){
+    int nl=s->n<k?s->n:k, nh=s->n-nl;
+    lo->d=(uint32_t*)calloc((size_t)(nl>0?nl:1),sizeof(uint32_t));
+    hi->d=(uint32_t*)calloc((size_t)(nh>0?nh:1),sizeof(uint32_t));
+    if(!lo->d||!hi->d){ free(lo->d); free(hi->d); return 0; }
+    if(nl>0) memcpy(lo->d,s->d,(size_t)nl*sizeof(uint32_t));
+    if(nh>0) memcpy(hi->d,s->d+nl,(size_t)nh*sizeof(uint32_t));
+    lo->n=nl>0?nl:1; hi->n=nh>0?nh:1;
+    big_trim(lo); big_trim(hi);
+    return 1;
+}
+
+static int big_kmul(Big *r,const Big *a,const Big *b){
+    if(big_is_zero(a)||big_is_zero(b)){
+        r->d=(uint32_t*)calloc(1,sizeof(uint32_t)); if(!r->d) return 0;
+        r->d[0]=0; r->n=1; return 1;
+    }
+    int m=a->n<b->n?a->n:b->n;
+    if(m<KARAT_LIMBS) return big_mul_naive(r,a,b);
+    int mx=a->n>b->n?a->n:b->n;
+    int k=mx/2; if(k<1) k=1;
+    Big a0,a1,b0,b1;
+    if(!big_split(a,k,&a0,&a1)) return 0;
+    if(!big_split(b,k,&b0,&b1)){ big_free(&a0); big_free(&a1); return 0; }
+    Big z0,z2,s1,s2,p,t1,t2,r1,r2;
+    memset(&z0,0,sizeof z0); memset(&z2,0,sizeof z2); memset(&s1,0,sizeof s1);
+    memset(&s2,0,sizeof s2); memset(&p,0,sizeof p); memset(&t1,0,sizeof t1);
+    memset(&t2,0,sizeof t2); memset(&r1,0,sizeof r1); memset(&r2,0,sizeof r2);
+    int ok=big_kmul(&z0,&a0,&b0)
+        && big_kmul(&z2,&a1,&b1)
+        && big_add(&s1,&a0,&a1)
+        && big_add(&s2,&b0,&b1)
+        && big_kmul(&p,&s1,&s2)
+        && big_sub(&t1,&p,&z0)      /* p >= z0+z2 mathematically */
+        && big_sub(&t2,&t1,&z2)
+        && big_shl(&r1,&t2,k)
+        && big_shl(&r2,&z2,2*k)
+        && big_add(r,&z0,&r1)
+        && big_add(&t1,r,&r2)
+        && (big_free(r), *r=t1, 1);
+    big_free(&a0); big_free(&a1); big_free(&b0); big_free(&b1);
+    big_free(&z0); big_free(&z2); big_free(&s1); big_free(&s2);
+    big_free(&p); big_free(&t2); big_free(&r1); big_free(&r2);
+    if(!ok){ big_free(&t1); return 0; }
+    return 1;
+}
+
+static int big_mul(Big *r,const Big *a,const Big *b){ return big_kmul(r,a,b); }
+
+/* decimal string (malloc'd, *slen set); neg applies unless zero */
+static int big_to_str(const Big *a,int neg,char **out,int *slen){
+    char msd[16];
+    int m=snprintf(msd,sizeof msd,"%u",a->n>0?a->d[a->n-1]:0);
+    int neg1=(neg && !big_is_zero(a))?1:0;
+    int total=neg1+m+(a->n-1)*9;
+    char *s=(char*)malloc((size_t)total+1); if(!s) return 0;
+    int o=0;
+    if(neg1) s[o++]='-';
+    memcpy(s+o,msd,(size_t)m); o+=m;
+    for(int i=a->n-2;i>=0;i--){ snprintf(s+o,10,"%09u",a->d[i]); o+=9; }
+    s[o]=0;
+    *out=s; *slen=o;
+    return 1;
+}
+
+/* exact big path for MUL when both sides are integer strings.
+ * force!=0 takes any size (pragma); otherwise only sizes doubles
+ * cannot hold exactly (>15 significant digits). Returns 1 + *out. */
+int luc_try_bigmul(Value x,Value y,int force,Value *out){
+    if(x.t!=LT_STR||y.t!=LT_STR) return 0;
+    Str *sa=AS_STR(x), *sb=AS_STR(y);
+    if(!big_is_intstr(sa->s,sa->len)||!big_is_intstr(sb->s,sb->len)) return 0;
+    if(!force && big_sigdigits(sa->s,sa->len)<=15 && big_sigdigits(sb->s,sb->len)<=15)
+        return 0;
+    Big a,b; int na,nb;
+    memset(&a,0,sizeof a); memset(&b,0,sizeof b);
+    if(!big_from_str(sa->s,sa->len,&a,&na)) return 0;
+    if(!big_from_str(sb->s,sb->len,&b,&nb)){ big_free(&a); return 0; }
+    Big r; memset(&r,0,sizeof r);
+    int ok=big_mul(&r,&a,&b);
+    int neg=(na!=nb) && ok && !big_is_zero(&r);
+    char *s=NULL; int sl=0;
+    if(ok) ok=big_to_str(&r,neg,&s,&sl);
+    big_free(&a); big_free(&b); big_free(&r);
+    if(!ok){ free(s); return 0; }
+    *out=strv(s,sl);
+    free(s);
+    return 1;
+}
+
+LFN(f_m_karatsuba){ UNUSED_SELF;
+    if(nargs<1) luc_error("bad argument #1 to 'karatsuba' (value expected)");
+    Big acc; int neg=0;
+    acc.d=(uint32_t*)malloc(sizeof(uint32_t)); if(!acc.d) luc_error("karatsuba: out of memory");
+    acc.d[0]=1; acc.n=1;
+    for(int i=0;i<nargs;i++){
+        Value v=AR(i);
+        Big b; int bn=0;
+        memset(&b,0,sizeof b);
+        if(v.t==LT_STR){
+            Str *s=AS_STR(v);
+            if(!big_is_intstr(s->s,s->len)||!big_from_str(s->s,s->len,&b,&bn))
+                luc_error("karatsuba: argument #%d is not an integer",i+1);
+        } else if(v.t==LT_NUM){
+            if(!big_from_num(v.u.n,&b,&bn))
+                luc_error("karatsuba: argument #%d is not an integer",i+1);
+        } else luc_error("karatsuba: argument #%d must be an integer or integer string (got %s)",
+                         i+1,type_name(v));
+        if(bn) neg=!neg;
+        Big r; memset(&r,0,sizeof r);
+        if(!big_mul(&r,&acc,&b)){ big_free(&acc); big_free(&b); luc_error("karatsuba: out of memory"); }
+        big_free(&acc); big_free(&b);
+        acc=r;
+    }
+    int nz=big_is_zero(&acc);
+    char *s=NULL; int sl=0;
+    if(!big_to_str(&acc,(neg && !nz),&s,&sl)){ big_free(&acc); luc_error("karatsuba: out of memory"); }
+    Value rv=strv(s,sl);
+    free(s); big_free(&acc);
+    RET(0,rv); return 1;
+}
+
 /* bit32 */
 LFN(f_b_band){ UNUSED_SELF;
     uint32_t r=0xFFFFFFFFu;
@@ -1276,6 +1847,7 @@ void lucL_open_math(void){
     reg(m,"pow",f_m_pow);     reg(m,"fmod",f_m_fmod);  reg(m,"modf",f_m_modf);
     reg(m,"max",f_m_max);     reg(m,"min",f_m_min);
     reg(m,"random",f_m_random); reg(m,"randomseed",f_m_randomseed);
+    reg(m,"karatsuba",f_m_karatsuba);
     tab_set(m,cstrv("pi"),mknum(3.14159265358979323846));
     tab_set(m,cstrv("huge"),mknum(HUGE_VAL));
     reg(m,"tointeger",f_m_tointeger); reg(m,"type",f_m_type);

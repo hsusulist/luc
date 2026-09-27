@@ -1,0 +1,24 @@
+!luic1
+lib mymath
+parts 2
+==== add 214
+import libs
+make add
+
+-- one file, one part: `import libs` first, then `make <name>`.
+-- every top-level create/function/command is auto-exported.
+
+create function plus(a, b)
+    return a + b
+end
+
+create tag = "A"
+
+==== sub 71
+import libs
+make sub
+
+create function minus(a, b)
+    return a - b
+end
+

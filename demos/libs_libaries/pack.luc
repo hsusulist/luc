@@ -1,0 +1,11 @@
+-- demos/libs_libaries/pack.luc -- bundle parts into a lib pack
+-- run: luc "demos/libs_libaries/pack.luc"   (from the repo root)
+-- writes demos/libs_libaries/mymath.luic next to this file.
+
+-- get loads parts by MAKE name (not filename), from every
+-- file/folder sitting next to this one:
+import libs
+get add, sub
+
+-- pack bundles everything gotten above into one shippable file:
+pack mymath

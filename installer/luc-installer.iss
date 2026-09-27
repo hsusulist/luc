@@ -1,6 +1,7 @@
 ﻿; LUC - Inno Setup script (PREBUILT, English, setup v3)
 ; update 2026-09-01: AppId, opt-in window/ai, maintenance dialog, start menu
 ; update 2026-09-02: ver 0.1, library management, offline packages
+; update 2026-09-21: ver 0.2-beta1
 ; Setup v3 changes EVERYTHING about how window support works:
 ; the installer now ships READY-TO-RUN binaries built ahead of
 ; time on the developer's machine (build_installer.ps1):
@@ -21,11 +22,17 @@
 ; Pages: Language -> Welcome -> License -> Components ->
 ;        Install folder -> Ready -> Installing -> Finish
 ; Maintenance: re-running this setup (or the "Luc Installer" Start Menu
-; entry) detects an existing install and asks what to do:
-;   Install libraries - pick which libraries to add or remove
-;                       (unticking one deletes it from the install)
-;   Fix               - silent reinstall over the previous folder
-;   Uninstall         - runs the existing uninstaller
+; entry) compares versions first. A different installed version means a
+; plain upgrade over the old folder (previous folder kept, previous
+; components pre-ticked, no dialog, no uninstall-then-install).
+; The same version shows a dialog with the installed folder + versions:
+;   Install libraries - jumps straight to the components page, previous
+;                       selection pre-ticked: tick to add a library,
+;                       untick to remove it (files deleted, ticking again
+;                       reinstalls fresh in the same run)
+;   Fix               - same pages, pre-ticked: press Next through to
+;                       reinstall this version over the previous folder
+;   Uninstall         - remove LUC completely
 ; Default components: main only. "window", "ailib" and "discord" are opt-in
 ; (each has its own checkbox/index, unchecked by default); users
 ; can add them later without this setup via "luc install window|ai|discord".
@@ -43,7 +50,7 @@
 ; fallback produced before, so installs made without this line stay detected.
 AppId=Luc
 AppName=Luc
-AppVersion=0.1
+AppVersion=0.2-beta1
 AppPublisher=hsusulist
 DefaultDirName={userpf}\LUC
 DefaultGroupName=LUC
@@ -54,12 +61,19 @@ SolidCompression=yes
 LicenseFile=LICENSE.txt
 PrivilegesRequired=none
 SetupIconFile=luc.ico
+VersionInfoProductName=Luc
+VersionInfoDescription=LUC programming language installer
+VersionInfoCompany=hsusulist
 WizardImageFile=lucdownload2.bmp
 WizardSmallImageFile=lucdownload.bmp
 WizardImageStretch=yes
 WizardStyle=modern
 UninstallDisplayIcon={app}\luc.exe
 ChangesEnvironment=yes
+; Locked files ("another program is using luc") instead of cryptic errors:
+; the Restart Manager asks to close the locking apps, then restarts them.
+CloseApplications=yes
+RestartApplications=yes
 DisableProgramGroupPage=yes
 DisableDirPage=no
 ; Inno 7 HIDES the Welcome page by default (shDisableWelcomePage is in the
@@ -174,7 +188,7 @@ Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}\packages\window"; Flags: 
 Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
 ; VS Code extension (copied into the VS Code extensions folder)
-Source: "..\vscode\*"; DestDir: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc-language"; Components: vsext; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\vscode\*"; DestDir: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc"; Components: vsext; Flags: ignoreversion recursesubdirs createallsubdirs
 ; C source for developers (explicit: src also contains stray exes that
 ; must NOT be shipped - they would silently bloat the installer)
 Source: "..\src\*.h"; DestDir: "{app}\src"; Components: source; Flags: ignoreversion
@@ -203,7 +217,11 @@ Filename: "{app}"; Description: "Open the LUC installation folder"; Flags: posti
 
 [UninstallDelete]
 ; VS Code extension was installed outside {app}
-Type: filesandordirs; Name: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc-language"
+Type: filesandordirs; Name: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc"
+; Leftovers the uninstaller does not track: exe backups from
+; "luc install window" swaps (luc.exe.old, luc.exe.pre-*)
+Type: files; Name: "{app}\luc.exe.old"
+Type: files; Name: "{app}\luc.exe.pre-*"
 ; Sweep leftovers from older v1/v2 installs made without uninstalling first
 Type: files; Name: "{app}\lucgcc.exe"
 Type: files; Name: "{app}\luc-fallback.exe"
@@ -220,8 +238,9 @@ WelcomeLabel2=This will install LUC on your computer - a tiny scripting language
 [Code]
 var
   GAppDir: String;
-  // -1 none, 0 full, 1 fix, 2 uninstall
+  // -1 none/fresh/upgrade, 0 libraries, 1 fix, 2 uninstall
   GMaintAction: Integer;
+  GPrevDir, GPrevVer, GPrevComponents: String;
 
 // Looks up the previous install (uninstall registry key Luc_is1).
 // Checks HKCU first, then HKLM (older installs may be admin-mode).
@@ -252,35 +271,59 @@ end;
 function AskMaintenance: Integer;
 var
   Form: TSetupForm;
+  HeadLbl, SubLbl: TLabel;
   RBLibs, RBFix, RBUninst: TRadioButton;
   OkBtn, CancelBtn: TButton;
+  VerLine: String;
 begin
   Result := -1;
   // Inno 7: CreateCustomForm takes the size + keep-size flags
-  Form := CreateCustomForm(ScaleX(420), ScaleY(150), True, True);
+  Form := CreateCustomForm(ScaleX(460), ScaleY(250), True, True);
   try
     Form.Caption := 'Setup - Luc {#SetupSetting("AppVersion")}';
     Form.Position := poScreenCenter;
 
+    if GPrevVer <> '' then
+      VerLine := 'Installed: ' + GPrevVer + '   -   This setup: {#SetupSetting("AppVersion")}'
+    else
+      VerLine := 'This setup: {#SetupSetting("AppVersion")}';
+
+    HeadLbl := TLabel.Create(Form);
+    HeadLbl.Parent := Form;
+    HeadLbl.Left := ScaleX(24);
+    HeadLbl.Top := ScaleY(14);
+    HeadLbl.Width := Form.ClientWidth - ScaleX(48);
+    HeadLbl.Caption := 'LUC is already installed in:';
+    HeadLbl.Font.Style := [fsBold];
+
+    SubLbl := TLabel.Create(Form);
+    SubLbl.Parent := Form;
+    SubLbl.Left := ScaleX(24);
+    SubLbl.Top := ScaleY(34);
+    SubLbl.Width := Form.ClientWidth - ScaleX(48);
+    SubLbl.Caption := GPrevDir + #13#10 + VerLine;
+    SubLbl.Autosize := False;
+    SubLbl.Height := ScaleY(36);
+
     RBLibs := TRadioButton.Create(Form);
     RBLibs.Parent := Form;
     RBLibs.Left := ScaleX(24);
-    RBLibs.Top := ScaleY(20);
+    RBLibs.Top := ScaleY(82);
     RBLibs.Width := Form.ClientWidth - ScaleX(48);
-    RBLibs.Caption := 'Install libraries - choose which ones to add or remove';
+    RBLibs.Caption := 'Install libraries - jump straight to components to add or remove';
     RBLibs.Checked := True;
 
     RBFix := TRadioButton.Create(Form);
     RBFix.Parent := Form;
     RBFix.Left := ScaleX(24);
-    RBFix.Top := ScaleY(50);
+    RBFix.Top := ScaleY(112);
     RBFix.Width := Form.ClientWidth - ScaleX(48);
-    RBFix.Caption := 'Fix - reinstall the core files (keeps your settings)';
+    RBFix.Caption := 'Fix - reinstall everything, pre-ticked (just press Next)';
 
     RBUninst := TRadioButton.Create(Form);
     RBUninst.Parent := Form;
     RBUninst.Left := ScaleX(24);
-    RBUninst.Top := ScaleY(80);
+    RBUninst.Top := ScaleY(142);
     RBUninst.Width := Form.ClientWidth - ScaleX(48);
     RBUninst.Caption := 'Uninstall - remove LUC from this computer';
 
@@ -321,20 +364,29 @@ var
 begin
   Result := True;
   GMaintAction := -1;
+  GPrevDir := ''; GPrevVer := ''; GPrevComponents := '';
   if WizardSilent() then
     Exit;   // Fix rerun or scripted install: plain install, no dialog
   if not PreviousInstall(Ver, Dir, Uninst) then
     Exit;   // fresh install: normal wizard flow
 
+  GPrevDir := Dir;
+  GPrevVer := Ver;
+  if not RegQueryStringValue(HKCU, 'Software\LUC', 'Components', GPrevComponents) then
+    GPrevComponents := '';
+
+  // Different version installed: plain upgrade over the old folder.
+  // No maintenance dialog, no uninstall-then-install dance.
+  if (Ver <> '') and (Ver <> '{#SetupSetting("AppVersion")}') then
+    Exit;
+
   GMaintAction := AskMaintenance();
   case GMaintAction of
-    0: ;  // libraries: run the wizard, previous selection pre-ticked
-    1: begin
-         // fix: silent reinstall over the previous folder, then exit
-         Exec(ExpandConstant('{srcexe}'), '/SILENT /SUPPRESSMSGBOXES', '',
-              SW_SHOW, ewWaitUntilTerminated, R);
-         Result := False;
-       end;
+    // 0 libraries and 1 fix share the wizard flow: components pre-ticked
+    // with the previous selection, then a normal reinstall. No child
+    // process relaunch (Exec proved unreliable here), so Fix cannot
+    // "fail to start" - it is already running.
+    0, 1: ;
     2: begin
          // uninstall: hand over to the existing uninstaller, then exit
          Exec(RemoveQuotes(Uninst), '', '', SW_SHOW,
@@ -352,15 +404,73 @@ begin
   Result := WizardSelectedComponents(False);
 end;
 
+// Libraries and Fix modes jump straight to the components page (skip welcome,
+// license and folder - everything lands in the existing install).
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (GMaintAction = 0) or (GMaintAction = 1) then
+    if (PageID = wpWelcome) or (PageID = wpLicense) or (PageID = wpSelectDir) then
+      Result := True;
+end;
+
+// Maintenance and upgrades start in the previous folder (the user can
+// still change it, except in libraries mode where the dir page is skipped).
+procedure InitializeWizard();
+begin
+  if GPrevDir <> '' then WizardForm.DirEdit.Text := GPrevDir;
+end;
+
 // "Install libraries": start from the previous selection; unticking a
-// library removes it (the old install is uninstalled before the new one)
+// library removes it (deleted in CurStepChanged before the new files land).
+// Upgrades also start from the previous selection when we have a snapshot.
 procedure CurPageChanged(CurPageID: Integer);
 var
   Saved: String;
 begin
-  if (CurPageID = wpSelectComponents) and (GMaintAction = 0) then
+  if (CurPageID = wpSelectComponents) and ((GMaintAction = 0) or (GPrevComponents <> '')) then
     if RegQueryStringValue(HKCU, 'Software\LUC', 'Components', Saved) and (Saved <> '') then
       WizardSelectComponents(Saved);
+end;
+
+// Space-or-comma separated component list membership.
+function CompOn(const Sel, Name: String): Boolean;
+var
+  N: String;
+begin
+  N := Sel;
+  StringChangeEx(N, ',', ' ', True);
+  Result := Pos(' ' + Name + ' ', ' ' + N + ' ') > 0;
+end;
+
+// Deleting a deselected library: runs before the new files are copied,
+// so ticking it again reinstalls it fresh in the same run.
+procedure RemoveDeselected(const PrevSel, NewSel: String);
+var
+  App, ExtDir: String;
+begin
+  App := ExpandConstant('{app}');
+  if CompOn(PrevSel, 'window') and not CompOn(NewSel, 'window') then begin
+    DeleteFile(App + '\SDL2.dll');
+    DeleteFile(App + '\SDL2_ttf.dll');
+    DeleteFile(App + '\SDL2_image.dll');
+    DeleteFile(App + '\SDL2_mixer.dll');
+    DeleteFile(App + '\DejaVuSans.ttf');
+  end;
+  if (CompOn(PrevSel, 'ailib') and not CompOn(NewSel, 'ailib')) or
+     (CompOn(PrevSel, 'discord') and not CompOn(NewSel, 'discord')) then
+    DelTree(App + '\luc_modules', True, True, True);
+  ExtDir := ExpandConstant('{%USERPROFILE}\.vscode\extensions\hsusulist.luc');
+  if CompOn(PrevSel, 'vsext') and not CompOn(NewSel, 'vsext') then
+    DelTree(ExtDir, True, True, True);
+  if CompOn(PrevSel, 'source') and not CompOn(NewSel, 'source') then
+    DelTree(App + '\src', True, True, True);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if (CurStep = ssInstall) and (GPrevComponents <> '') then
+    RemoveDeselected(GPrevComponents, WizardSelectedComponents(False));
 end;
 
 function ContainsPath(Path: string): Boolean;

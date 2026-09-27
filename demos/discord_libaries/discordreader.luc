@@ -1,6 +1,6 @@
 -- demos/discordreader.luc -- read back messages (import discord)
 -- shows msg.last / msg.lastby / msg.sender (instant reads, no waiting)
--- run: luc "demos/discord libaries/discordreader.luc"
+-- run: luc "demos/discord_libaries/discordreader.luc"
 -- chat in Discord: !last, !mine, !who <text>
 
 import discord("bot")

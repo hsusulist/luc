@@ -1,0 +1,27 @@
+-- demos/libs_libaries/mlp.luc -- wrap lanternl so training is one word: train()
+-- needs the ai library (luc install ai)
+-- run: luc "demos/libs_libaries/mlp.luc"
+--
+-- NOTE: do NOT name this file train.luc -- ai's own submodule is called
+-- "train" and require() looks in the script dir first, so train.luc here
+-- would shadow it and recurse forever. Same rule for matrix/tensor/nn/....
+
+import libs
+import ai
+
+create data = [
+    {"input": [0], "target": [1]},
+    {"input": [1], "target": [3]},
+    {"input": [2], "target": [5]},
+    {"input": [3], "target": [7]},
+]
+
+create t = ai.Train({"layers": {1: 1, 2: 8, 3: 1}, "data": data, "epochs": 300, "lr": 0.01, "log_every": 100})
+
+command train()
+    t:run()
+    print("--- evaluate ---")
+    t:evaluate(data)
+end
+
+train()

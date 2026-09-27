@@ -3,21 +3,40 @@
   "scopeName": "source.luc",
   "fileTypes": ["luc"],
   "patterns": [
+    { "include": "#directives" },
     { "include": "#comments" },
     { "include": "#strings" },
+    { "include": "#declarations" },
+    { "include": "#definitions" },
     { "include": "#keywords" },
-    { "include": "#functions" },
+    { "include": "#builtins" },
+    { "include": "#calls" },
+    { "include": "#constants" },
     { "include": "#numbers" },
     { "include": "#operators" },
-    { "include": "#types" }
+    { "include": "#punctuation" },
+    { "include": "#types" },
+    { "include": "#invalid" }
   ],
   "repository": {
+    "directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.luc",
+          "match": "^!(strict|karatsuba)\\b"
+        }
+      ]
+    },
     "comments": {
       "patterns": [
         {
+          "name": "comment.line.shebang.luc",
+          "match": "^#!.*$"
+        },
+        {
           "name": "comment.block.luc",
-          "begin": "--\\[\\[",
-          "end": "\\]\\]"
+          "begin": "--\\[(=*)\\[",
+          "end": "\\](\\1)\\]"
         },
         {
           "name": "comment.line.double-dash.luc",
@@ -38,44 +57,126 @@
           "begin": "'",
           "end": "'",
           "patterns": [{ "name": "constant.character.escape.luc", "match": "\\\\." }]
+        },
+        {
+          "name": "string.unquoted.block.luc",
+          "begin": "\\[=(=*)\\[",
+          "end": "\\]\\1\\]"
+        }
+      ]
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "name": "storage.type.luc",
+          "match": "\\bcreate\\b"
+        }
+      ]
+    },
+    "definitions": {
+      "patterns": [
+        {
+          "match": "\\b(function|command)\\s+([A-Za-z_][A-Za-z0-9_]*(?:[.:][A-Za-z_][A-Za-z0-9_]*)*)",
+          "captures": {
+            "1": { "name": "storage.type.function.luc" },
+            "2": { "name": "entity.name.function.luc" }
+          }
         }
       ]
     },
     "keywords": {
       "patterns": [
         {
-          "name": "keyword.control.luc",
-          "match": "\\b(and|break|do|else|elseif|end|for|function|if|in|local|not|or|repeat|return|then|until|while)\\b"
+          "name": "keyword.control.import.luc",
+          "match": "\\bimport\\b"
         },
+        {
+          "name": "keyword.control.luc",
+          "match": "\\b(and|break|do|else|elseif|end|for|function|command|if|in|not|or|repeat|return|then|until|while|run|make|get|pack|as)\\b"
+        },
+        {
+          "name": "variable.language.luc",
+          "match": "\\bself\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.function.luc",
+          "match": "\\b(print|tostring|tonumber|type|ipairs|pairs|error|assert|pcall|select|unpack|rawget|rawset|rawequal|rawlen|collectgarbage|require|len|setmetatable|getmetatable|next)\\b"
+        },
+        {
+          "match": "\\b(string|table|math|io|os|bit32|buffer|task|coroutine|list|net|window|discord|ai|json)\\.([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "support.class.luc" },
+            "2": { "name": "support.function.luc" }
+          }
+        }
+      ]
+    },
+    "calls": {
+      "patterns": [
+        {
+          "match": "(:)\\s*([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()",
+          "captures": {
+            "1": { "name": "punctuation.separator.luc" },
+            "2": { "name": "entity.name.function.luc" }
+          }
+        },
+        {
+          "name": "entity.name.function.luc",
+          "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
         {
           "name": "constant.language.luc",
           "match": "\\b(true|false|nil)\\b"
         }
       ]
     },
-    "functions": {
-      "patterns": [
-        {
-          "name": "support.function.luc",
-          "match": "\\b(print|tostring|tonumber|type|ipairs|pairs|error|assert|pcall|select|unpack|rawget|rawset|rawequal|collectgarbage)\\b"
-        },
-        {
-          "name": "support.function.library.luc",
-          "match": "\\b(string|table|math|io|os|bit32|buffer|task|coroutine|list)\\.(\\w+)"
-        }
-      ]
-    },
     "numbers": {
       "name": "constant.numeric.luc",
-      "match": "\\b(0x[0-9a-fA-F]+|[0-9]+\\.?[0-9]*)\\b"
+      "match": "(?<!\\w)(0[xX][0-9a-fA-F]+|\\d*\\.?\\d+([eE][+-]?\\d+)?)\\b"
     },
     "operators": {
       "name": "keyword.operator.luc",
-      "match": "\\+|-|\\*|\\/|%|\\^|#|==|~=|<=|>=|<|>|=|\\.\\.|\\.\\.\\."
+      "match": "\\+=|-=|\\*=|/=|==|!=|<=|>=|\\.\\.\\.|\\.\\.|\\+|-|\\*|/|%|\\^|<|>|="
+    },
+    "punctuation": {
+      "name": "punctuation.separator.luc",
+      "match": "[{}()\\[\\],;:]"
     },
     "types": {
       "name": "entity.name.type.luc",
-      "match": "(?<=:)\\s*(number|string|boolean|table|list|buffer|thread|function|nil)\\b"
+      "match": "(?<=:)\\s*(number|string|boolean|table|list|buffer|thread|function|nil|any|integer|float)\\b"
+    },
+    "invalid": {
+      "patterns": [
+        {
+          "name": "invalid.illegal.luc",
+          "match": "^![A-Za-z_]+"
+        },
+        {
+          "name": "invalid.illegal.luc",
+          "match": "\\blocal\\b"
+        },
+        {
+          "name": "invalid.illegal.luc",
+          "match": "~"
+        },
+        {
+          "name": "invalid.illegal.luc",
+          "match": "#"
+        },
+        {
+          "name": "invalid.illegal.luc",
+          "match": "!(?!=)"
+        }
+      ]
     }
   }
 }

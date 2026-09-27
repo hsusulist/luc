@@ -1,6 +1,6 @@
--- demos/window libaries/hello.luc -- minimal window: bounce + text
+-- demos/window_libaries/hello.luc -- minimal window: bounce + text
 -- needs the window build (luc install window)
--- run: luc "demos/window libaries/hello.luc"
+-- run: luc "demos/window_libaries/hello.luc"
 
 import window("w")
 

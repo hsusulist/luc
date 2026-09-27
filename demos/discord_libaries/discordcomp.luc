@@ -1,0 +1,70 @@
+-- demos/discord_libaries/discordcomp.luc -- embed pages + buttons (import discord)
+-- run: luc "demos/discord_libaries/discordcomp.luc"
+-- chat in Discord: /shop -> page 1, Next/Prev flip pages
+
+import discord("bot")
+
+create p1 = bot.embed:create({"title": "Shop 1/2", "description": "Trang 1", "color": "0x00ff00"})
+p1:add_field({"name": "!ping", "value": "pong command", "inline": false})
+create p2 = bot.embed:create({"title": "Shop 2/2", "description": "Trang 2", "color": "0x0099ff"})
+p2:add_field({"name": "!help", "value": "shows this", "inline": false})
+
+create buttons = bot.buttons
+buttons:new("Next", p1)
+buttons:new("Next", p2)
+buttons:new("Prev", p1)
+buttons:new("Prev", p2)
+
+create sel = bot.select
+sel:new("food", p1, [{"label": "Pho", "value": "pho"}, {"label": "Bun Bo", "value": "bunbo"}], "Chon mon:")
+
+create token = bot.token("TOKEN_HERE")
+create cmd = bot.slash
+cmd.new("shop", "gobal")
+
+create pages = [p1, p2]
+create cur = 0
+
+create function show(i)
+    cur = i
+    if cur < 0 then cur = 0 end
+    if cur > 1 then cur = 1 end
+    if cur == 0 then buttons:disable("Prev") else buttons:enable("Prev") end
+    if cur == 1 then buttons:disable("Next") else buttons:enable("Next") end
+    pages[cur]:send()
+end
+
+bot:run(token)
+
+-- one watcher per button (both live at once, like multi-prefix)
+task.spawn(function()
+    while true do
+        if buttons:click("Next") then
+            show(cur + 1)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        if buttons:click("Prev") then
+            show(cur - 1)
+        end
+    end
+end)
+
+task.spawn(function()
+    while true do
+        create choice = sel:choose("food")
+        if choice != nil then
+            create msg = bot.msg
+            msg:send("Ban chon " + choice)
+        end
+    end
+end)
+
+while bot.on do
+    if cmd.slash("shop") then
+        show(0)
+    end
+end

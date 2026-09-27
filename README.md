@@ -1,6 +1,6 @@
 # LUC Programming Language
 
-<!-- update 2026-09-02: ver 0.1, library management, offline luc install -->
+<!-- update 2026-09-21: ver 0.2-beta1, discord embeds/buttons -->
 
 <p align="center">
   <img src="vscode/icons/luc.svg" width="120" alt="LUC Logo"/>
@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1-orange" />
+  <img src="https://img.shields.io/badge/version-0.2--beta1-orange" />
   <img src="https://img.shields.io/badge/platform-Windows-blue" />
   <img src="https://img.shields.io/badge/license-Apache%202.0-green" />
   <img src="https://img.shields.io/badge/built%20with-C99-lightgrey" />
@@ -164,7 +164,7 @@ w.play_music(bgm)          -- lặp vô hạn mặc định
 w.stop_music()
 
 -- phím/chuột: w.key("space"), w.key_pressed("escape"), w.mouse() ...
--- xem them: demos/window libaries/pong.luc
+-- xem them: demos/window_libaries/pong.luc
 ```
 
 > **import vs require** — `import` chỉ nạp thư viện hệ thống (`window`, `ai`, `json`).
@@ -183,7 +183,17 @@ import ai
 print(type(ai.Tensor))       -- table
 print(type(ai.LMTrain))      -- table
 print(type(ai.Tokenizer))    -- table
+
+-- tiny MLP: dict keys must be quoted, layers 1-based
+create data = [{"input": [0], "target": [1]}, {"input": [1], "target": [3]}]
+create t = ai.Train({"layers": {1: 1, 2: 4, 3: 1}, "data": data, "epochs": 50, "lr": 0.1})
+t:run()
+t:evaluate(data)
+t:save("model.luc")                 -- keep weights
+create t2 = ai.Train.load("model.luc")  -- load them back
 ```
+
+Demos: `demos/ai_libaries/ai_train.luc`, `demos/ai_libaries/ai_tokenizer.luc`.
 
 ---
 
@@ -334,7 +344,54 @@ while bot.on do
 end
 ```
 
-See `demos/discord libaries/discordbot.luc`.
+Embed — dựng như Python (`Embed` + `add_field` + `set_*`), gửi bằng
+`send()` tại chỗ ra lệnh. **Key phải quote** (`{"title": ...}` đúng,
+`{title: ...}` lỗi), `true`/`false` viết thường:
+
+```lua
+create e = bot.embed:create({"title": "Shop", "description": "Hi", "color": "0x00ff00"})
+e:add_field({"name": "!ping", "value": "pong", "inline": false})
+e:set_footer({"text": "luc bot"})
+e:send()                    -- trong command: gửi tại chỗ
+e:send("general", "caption") -- hoặc chỉ kênh + caption
+```
+
+Buttons — dựng như Python (`View` + `Button`), chờ bằng `click`
+(thay cho `await`). Style 1 xanh/2 xám/3 xanh lá/4 đỏ/5 link:
+
+```lua
+create buttons = bot.buttons
+buttons:new("Next", e)                    -- label + embed đính kèm
+buttons:new("Docs", e, "docs", 5, "https://example.com")  -- nút link
+buttons:disable("Next")                   -- xám, bấm không chạy
+buttons:enable("Next")
+while bot.on do
+    if buttons:click("Next") then
+        create msg = bot.msg
+        msg:send("Ban bam Next!")
+    end
+end
+```
+
+Chuyển trang embed: mỗi trang 1 object, link chung 1 bộ nút, bấm thì
+gửi trang mới (xem `demos/discord libaries/discordcomp.luc`).
+
+Select bar — dựng như Python (`Select` + options), chờ bằng `choose`
+(trả về value đã chọn):
+
+```lua
+create sel = bot.select
+sel:new("food", e, [{"label": "Pho", "value": "pho"}], "Chon mon:")
+while bot.on do
+    create choice = sel:choose("food")
+    if choice != nil then
+        create msg = bot.msg
+        msg:send("Ban chon " + choice)
+    end
+end
+```
+
+See `demos/discord_libaries/discordbot.luc`.
 
 ---
 
@@ -345,6 +402,7 @@ See `demos/discord libaries/discordbot.luc`.
 | `string` | split, trim, tohex, fromhex, upper, lower... |
 | `table` | insert, remove, concat, move, sort |
 | `math` | floor, ceil, sqrt, sin, cos, random... |
+| `math.karatsuba` | exact big-integer multiply (any count of args) |
 | `io` | read, write, open, popen, replace (terminal overwrite) |
 | `os` | clock, time, sleep, execute, getenv |
 | `task` | spawn, wait, delay, cancel |
@@ -355,6 +413,36 @@ See `demos/discord libaries/discordbot.luc`.
 | `import window` | GUI windows, drawing, input (`import window("w")` để đặt tên ngắn) |
 | `import net` | TCP + HTTP(S) client/server, WebSocket (`import net("n")` để đặt tên ngắn) |
 | `import discord` | Discord bot (`luc install discord` first, needs a bot token) |
+
+---
+
+## math.karatsuba — exact big integers
+
+Doubles lose digits past 2^53. `math.karatsuba` multiplies integer
+strings exactly (any size, any count of args — naive below the
+threshold, Karatsuba above, automatically). Always returns a string:
+
+```lua
+create r = math.karatsuba("123456789123456789123456789", "2")
+print(r)   -- 24691357802469135780246 (exact)
+print(math.karatsuba("2", "3", "4"))   -- 24
+```
+
+Plain `*` stays as-is, except integer strings too big for doubles
+(over 15 digits) upgrade to exact automatically:
+
+```lua
+print("12345678901234567890123" * "2")  -- exact string
+print("123" * "456")                    -- 56088 (number, as before)
+```
+
+`!karatsuba` as the very first line makes every integer-string `*`
+in that file exact (imports are not affected):
+
+```lua
+!karatsuba
+print("123" * "456")   -- "56088" (string)
+```
 
 ---
 

@@ -2,7 +2,7 @@
 -- 1. create a bot at https://discord.com/developers/applications
 -- 2. turn on MESSAGE CONTENT INTENT (Bot page) to read text
 -- 3. invite it (bot scope), put the token below
--- run: luc "demos/discord libaries/discordbot.luc"
+-- run: luc "demos/discord_libaries/discordbot.luc"
 -- chat in Discord: !ping -> pong!
 
 import discord("bot")

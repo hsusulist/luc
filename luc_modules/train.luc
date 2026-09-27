@@ -199,4 +199,86 @@ end
 setmetatable(Train, { "__call":  function(_, ...) return Train.new(...) end
  })
 
+-- persist weights (layers + params, exact %.17g round-trip).
+-- t:save(path) writes; ai.Train.load(path) rebuilds. Optimizer
+-- state is not kept: set lr/epochs via :config to keep training.
+function Train:save(path)
+    create f, ferr = io.open(path, "w")
+    if f == nil then error("train:save: cannot open '" .. path .. "'", 2) end
+    f:write("# luc-train-v1\n")
+    f:write("layers: " .. table.concat(self.layers, ",") .. "\n")
+    f:write("params:\n")
+    do
+    create __L = (self.params)
+    repeat 1, len(__L) as __i do
+        create p = __at(__L, __i + 1)
+        f:write(string.format("%.17g\n", p.data))
+    end
+end
+    f:close()
+    return true
+end
+
+function Train.load(path)
+    create f, ferr = io.open(path, "r")
+    if f == nil then error("train:load: cannot open '" .. path .. "'", 2) end
+    if f:read("*l") != "# luc-train-v1" then
+        f:close()
+        error("train:load: bad model file (need luc-train-v1)", 2)
+    end
+    create headline = f:read("*l")
+    if headline == nil then
+        f:close()
+        error("train:load: truncated model file", 2)
+    end
+    create layers = {}
+    create n = 0
+    create first = true
+    repeat part, i in string.split(headline, ",") do
+        create chunk = part
+        if first then
+            first = false
+            create colon = string.find(chunk, ":")
+            if colon != nil then chunk = string.sub(chunk, colon + 1) end
+        end
+        create v = tonumber(chunk)
+        if v != nil then
+            n = n + 1
+            layers[n] = v
+        end
+    end
+    if n < 2 then
+        f:close()
+        error("train:load: bad layers line", 2)
+    end
+    create t = Train.new({ "layers": layers })
+    create vals = {}
+    create nv = 0
+    while true do
+        create line = f:read("*l")
+        if line == nil then break end
+        if line != "params:" then
+            create v = tonumber(line)
+            if v == nil then
+                f:close()
+                error("train:load: bad param line", 2)
+            end
+            nv = nv + 1
+            vals[nv] = v
+        end
+    end
+    f:close()
+    if nv != len(t.params) then
+        error("train:load: param count mismatch", 2)
+    end
+    do
+    create __L = (t.params)
+    repeat 1, len(__L) as __i do
+        create p = __at(__L, __i + 1)
+        p.data = vals[__i + 1]
+    end
+end
+    return t
+end
+
 return Train

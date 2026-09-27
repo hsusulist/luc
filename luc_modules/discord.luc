@@ -12,7 +12,9 @@
 --   end
 --
 -- Groups: bot.msg (send/dm/last/lastby/sender), bot.user (join/getid),
--- bot.slash (new/slash), bot.debug (name/username/id/servers - grab early).
+-- bot.slash (new/slash), bot.debug (name/username/id/servers - grab early),
+-- bot.embed (create/add_field/set_footer/set_author/set_thumbnail/set_image/send),
+-- bot.buttons (new/disable/enable/click), bot.select (new/choose).
 -- bot:run(token) only starts the bot: no loop, no config, no do-block
 -- (throws on failure, so code after it only runs when online).
 -- bot.on reads state, bot:stop() pauses (events queue up),
@@ -32,6 +34,7 @@ create B = {
     "hb": 30, "hback": true, "gen": 0, "hello": false,
     "msgq": [], "joinq": [], "intq": [],
     "recent": [],
+    "btns": [],
     "guilds": {}, "channels": {}, "members": {},
     "pending": [], "cur": nil,
     "paused": false, "running": false, "on": true,
@@ -52,7 +55,7 @@ create function unself(a, b, c)
 end
 
 create function auth()
-    return "Authorization: Bot " .. B.token .. "\r\nUser-Agent: DiscordBot (luc, 0.1)"
+    return "Authorization: Bot " .. B.token .. "\r\nUser-Agent: DiscordBot (luc, 0.2-beta1)"
 end
 
 -- REST with one 429 retry. Returns body, code.
@@ -118,15 +121,21 @@ create function flush_pending()
     B.pending = keep
 end
 
-create function interaction_reply(text)
+-- interaction answer with a full data object (content/embeds/components).
+-- interaction_reply(text) is the text-only shortcut.
+create function interaction_send(data)
     create cur = B.cur
     if cur == nil or cur.kind != "int" then return nil, "no interaction" end
     create r, code = rest("POST",
         "/interactions/" .. cur.iid .. "/" .. cur.itoken .. "/callback",
-        { "type": 4, "data": { "content": text } })
+        { "type": 4, "data": data })
     if r == nil then return nil, code end
     if code == 204 or code == 200 then return true end
     return nil, r
+end
+
+create function interaction_reply(text)
+    return interaction_send({ "content": text })
 end
 
 create function channel_id(name)
@@ -278,10 +287,23 @@ create function handle_packet(m)
     if ev == "INTERACTION_CREATE" then
         if d.data == nil then return end
         create uid = nil
-        if d.member != nil and d.member.user != nil then uid = d.member.user.id
-        elseif d.user != nil then uid = d.user.id
+        create aname = nil
+        if d.member != nil and d.member.user != nil then
+            uid = d.member.user.id
+            aname = d.member.user.username
+        elseif d.user != nil then
+            uid = d.user.id
+            aname = d.user.username
         end
         if d.application_id != nil then B.app = d.application_id end
+        if d.type == 3 and d.data.component_type != nil then
+            -- button (2) or select (3): queued for buttons:click / select:choose
+            B.intq:append({ "kind": "comp", "ctype": d.data.component_type,
+                "cid": d.data.custom_id, "values": d.data.values,
+                "id": d.id, "token": d.token, "channel": d.channel_id,
+                "uid": uid, "author": aname, "app": d.application_id })
+            return
+        end
         B.intq:append({ "kind": "int", "id": d.id, "token": d.token,
             "name": d.data.name, "channel": d.channel_id, "uid": uid, "app": d.application_id })
         return
@@ -623,6 +645,337 @@ bot.dm = function(a, b, c)
     return bot.msg.dm(a, b)
 end
 
+bot.dm = function(a, b, c)
+    if a == bot then a, b, c = b, c, nil end
+    return bot.msg.dm(a, b)
+end
+
+-- ================= embeds (Python: discord.Embed) =================
+bot.embed = {}
+
+-- color: decimal number or "0x..."/"#..." string
+create function embed_color(c)
+    if c == nil then return nil end
+    if type(c) == "number" then return c end
+    if type(c) != "string" then return nil end
+    create s = c
+    if string.sub(s, 1, 2) == "0x" then s = string.sub(s, 3)
+    elseif string.sub(s, 1, 1) == "#" then s = string.sub(s, 2) end
+    return tonumber(s, 16)
+end
+
+create EMB_MT = { "__index": bot.embed }
+
+-- constructor: create e = bot.embed:create({...}) (fresh object each call)
+bot.embed.create = function(a, b)
+    create init = b
+    if a != bot.embed then init = a end
+    if init == nil then init = {} end
+    create e = setmetatable({}, EMB_MT)
+    e._fields = []
+    e._buttons = []
+    e._selects = []
+    if init.title != nil then e._title = init.title end
+    if init.description != nil then e._description = init.description end
+    if init.color != nil then e._color = embed_color(init.color) end
+    return e
+end
+
+-- Python: embed.add_field(name=, value=, inline=)
+bot.embed.add_field = function(a, b)
+    if a == bot.embed then a = b end
+    if a == nil or a._fields == nil then return nil, "not an embed" end
+    create f = b or {}
+    if f.name == nil or f.value == nil then return nil, "need name + value" end
+    if a._fields:len() >= 25 then return nil, "too many fields (25 max)" end
+    create jf = { "name": f.name, "value": f.value }
+    if f.inline then jf.inline = true end
+    a._fields:append(jf)
+    return true
+end
+
+-- Python: embed.set_footer(text=) / set_author(name=) / set_thumbnail(url=) / set_image(url=)
+-- each also takes a plain string shortcut
+bot.embed.set_footer = function(a, b)
+    if a == bot.embed then a = b end
+    if a == nil or a._fields == nil then return nil, "not an embed" end
+    create t = b
+    if type(t) == "string" then t = { "text": t } end
+    if t == nil or t.text == nil then return nil, "need text" end
+    a._footer = t.text
+    return true
+end
+
+bot.embed.set_author = function(a, b)
+    if a == bot.embed then a = b end
+    if a == nil or a._fields == nil then return nil, "not an embed" end
+    create t = b
+    if type(t) == "string" then t = { "name": t } end
+    if t == nil or t.name == nil then return nil, "need name" end
+    a._author = t.name
+    if t.icon_url != nil then a._authoricon = t.icon_url end
+    return true
+end
+
+bot.embed.set_thumbnail = function(a, b)
+    if a == bot.embed then a = b end
+    if a == nil or a._fields == nil then return nil, "not an embed" end
+    create t = b
+    if type(t) == "string" then t = { "url": t } end
+    if t == nil or t.url == nil then return nil, "need url" end
+    a._thumb = t.url
+    return true
+end
+
+bot.embed.set_image = function(a, b)
+    if a == bot.embed then a = b end
+    if a == nil or a._fields == nil then return nil, "not an embed" end
+    create t = b
+    if type(t) == "string" then t = { "url": t } end
+    if t == nil or t.url == nil then return nil, "need url" end
+    a._image = t.url
+    return true
+end
+
+create function embed_json(e)
+    create o = {}
+    if e._title != nil then o.title = e._title end
+    if e._description != nil then o.description = e._description end
+    if e._color != nil then o.color = e._color end
+    if e._fields != nil and e._fields:len() > 0 then
+        create fl = []
+        repeat f, i in e._fields do
+            create jf = { "name": f.name, "value": f.value }
+            if f.inline then jf.inline = true end
+            fl:append(jf)
+        end
+        o.fields = fl
+    end
+    if e._footer != nil then o.footer = { "text": e._footer } end
+    if e._author != nil then
+        o.author = { "name": e._author }
+        if e._authoricon != nil then o.author.icon_url = e._authoricon end
+    end
+    if e._thumb != nil then o.thumbnail = { "url": e._thumb } end
+    if e._image != nil then o.image = { "url": e._image } end
+    return o
+end
+
+-- buttons of one embed -> action rows (5 per row), then one row per
+-- select menu; 5 rows max per message.
+create function embed_rows(btns, sels)
+    create rows = []
+    create row = nil
+    create n = 0
+    repeat b, i in btns do
+        if rows:len() >= 5 then break end
+        if n % 5 == 0 then
+            row = { "type": 1, "components": [] }
+            rows:append(row)
+        end
+        create jb = { "type": 2, "style": b.style or 1, "label": b.label }
+        if b.style == 5 then
+            jb.url = b.url
+        else
+            jb.custom_id = b.id
+            if b.disabled then jb.disabled = true end
+        end
+        row.components:append(jb)
+        n = n + 1
+    end
+    if sels != nil then
+        repeat s, i in sels do
+            if rows:len() >= 5 then break end
+            create js = { "type": 1, "components": [{ "type": 3, "custom_id": s.id, "options": s.options }] }
+            if s.holder != nil then js.components[0].placeholder = s.holder end
+            rows:append(js)
+        end
+    end
+    return rows
+end
+
+-- send the embed: e:send() in a command (origin place, incl. interactions),
+-- e:send(channel) or e:send(channel, text) anywhere. Buttons linked via
+-- buttons:new(..., embed) ride along. Returns true, message id (REST path).
+bot.embed.send = function(a, b, c)
+    if a == bot.embed then return nil, "not an embed" end
+    create e, channel, text = a, b, c
+    if e == nil or e._fields == nil then return nil, "not an embed" end
+    create payload = { "embeds": [embed_json(e)] }
+    create rows = embed_rows(e._buttons, e._selects)
+    if rows:len() > 0 then payload.components = rows end
+    if text != nil then payload.content = text end
+    if channel == nil then
+        if B.cur != nil and B.cur.kind == "int" then
+            return interaction_send(payload)
+        end
+        if B.cur != nil then channel = B.cur.channel end
+    end
+    if channel == nil then return nil, "no channel in context" end
+    create cid = resolve_channel(channel)
+    if cid == nil then return nil, "unknown channel" end
+    create r, code = rest("POST", "/channels/" .. cid .. "/messages", payload)
+    if r == nil then return nil, code end
+    if code == 200 or code == 201 then
+        create t = json.decode(r)
+        return true, t.id
+    end
+    return nil, r
+end
+
+-- ================= buttons (Python: discord.ui View/Button) =================
+-- bot.buttons is a method namespace; button data lives on the embeds it is
+-- linked to (plus a global registry for click/disable by id).
+bot.buttons = {}
+
+-- default custom_id from label (spaces -> _)
+create function button_id(label)
+    create s = tostring(label)
+    create o = ""
+    create i = 1
+    while i <= string.len(s) do
+        create c = string.sub(s, i, i)
+        if c == " " then o = o + "_" else o = o + c end
+        i = i + 1
+    end
+    return o
+end
+
+create function button_by_id(cid)
+    repeat e, i in B.btns do
+        if e.btn != nil and e.btn.id == cid then return e.btn end
+    end
+    return nil
+end
+
+-- new(label, embed?, id?, style?) or new({...}, embed?).
+-- style: 1 blue, 2 grey, 3 green, 4 red, 5 link (needs url, no callback).
+bot.buttons.new = function(a, b, c, d, e)
+    if a == bot.buttons then a, b, c, d, e = b, c, d, e, nil end
+    create label, emb, id, style, extra = a, b, c, d, nil
+    if type(label) == "table" then
+        create t = label
+        label = t.label
+        if id == nil then id = t.id end
+        if style == nil then style = t.style end
+        if t.disabled then extra = { "disabled": true } end
+        if t.url != nil then extra = { "disabled": t.disabled, "url": t.url } end
+    else
+        extra = e
+    end
+    if label == nil then return nil, "need a label" end
+    if id == nil then id = button_id(label) end
+    if style == nil then style = 1 end
+    create url = nil
+    if type(extra) == "string" then url = extra
+    elseif extra != nil and extra.url != nil then url = extra.url end
+    if style == 5 and url == nil then
+        return nil, "link buttons (style 5) need a url"
+    end
+    if style != 5 and url != nil then
+        return nil, "only link buttons (style 5) take a url"
+    end
+    create btn = { "label": label, "id": id, "style": style, "url": url, "disabled": false }
+    if type(extra) == "table" and extra.disabled then btn.disabled = true end
+    B.btns:append({ "btn": btn, "embed": emb })
+    if emb != nil then
+        if emb._buttons == nil then return nil, "not an embed" end
+        emb._buttons:append(btn)
+    end
+    return true
+end
+
+bot.buttons.disable = function(a, b)
+    if a == bot.buttons then a = b end
+    create n = 0
+    repeat e, i in B.btns do
+        if e.btn.id == a or e.btn.label == a then
+            e.btn.disabled = true
+            n = n + 1
+        end
+    end
+    return n > 0
+end
+
+bot.buttons.enable = function(a, b)
+    if a == bot.buttons then a = b end
+    create n = 0
+    repeat e, i in B.btns do
+        if e.btn.id == a or e.btn.label == a then
+            e.btn.disabled = false
+            n = n + 1
+        end
+    end
+    return n > 0
+end
+
+-- block until this button (id or label) is clicked; returns true + clicker.
+-- (LUC's stand-in for Python's await view.wait()/callback.)
+bot.buttons.click = function(a, b)
+    if a == bot.buttons then a = b end
+    create id = a
+    if id == nil then return nil, "need a button id" end
+    while true do
+        create ev = wait_ev(B.intq)
+        if ev.kind == "comp" and ev.ctype == 2 and ev.cid != nil then
+            create known = button_by_id(ev.cid)
+            if ev.cid == id or (known != nil and known.label == id) then
+                B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
+                          "channel": ev.channel, "author": ev.author }
+                return true, ev.author
+            end
+        end
+        B.intq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- ================= select menus (Python: discord.ui Select) =================
+-- bot.select is a method namespace; menus live on the embeds they attach to.
+bot.select = {}
+
+-- new(id, embed, options?, placeholder?) — options: [{label=, value=, description=?}].
+-- single-select (1 pick); the embed is required (menus ride along on send).
+bot.select.new = function(a, b, c, d)
+    if a == bot.select then a, b, c, d = b, c, d, nil end
+    create id, emb, opts, ph = a, b, c, d
+    if id == nil then return nil, "need an id" end
+    if emb == nil or emb._selects == nil then return nil, "need an embed" end
+    if opts == nil then opts = [] end
+    create sopts = []
+    repeat o, i in opts do
+        if sopts:len() >= 25 then break end
+        if o == nil or o.label == nil or o.value == nil then
+            return nil, "options need label + value"
+        end
+        create jo = { "label": o.label, "value": o.value }
+        if o.description != nil then jo.description = o.description end
+        sopts:append(jo)
+    end
+    if sopts:len() == 0 then return nil, "need at least 1 option" end
+    emb._selects:append({ "id": id, "options": sopts, "holder": ph })
+    return true
+end
+
+-- block until this menu is used; returns the picked value + who picked.
+bot.select.choose = function(a, b)
+    if a == bot.select then a = b end
+    create id = a
+    if id == nil then return nil, "need a select id" end
+    while true do
+        create ev = wait_ev(B.intq)
+        if ev.kind == "comp" and ev.ctype == 3 and ev.cid == id then
+            B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
+                      "channel": ev.channel, "author": ev.author }
+            create v = nil
+            if ev.values != nil and ev.values:len() > 0 then v = ev.values[0] end
+            return v, ev.author
+        end
+        B.intq:append(ev)
+        task.wait(0.01)
+    end
+end
+
 bot.slash = {}
 bot.slash.new = function(a, b, c, d)
     if a == bot.slash then a, b, c, d = b, c, d, nil end
@@ -641,8 +994,12 @@ bot.slash.slash = function(a, b)
     while true do
         create ev = wait_ev(B.intq)
         if ev.name == name then
+            create aname = nil
+            if ev.uid != nil and B.members[ev.uid] != nil then
+                aname = B.members[ev.uid].name
+            end
             B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
-                      "channel": ev.channel, "app": ev.app }
+                      "channel": ev.channel, "author": aname, "app": ev.app }
             return true
         end
         B.intq:append(ev)

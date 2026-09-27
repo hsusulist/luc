@@ -1,0 +1,110 @@
+{
+  "Create variable": {
+    "prefix": "create",
+    "body": "create ${1:name} = ${2:value}",
+    "description": "LUC local variable"
+  },
+  "Create function": {
+    "prefix": "create function",
+    "body": [
+      "create function ${1:name}(${2:args})",
+      "    ${3:-- body}",
+      "end"
+    ],
+    "description": "LUC local function"
+  },
+  "Command": {
+    "prefix": "command",
+    "body": [
+      "command ${1:name}(${2:args})",
+      "    ${3:-- body}",
+      "end"
+    ],
+    "description": "LUC procedure (runs, no return)"
+  },
+  "Run command": {
+    "prefix": "run",
+    "body": "run ${1:name}(${2:args})",
+    "description": "Run a command"
+  },
+  "Repeat count": {
+    "prefix": "repeat",
+    "body": [
+      "repeat ${1:5} do",
+      "    ${2:-- body}",
+      "end"
+    ],
+    "description": "Repeat N times"
+  },
+  "Repeat with index": {
+    "prefix": "repeat as",
+    "body": [
+      "repeat ${1:1}, ${2:10} as ${3:i} do",
+      "    ${4:-- body}",
+      "end"
+    ],
+    "description": "Repeat with index variable"
+  },
+  "Repeat iterate": {
+    "prefix": "repeat in",
+    "body": [
+      "repeat ${1:item}, ${2:i} in ${3:list} do",
+      "    ${4:-- body}",
+      "end"
+    ],
+    "description": "Iterate list/dict"
+  },
+  "Import library": {
+    "prefix": "import",
+    "body": "import ${1:ai}",
+    "description": "Import a system library"
+  },
+  "Import alias": {
+    "prefix": "import alias",
+    "body": "import ${1:window}(\"${2:w}\")",
+    "description": "Import a system library with a short name"
+  },
+  "Import from lib": {
+    "prefix": "import from",
+    "body": "import ${1:symbol} from ${2:lib}",
+    "description": "Import a part/symbol from a packed lib"
+  },
+  "Make lib part": {
+    "prefix": "make",
+    "body": "make ${1:name}",
+    "description": "Declare this file as a lib part (first line)"
+  },
+  "Get parts": {
+    "prefix": "get",
+    "body": "get ${1:a}, ${2:b}",
+    "description": "Load lib parts by make-name"
+  },
+  "Pack lib": {
+    "prefix": "pack",
+    "body": "pack ${1:lib}",
+    "description": "Bundle gotten parts into a .lucpack"
+  },
+  "If block": {
+    "prefix": "if",
+    "body": [
+      "if ${1:cond} then",
+      "    ${2:-- body}",
+      "end"
+    ],
+    "description": "If block"
+  },
+  "While loop": {
+    "prefix": "while",
+    "body": [
+      "while ${1:cond} do",
+      "    ${2:-- body}",
+      "end"
+    ],
+    "description": "While loop"
+  },
+  "Strict mode": {
+    "prefix": "!strict",
+    "body": "!strict",
+    "description": "Ultra-strict syntax for this file"
+  }
+}

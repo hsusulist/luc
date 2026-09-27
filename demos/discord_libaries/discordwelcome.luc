@@ -1,6 +1,6 @@
 -- demos/discordwelcome.luc -- greet newcomers in DM (import discord)
 -- turn on SERVER MEMBERS INTENT (Bot page) for join events
--- run: luc "demos/discord libaries/discordwelcome.luc"
+-- run: luc "demos/discord_libaries/discordwelcome.luc"
 
 import discord("bot")
 

@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define LUC_VERSION   "LUC 0.1"
+#define LUC_VERSION   "LUC 0.2-beta1"
 #define LUC_MAXREG    200
 #define LUC_MAXUPVAL  60
 #define LUC_MAXCI     220
@@ -69,6 +69,8 @@ struct Proto {
     UpvalDesc upvals[LUC_MAXUPVAL];
     int nparams, isvararg, maxstack, nup;
     Str *name, *source;
+    int uses_karatsuba;   /* !karatsuba directive: exact big-int * in this chunk */
+    int uses_strict;      /* !strict directive: forbid implicit globals, require quoted dict keys */
 };
 
 struct Upval {
@@ -249,6 +251,9 @@ void sched_poll(void);   /* run due tasks now, never sleep (main-thread waits) *
 Closure *luc_compile(const char *src,int len,const char *chunkname);
 char *find_module(const char *name,int *len,char *found,size_t fcap);
 char *find_system_module(const char *name,int *len,char *found,size_t fcap);
+const char *luc_scriptdir(void);
+int part_make_name(const char *path,char *out,size_t cap);
+char *find_pack(const char *name,int *len,char *found,size_t fcap);
 
 /* library registration helpers (defined in luc_core.c) */
 void   reg(Table *t,const char *name,CFn fn);
@@ -263,6 +268,7 @@ Buffer  *checkbuf (LucState *L,int base,int nargs,int i,const char *fn);
 uint32_t checku32 (LucState *L,int base,int nargs,int i,const char *fn);
 
 /* lib-side helpers */
+int luc_try_bigmul(Value x,Value y,int force,Value *out);
 
 #define LFN(name) static int name(LucState *L,int base,int nargs,CFunc *self)
 #define UNUSED_SELF (void)self

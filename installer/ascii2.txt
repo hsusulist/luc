@@ -1,0 +1,6 @@
+██╗     ██╗   ██╗ ██████╗  Version: 0.2 beta 1
+██║     ██║   ██║██╔════╝  License: Apache
+██║     ██║   ██║██║       Repo: https://github.com/hsusulist/luc
+██║     ██║   ██║██║       Welcome to luc.
+██████╗╚██████╔╝╚██████╗   Type "help", "credits" or "license" for more information.
+╚══════╝ ╚═════╝  ╚═════╝  

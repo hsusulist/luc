@@ -1,0 +1,34 @@
+-- demos/libs_libaries/command.luc -- `command` = procedure: runs, doesn't return
+-- (commands live in the libs system: `import libs` first)
+-- run: luc "demos/libs_libaries/command.luc"
+
+import libs
+
+command greet(name)
+    print("hello " + name)
+end
+
+greet("bo")          -- bare call: no parens needed
+run greet("zo")      -- explicit run
+greet("mo")          -- plain call works too
+
+command math(a, b)
+    create result = a * b
+    print(result)
+end
+
+math 3, 4
+run math(5, 6)
+
+-- local command (required under !strict)
+create command bye(name)
+    print("bye " + name)
+end
+
+bye "bo"
+
+-- commands can't return values (this would be a compile error):
+-- command bad()
+--     return 1
+-- end
+-- use `create function` when you need a value back (functions work in libs too).

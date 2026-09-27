@@ -1,0 +1,11 @@
+import libs
+make add
+
+-- one file, one part: `import libs` first, then `make <name>`.
+-- every top-level create/function/command is auto-exported.
+
+create function plus(a, b)
+    return a + b
+end
+
+create tag = "A"
