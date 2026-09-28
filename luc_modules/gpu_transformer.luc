@@ -1,30 +1,30 @@
---  One training step  =  token ids in  ->  loss out  ->  weights updated
---  in place on the GPU.  The host boundary is crossed exactly twice:
+-- One step: ids in, loss out, weights on GPU
+-- Host crossed twice per step
 --
---      1. upload  N int32 input ids + N int32 targets   (H2D, ~8 KB)
---      2. download 1 float loss  (+ N int32 argmax if accuracy is on)
+-- Upload N ids plus N targets, ~8KB
+-- Download 1 loss plus argmax if needed
 --
---  Everything between those two points -- embedding lookup, RoPE, causal
---  multi-head attention, RMSNorm, SwiGLU FFN, tied/untied head, fused
---  cross-entropy, the entire backward pass, global gradient clipping and
---  the AdamW update -- is queued into luaTL.Program objects and executed
---  with a handful of FFI transitions (or ONE, with CUDA graph replay).
+-- Embed through AdamW stays on device
+-- Attention, norms, FFN and clipping included
+-- Backward plus update queued too
+-- Queued in luaTL.Program objects
+-- Few FFI calls, one with graph replay
 --
---  Layout
---    N  = B * T          rows; sequence b occupies rows b*T .. b*T+T-1
---    D  = dim, H = heads, hd = D/H, F = ffn hidden, V = vocab
---    qkv[l]    : [N, 3D]        Q = cols 0..D-1, K = D..2D-1, V = 2D..3D-1
---    scores[l] : [B*H*T, T]     row ((b*H+h)*T + t);  r % T == t  =>  the
---                               group-causal softmax masks correctly and
---                               sequences cannot see each other.
+-- Layout
+-- N=B*T rows; seq b owns its rows
+-- D dim, H heads, hd D/H, F ffn, V vocab
+-- qkv is N x 3D with Q,K,V blocks
+-- scores is B*H*T x T with causal mask
+-- Group mask keeps sequences separate
+-- No cross-sequence view
 --
---  Padding contract
---    Shapes are STATIC.  A short window or a short final batch is padded
---    with id 0 and target -1.  luaTL_ce_kernel writes loss 0 AND
---    dlogits 0 for those rows, so their contribution to every gradient is
---    exactly zero.  grad_scale and the loss-sum scale are patched in the
---    command structs to 1/valid_tokens, so the reported loss and the
---    gradient magnitude are exact, not approximate.
+-- Padding contract
+-- Shapes static; short batch padded
+-- Pad id 0 and target -1
+-- Padded rows give loss and grad zero
+-- Zero contribution to every gradient
+-- Scales patched to 1/valid_tokens
+-- Loss and grad magnitude stay exact
 
 create ffi = require("ffi")
 
@@ -41,8 +41,8 @@ create sqrt, log, cos, sin, pi = math.sqrt, math.log, math.cos, math.sin, math.p
 create floor, min, max, huge = math.floor, math.min, math.max, math.huge
 create sformat = string.format
 
---  Bindings (resolved lazily so that requiring this file on a CPU-only
---  box does not explode; construction is what fails loudly).
+-- Lazy bindings; CPU-only require stays safe
+-- Construction fails loudly without backend
 create luaTL, C, F32
 
 create function bind()
@@ -63,20 +63,20 @@ end
 GT.available = adapter.available
 GT.adapter   = adapter
 
---  Small helpers
+-- Helpers
 
---- Byte-offset pointer into a tensor's storage, in ELEMENTS (f32).
+--- Element offset pointer into f32 storage
 create function poff(t, elems)
     return ffi.cast("char*", t.data) + elems * 4
 end
 
---- Stride view: the six numbers gemm_ex needs, plus a batch stride.
+--- Stride view for gemm_ex plus batch
 create function sv(ptr, rows, cols, rs, cs, bs)
     return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  F32  }
 end
 
---- Grab the command struct that was just queued, so we can patch scalars
---- (grad_scale, lr, step) later without re-queueing the whole program.
+--- Last queued op for scalar patching
+--- Patch grad_scale, lr, step in place
 create function last_op(p)
     return p.h.ops[p.h.count - 1]
 end
@@ -96,7 +96,7 @@ create function normal_fill(t, std)
     t:upload(buf, n)
 end
 
---  Construction
+-- Construction
 
 create function need(cfg, key)
     create v = cfg[key]
@@ -173,21 +173,21 @@ function GT.new(cfg)
     return self
 end
 
---  Allocation.  Every tensor below lives for the lifetime of the model.
---  Handles (adapter.alloc / adapter.pin) own the storage and anchor it
---  against the GC; `self._keep` anchors the non-owning wrap views.
+-- Allocation; tensors live with model
+-- Handles own storage against GC
+-- _keep anchors non-owning views
 function Model:_alloc()
     create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
     create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
     create D3, F2         = 3 * D, 2 * F
     create keep           = self._keep
 
-    create function A(rows, cols)                 -- zeroed activation buffer
+    create function A(rows, cols)                 -- zeroed buffer
         create h = adapter.alloc(rows, cols)
         keep[len(keep) + 1] = h
         return h.t
     end
-    create function W(ptr, rows, cols)            -- non-owning column view
+    create function W(ptr, rows, cols)            -- non-owning view
         create t = luaTL.wrap(ptr, rows, cols, F32)
         keep[len(keep) + 1] = t
         return t
@@ -205,10 +205,10 @@ function Model:_alloc()
         return p
     end
 
-    -- ---- parameters ----
-    -- GPT-2 style init: 0.02 everywhere, residual-output projections
-    -- scaled by 1/sqrt(2L) so the residual stream does not blow up with
-    -- depth.  No weight decay on 1-D norm gains.
+    -- params
+    -- GPT-2 init 0.02; residual scaled
+    -- Scale 1/sqrt(2L) stops blowup with depth
+    -- No decay on norm gains
     create std  = 0.02
     create rstd = std / sqrt(2 * L)
 
@@ -237,8 +237,8 @@ end
         self.wout = param("head", D, V, std, true)
     end
 
-    -- ---- index buffers ----
-    self.ids = A(N, 1)     -- int32 storage in an f32-sized tensor
+    -- Index buffers
+    self.ids = A(N, 1)     -- int32 in f32 tensor
     self.tgt = A(N, 1)
     self.pos = A(N, 1)
 
@@ -257,9 +257,9 @@ end
 end
     luaTL.check(C.luaTL_upload_i32(self.pos.data, self.h_pos, N), "pos.upload")
 
-    -- ---- residual stream + per-layer saved activations ---
-    self.res  = { (0):  A(N, D)  }      -- res[l]  : output of layer l
-    self.mid  = {}                     -- mid[l]  : after attention residual
+    -- Residual stream and saved activations
+    self.res  = { (0):  A(N, D)  }      -- res is layer output
+    self.mid  = {}                     -- mid after attention
     self.h1, self.qkv, self.sc, self.attn = {}, {}, {}, {}
     self.h2, self.h13, self.hs            = {}, {}, {}
     self.qv, self.kv, self.h13a, self.h13b = {}, {}, {}, {}
@@ -281,23 +281,23 @@ end
         self.h2[l]   = A(N, D)
         self.h13[l]  = A(N, F2)
         self.hs[l]   = A(N, F)
-        -- RoPE operates in place on the Q and K column slices
+        -- RoPE in place on Q and K slices
         self.qv[l]   = W(poff(self.qkv[l], 0), N, D)
         self.kv[l]   = W(poff(self.qkv[l], D), N, D)
-        -- SwiGLU gate/up halves of the fused [N, 2F] projection
+        -- SwiGLU halves of fused projection
         self.h13a[l] = W(poff(self.h13[l], 0), N, F)
         self.h13b[l] = W(poff(self.h13[l], F), N, F)
     end
 end
 
     self.hf     = A(N, D)
-    self.logits = A(N, V)          -- dlogits aliases this (saves N*V floats)
+    self.logits = A(N, V)          -- dlogits reuses logits, saves memory
     self.losses = A(N, 1)
     self.pred   = A(N, 1)
     self.lossacc= A(1, 1)
     self.nsq    = A(1, 1)
 
-    -- ---- backward scratch (reused across layers) ----
+    -- Backward scratch reused per layer
     self.dres   = A(N, D)
     self.dbr    = A(N, D)
     self.dhf    = A(N, D)
@@ -316,11 +316,11 @@ end
     self.f1 = ffi.new("float[1]")
 end
 
---  Program construction
+-- Program build
 
---- Forward pass.  `grad` selects whether cross-entropy also writes
---- dlogits (in place over the logits) or leaves the logits intact so
---- that :generate() can read them.
+--- Forward; grad selects dlogits write or not
+--- No write keeps logits for generate
+--- Generate reads intact logits
 function Model:_queue_forward(p, grad)
     create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
     create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
@@ -346,7 +346,7 @@ function Model:_queue_forward(p, grad)
         create xout = self.res[l]
         create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
-        -- pre-attention norm + fused QKV projection
+        -- Pre-attention norm plus QKV
         p:rmsnorm(xin, ly.ln1.w.t, self.h1[l], eps)
         p:gemm(self.h1[l], ly.wqkv.w.t, qkv)
 
@@ -356,7 +356,7 @@ function Model:_queue_forward(p, grad)
             p:rope(self.kv[l], ro)
         end
 
-        -- S = Q Kt   (batched over heads, looped over sequences)
+        -- Scores QKt batched per head
         do
     create __fa = (0)
     create __fb = (B - 1 )
@@ -373,10 +373,10 @@ function Model:_queue_forward(p, grad)
         end
 end
 
-        -- one launch masks + softmaxes every (sequence, head) row block
+        -- One launch masks all head rows
         p:softmax(sc, sc, { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
-        -- ctx = P V
+        -- Context P times V
         do
     create __fa = (0)
     create __fb = (B - 1 )
@@ -393,11 +393,11 @@ end
         end
 end
 
-        -- residual: mid = xin + ctx @ Wo   (add fused into the epilogue)
+        -- Residual add with fused epilogue
         p:copy(xin, mid)
         p:gemm(at, ly.wo.w.t, mid, { "beta":  1.0  })
 
-        -- SwiGLU feed-forward
+        -- SwiGLU FFN
         p:rmsnorm(mid, ly.ln2.w.t, self.h2[l], eps)
         p:gemm(self.h2[l], ly.w13.w.t, self.h13[l])
         p:swiglu(self.h13a[l], self.h13b[l], self.hs[l],
@@ -407,7 +407,7 @@ end
     end
 end
 
-    -- final norm + output head
+    -- Final norm and head
     p:rmsnorm(self.res[L], self.lnf.w.t, self.hf, eps)
     if self.tie then
         p:gemm(self.hf, self.emb.w.t:t(), self.logits)   -- [N,D] @ [D,V]
@@ -415,7 +415,7 @@ end
         p:gemm(self.hf, self.wout.w.t, self.logits)
     end
 
-    -- argmax BEFORE cross-entropy, because dlogits aliases logits
+    -- Argmax first; dlogits reuses logits
     if self.want_acc then p:argmax(self.logits, self.pred) end
 
     p:cross_entropy(self.logits, self.tgt, self.losses,
@@ -434,13 +434,13 @@ function Model:_queue_backward(p)
     create eps            = self.eps
     create TT             = T * T
     create HTT            = H * TT
-    create dl             = self.logits          -- dlogits, written in place
+    create dl             = self.logits          -- dlogits in place
 
-    -- ---- output head ----
+    -- Output head
     if self.tie then
-        -- d(tok_emb) += dlogits^T @ hf     ([V,N] @ [N,D] -> [V,D])
+        -- grad emb from dlogits and hf
         p:gemm(dl:t(), self.hf, self.emb.g.t, { "beta":  1.0  })
-        -- dhf = dlogits @ tok_emb          ([N,V] @ [V,D] -> [N,D])
+        -- grad hf from dlogits and emb
         p:gemm(dl, self.emb.w.t, self.dhf)
     else
         p:dw(self.hf, dl, self.wout.g.t)
@@ -449,7 +449,7 @@ function Model:_queue_backward(p)
     p:rmsnorm_bwd(self.res[L], self.lnf.w.t, self.dhf, self.dres,
                   self.lnf.g.t, eps)
 
-    -- ---- layers, top down ----
+    -- Layers top down
     do
     create __fa = (L)
     create __fb = (1)
@@ -463,18 +463,18 @@ function Model:_queue_backward(p)
         create mid = self.mid[l]
         create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
-        -- ---- feed-forward ----
-        p:dx(self.dres, ly.w2.w.t, self.dhs)          -- dhs  = dres @ W2^T
-        p:dw(self.hs[l], self.dres, ly.w2.g.t)        -- dW2 += hs^T @ dres
+        -- Feed-forward
+        p:dx(self.dres, ly.w2.w.t, self.dhs)          -- dhs from dres
+        p:dw(self.hs[l], self.dres, ly.w2.g.t)        -- dW2 accumulates
         p:swiglu_bwd(self.h13a[l], self.h13b[l], self.dhs,
                      self.dh13a, self.dh13b,
                      { "lda":  F2, "ldb":  F2, "ldo":  F  })
         p:dw(self.h2[l], self.dh13, ly.w13.g.t)
         p:dx(self.dh13, ly.w13.w.t, self.dh2)
         p:rmsnorm_bwd(mid, ly.ln2.w.t, self.dh2, self.dbr, ly.ln2.g.t, eps)
-        p:axpy(self.dres, self.dbr, 1.0)              -- residual join
+        p:axpy(self.dres, self.dbr, 1.0)              -- join residual
 
-        -- ---- attention ----
+        -- Attention
         p:dx(self.dres, ly.wo.w.t, self.dattn)
         p:dw(at, self.dres, ly.wo.g.t)
 
@@ -488,7 +488,7 @@ function Model:_queue_backward(p)
 
             create qb = b * T * D3
             create dA = sv(poff(self.dattn, b * T * D), T, hd, D, 1, hd)
-            -- dP = dctx @ V^T
+            -- dP from dctx and V
             p:gemm(dA,
                    sv(poff(qkv, qb + 2 * D), hd, T, 1, D3, hd),
                    sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),

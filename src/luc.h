@@ -1,5 +1,5 @@
-/* luc.h - shared header: the contract between luc_core.c and the merged libs */
-/* update 2026-09-01: comment cleanup */
+/* shared header: core/libs contract */
+/* cleanup 2026-09-01 */
 #ifndef LUC_H
 #define LUC_H
 
@@ -53,10 +53,10 @@ struct Str  { Obj o; Str *snext; int len; unsigned hash; char s[1]; };
 typedef struct { Value k, v; } Entry;
 struct Table {
     Obj o;
-    Value *arr;  int alen, acap;      /* array part: indices 1..alen        */
-    Entry *ents; int ecap, ecount;    /* hash part: open addressing          */
-    unsigned tid, ver;               /* inline cache identity + version     */
-    struct Table *meta;              /* metatable-lite: __index/__call/...  */
+    Value *arr;  int alen, acap;      /* array part: 1..alen */
+    Entry *ents; int ecap, ecount;    /* hash part: open addressing */
+    unsigned tid, ver;               /* inline cache id + version */
+    struct Table *meta;              /* metatable: __index/__call/... */
 };
 
 typedef struct { unsigned char instack; unsigned char idx; } UpvalDesc;
@@ -69,8 +69,8 @@ struct Proto {
     UpvalDesc upvals[LUC_MAXUPVAL];
     int nparams, isvararg, maxstack, nup;
     Str *name, *source;
-    int uses_karatsuba;   /* !karatsuba directive: exact big-int * in this chunk */
-    int uses_strict;      /* !strict directive: forbid implicit globals, require quoted dict keys */
+    int uses_karatsuba;   /* !karatsuba: exact big-int * here */
+    int uses_strict;      /* !strict: no implicit globals, quoted dict keys */
 };
 
 struct Upval {
@@ -103,9 +103,9 @@ struct LucState {
     Upval *openupv;
     int status;
     LucState *resumer;
-    int yield_A, yield_C;      /* where to place values on resume */
-    int yieldbase, nyield;     /* where the yielded values live   */
-    int npending;              /* args pre-pushed for first resume */
+    int yield_A, yield_C;      /* resume value slots */
+    int yieldbase, nyield;     /* yielded values slot */
+    int npending;              /* pre-pushed first-resume args */
     double waketime; int scheduled;
     Str *cursource; int curline;
 };
@@ -121,7 +121,7 @@ extern Value NIL;
 #define AS_FILE(v)  ((FileH*)(v).u.o)
 #define AS_SOCK(v)  ((Socket*)(v).u.o)
 
-/* 1b. bytecode opcodes + instruction codecs (shared by luc_core.c and luc_trans.c) */
+/* 1b. opcodes + codecs (core/trans shared) */
 enum {
     OP_MOVE, OP_LOADK, OP_LOADNIL, OP_LOADBOOL,
     OP_GETGLOBAL, OP_SETGLOBAL, OP_GETUPVAL, OP_SETUPVAL,
@@ -147,7 +147,7 @@ enum {
 #define GET_Bx(i)   ((int)((i)&0xFFFFu))
 #define GET_sBx(i)  (GET_Bx(i)-32767)
 
-/* 2. global VM state (defined in luc_core.c) */
+/* 2. global VM state (core) */
 
 typedef struct ErrJmp { jmp_buf jb; struct ErrJmp *prev; } ErrJmp;
 
@@ -161,8 +161,8 @@ typedef struct LucV {
 
     Table *globals;
     Table *stringlib, *listmeta, *bufferlib, *filelib;
-    Table *listcore;         /* core list methods that shadow listmeta (remove) */
-    Table *tabmeta;          /* dict methods reachable through dot access */
+    Table *listcore;         /* list core methods (shadow listmeta) */
+    Table *tabmeta;          /* dict methods via dot access */
     Table *socklib;          /* socket methods (import net) */
 
     LucState *mainco, *cur;
@@ -172,25 +172,25 @@ typedef struct LucV {
 
     SchedEntry *sched; int nsched, schedcap;
     Table *loaded;           /* module cache for require() */
-    unsigned tidcounter;     /* inline cache table identity */
+    unsigned tidcounter;     /* inline cache id */
 } LucV;
 
 extern LucV V;
 
-/* VM yield machinery (defined in luc_core.c, used by coroutine/task libs) */
+/* yield machinery (core, for coro/task) */
 typedef struct YieldPt { jmp_buf jb; struct YieldPt *prev; LucState *co; int cdepth; } YieldPt;
 extern YieldPt *g_yp;
 
-/* core functions shared with the libs */
+/* core funcs for libs */
 
-/* platform (luc_core.c) */
+/* platform (core) */
 double luc_now(void);
 void   luc_sleep(double s);
 void  *lmalloc(size_t n);
 void  *lrealloc(void *p,size_t n);
 void  *lcalloc(size_t n);
 
-/* values (small helpers are static inline below) */
+/* values (inline helpers below) */
 int truthy(Value v);
 const char *type_name(Value v);
 
@@ -203,8 +203,8 @@ Str *str_new(const char *s,int len);
 void num2str(double n,char *buf,size_t sz);
 int  str2num(const char *s,int len,double *out);
 Str *tostr(Value v);
-extern const char *const HEXD;          /* "0123456789abcdef" (string+buffer) */
-int  hexval(int c);                     /* hex digit -> value (buffer/json/window) */
+extern const char *const HEXD;          /* hex digits (string+buffer) */
+int  hexval(int c);                     /* hex digit to value */
 
 static inline Value mknum(double d){ Value v; v.t=LT_NUM; v.u.n=d; return v; }
 static inline Value mkbool(int b){ Value v; v.t=LT_BOOL; v.u.b=(b!=0); return v; }
@@ -235,7 +235,7 @@ void      ensure_stack(LucState *L,int need);
 /* GC */
 void gc_collect(void);
 
-/* VM internals used by libs */
+/* VM internals for libs */
 int  vm_call(LucState *L,int func,int nargs,int nres);
 int  vm_len(Value v);
 int  vm_lessthan(Value a,Value b,int orequal);
@@ -245,9 +245,9 @@ int  co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres);
 void sched_add(LucState *co,double wake);
 void sched_remove(int i);
 void sched_run(void);
-void sched_poll(void);   /* run due tasks now, never sleep (main-thread waits) */
+void sched_poll(void);   /* run due tasks now, no sleep */
 
-/* compiler + module system (used by require/import) */
+/* compiler + modules (require/import) */
 Closure *luc_compile(const char *src,int len,const char *chunkname);
 char *find_module(const char *name,int *len,char *found,size_t fcap);
 char *find_system_module(const char *name,int *len,char *found,size_t fcap);
@@ -255,11 +255,11 @@ const char *luc_scriptdir(void);
 int part_make_name(const char *path,char *out,size_t cap);
 char *find_pack(const char *name,int *len,char *found,size_t fcap);
 
-/* library registration helpers (defined in luc_core.c) */
+/* lib registration helpers (core) */
 void   reg(Table *t,const char *name,CFn fn);
 Table *newlib(const char *name);
 
-/* argument-check helpers (defined in luc_core.c) */
+/* arg-check helpers (core) */
 double   checknum (LucState *L,int base,int nargs,int i,const char *fn);
 int      checkint (LucState *L,int base,int nargs,int i,const char *fn);
 Str     *checkstr (LucState *L,int base,int nargs,int i,const char *fn);
@@ -279,10 +279,10 @@ static inline Value argv_(LucState *L,int base,int nargs,int i){
 #define AR(i) argv_(L,base,nargs,(i))
 #define RET(i,v) do{ ensure_stack(L,base+(i)+2); L->stack[base+(i)]=(v); }while(0)
 
-/* shared across base <-> table libs (defined in luc_lib_base.c) */
+/* shared base<->table helper (base) */
 int f_unpack(LucState *L,int base,int nargs,CFunc *self);
 
-/* module entry points (each lib exports exactly one) */
+/* module entry points (one per lib) */
 
 void  lucL_open_base(void);                 /* luc_lib_base.c   */
 void  lucL_open_string(void);               /* luc_lib_string.c */

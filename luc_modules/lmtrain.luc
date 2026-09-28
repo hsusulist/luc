@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -18,10 +18,10 @@ LMTrain.__index = LMTrain
 create IS_TTY = lmlog.is_tty
 create wall = lmlog.now
 
--- Buffering policy now lives in lmlog.setup_stdout() (called on require of
--- lmlog).  It used to be `io.stdout:setvbuf("no")` duplicated twice here,
--- which left anyone driving lmlog directly at libc's mercy, and forced a
--- write(2) per byte on a pipe.  See PROBLEM 4 notes in lmlog.lua.
+-- Buffering in lmlog.setup_stdout on require
+-- Old code duplicated setvbuf here twice
+-- Direct lmlog users got slow pipe writes
+-- See PROBLEM 4 in lmlog.lua
 
 create floor, ceil = math.floor, math.ceil
 create huge = math.huge
@@ -30,8 +30,8 @@ create sformat = string.format
 
 create DEFAULTS = { "vocab":  256, "dim":  64, "layers":  2, "heads":  4, "ffn":  128, "epochs":  200, "lr":  1e-3, "lr_min":  0, "warmup":  0.05, "sched":  "cosine", "optimizer":  "adamw", "weight_decay":  0.01, "beta1":  0.9, "beta2":  0.95, "momentum":  0.9, "bar_style":  1, "bar_len":  20, "every":  1, "patience":  0, "min_delta":  0, "verbose":  true, "causal":  true, "pos":  "rope", "rope_base":  10000, "max_seq":  128, "stride":  nil, "batch_size":  8, "shuffle":  true, "grad_accum":  1, "sample_every":  0, "val_split":  0, "eval_every":  1, "keep_best":  true, "clip_norm":  1.0, "dropout":  0, "tie":  true, "fused_qkv":  true, "backend":  "cpu", "log_every_sec":  nil, "graph":  false, "max_bytes":  8 * 1024 * 1024, "hints":  true, "save_every":  1, "keep_last":  1, "save_best":  true, "save_at_end":  true, "resume":  false, "restore_best":  "auto" }
 
---- Keys that are legitimately absent (nil) but understood.  Used to be
---- declared and never read; now it backs the typo detector below.
+--- Nilable keys for typo detector
+--- Backs detector below
 create NILABLE = { "data":  true, "log":  true, "stop_loss":  true, "stop_when":  true, "seed":  true, "on_stop":  true, "name":  true, "tokenizer":  true, "temperature":  true, "top_k":  true, "top_p":  true, "data_file":  true, "max_tokens":  true, "auto_save":  true, "save_format":  true, "precision":  true, "inplace_bar":  true, "stream":  true, "preset":  true, "sample_prompt":  true, "sample_len":  true, "sample_temperature":  true }
 
 create ARCH_KEYS = { "vocab":  true, "dim":  true, "layers":  true, "heads":  true, "ffn":  true, "causal":  true, "pos":  true, "rope_base":  true, "max_seq":  true, "tie":  true, "dropout":  true, "backend":  true, "graph":  true, "fused_qkv":  true }
@@ -40,8 +40,8 @@ create OPT_KEYS = { "optimizer":  true, "weight_decay":  true, "beta1":  true, "
 
 create RESERVED = { "new":  true, "run":  true, "config":  true, "bar":  true, "reset":  true, "summary":  true, "parameters":  true, "generate":  true, "save":  true, "load":  true, "push":  true, "encode":  true, "decode":  true, "evaluate":  true, "model":  true, "params":  true, "opt":  true, "sgd":  true, "history":  true, "epoch":  true, "loss":  true, "best_loss":  true, "accuracy":  true, "elapsed":  true, "stopped":  true, "val_loss":  true }
 
---- Named size presets.  Any key the user set explicitly wins over the
---- preset; "auto" (data-size driven) is handled separately in new().
+--- Size presets; explicit keys win
+--- auto handled in new()
 create LMTRAIN_PRESETS = { "tiny":  { "dim":  32, "layers":  1, "heads":  2, "ffn":  64, "max_seq":  64  }, "small":  { "dim":  64, "layers":  2, "heads":  4, "ffn":  128, "max_seq":  128  }, "base":  { "dim":  128, "layers":  4, "heads":  8, "ffn":  256, "max_seq":  256  }, "medium":  { "dim":  256, "layers":  6, "heads":  8, "ffn":  512, "max_seq":  384  } }
 
 create ALIASES = { "e":  "epochs", "epoch":  "epochs", "epochs":  "epochs", "n":  "epochs", "iters":  "epochs", "steps":  "epochs", "lr":  "lr", "rate":  "lr", "learning_rate":  "lr", "lr_min":  "lr_min", "min_lr":  "lr_min", "warmup":  "warmup", "warmup_frac":  "warmup", "sched":  "sched", "schedule":  "sched", "lr_decay":  "sched", "opt":  "optimizer", "optimizer":  "optimizer", "optim":  "optimizer", "wd":  "weight_decay", "weight_decay":  "weight_decay", "decay":  "weight_decay", "beta1":  "beta1", "beta2":  "beta2", "momentum":  "momentum", "v":  "vocab", "vocab":  "vocab", "vocab_size":  "vocab", "d":  "dim", "dim":  "dim", "width":  "dim", "model_dim":  "dim", "l":  "layers", "layers":  "layers", "depth":  "layers", "nlayers":  "layers", "h":  "heads", "heads":  "heads", "nheads":  "heads", "f":  "ffn", "ffn":  "ffn", "ff":  "ffn", "hidden":  "ffn", "data":  "data", "tokens":  "data", "seq":  "data", "sequences":  "data", "tokenizer":  "tokenizer", "tok":  "tokenizer", "bar":  "bar_style", "style":  "bar_style", "bar_style":  "bar_style", "bar_len":  "bar_len", "width_bar":  "bar_len", "log":  "log", "on_epoch":  "log", "callback":  "log", "every":  "every", "log_every":  "every", "stop":  "stop_loss", "stop_loss":  "stop_loss", "target_loss":  "stop_loss", "stop_when":  "stop_when", ("until"):  "stop_when", "patience":  "patience", "min_delta":  "min_delta", "verbose":  "verbose", "seed":  "seed", "name":  "name", "on_stop":  "on_stop", "causal":  "causal", "mask":  "causal", "causal_mask":  "causal", "pos":  "pos", "positional":  "pos", "position":  "pos", "pe":  "pos", "rope_base":  "rope_base", "theta":  "rope_base", "max_seq":  "max_seq", "ctx":  "max_seq", "max_ctx":  "max_seq", "context":  "max_seq", "stride":  "stride", "batch":  "batch_size", "batch_size":  "batch_size", "bs":  "batch_size", "shuffle":  "shuffle", "val":  "val_split", "val_split":  "val_split", "eval_every":  "eval_every", "keep_best":  "keep_best", "clip":  "clip_norm", "clip_norm":  "clip_norm", "grad_clip":  "clip_norm", "dropout":  "dropout", "drop":  "dropout", "tie":  "tie", "fused_qkv":  "fused_qkv", "fused":  "fused_qkv", "qkv_fused":  "fused_qkv", "grad_accum":  "grad_accum", "accumulate":  "grad_accum", "accum":  "grad_accum", "accum_steps":  "grad_accum", "effective_batch":  "grad_accum", "sample_every":  "sample_every", "show_sample":  "sample_every", "sample_prompt":  "sample_prompt", "sample_len":  "sample_len", "sample_temperature":  "sample_temperature", "temperature":  "temperature", "temp":  "temperature", "top_k":  "top_k", "topk":  "top_k", "top_p":  "top_p", "topp":  "top_p", "preset":  "preset", "backend":  "backend", "device":  "backend", "engine":  "backend", "gpu":  "backend", "use_gpu":  "backend", "graph":  "graph", "cuda_graph":  "graph", "log_every_sec":  "log_every_sec", "log_interval":  "log_every_sec", "data_file":  "data_file", "datafile":  "data_file", "file":  "data_file", "text_file":  "data_file", "path":  "data_file", "corpus":  "data_file", "max_bytes":  "max_bytes", "byte_limit":  "max_bytes", "read_limit":  "max_bytes", "max_tokens":  "max_tokens", "token_limit":  "max_tokens", "hints":  "hints", "hint":  "hints", "tips":  "hints", "auto_save":  "auto_save", "autosave":  "auto_save", "auto_save_path":  "auto_save", "checkpoint":  "auto_save", "ckpt":  "auto_save", "save_to":  "auto_save", "save_every":  "save_every", "checkpoint_every":  "save_every", "save_interval":  "save_every", "ckpt_every":  "save_every", "keep_last":  "keep_last", "keep_checkpoints":  "keep_last", "max_checkpoints":  "keep_last", "rotate":  "keep_last", "save_best":  "save_best", "best_file":  "save_best", "save_at_end":  "save_at_end", "save_final":  "save_at_end", "resume":  "resume", "resume_from":  "resume", "auto_resume":  "resume", "restore_best":  "restore_best", "save_format":  "save_format", "format":  "save_format", "precision":  "precision", "prec":  "precision" }
@@ -51,7 +51,7 @@ create BAR_CHARS = { (1):  { "fill":  "#", "empty":  "-"  }, (2):  { "fill":  "\
 create POS_MODES = { "rope":  true, "rotary":  true, "sinusoidal":  true, "sin":  true, "absolute":  true, "abs":  true, "none":  true, "off":  true  }
 create SCHEDULES = { "cosine":  true, "linear":  true, "none":  true, "constant":  true  }
 
---- Every key the library understands, for the typo detector.
+--- Known keys for typo detector
 create KNOWN = {}
 do
     repeat k, __v in DEFAULTS do KNOWN[k] = true end
@@ -72,9 +72,9 @@ create function say(self, text)
     return lmlog.say(text)
 end
 
---- Cheap "did you mean" -- shared prefix + length proximity.  No full
---- edit distance; this only needs to catch save_evry / bath_size class
---- typos, and a wrong suggestion is worse than none.
+--- Cheap did-you-mean via prefix match
+--- Catches save_evry class typos
+--- Wrong hint worse than none
 create function suggest(key)
     create best, best_score = nil, 0
     repeat k, __v in KNOWN do
@@ -126,14 +126,14 @@ end
     return table.concat(chars)
 end
 
--- ==========================================================================
---  PROBLEM 1 -- data sources
--- ==========================================================================
+-- PROBLEM 1: data sources
+--
+--
 
---- Is this an ai.Data instance?  Duck-typed against its REAL API (data.lua
---- exposes :batches(), :count(), :config() and a .files array) rather than
---- against a metatable identity, so a user's own loader with the same shape
---- works too, and so we do not hard-require ai/data/data.lua.
+--- ai.Data check via batches/count/files API
+--- Duck-typed, not metatable identity
+--- Custom loaders with same shape work
+--- Avoids hard-requiring data.lua
 create function is_ai_data(v)
     return type(v) == "table"
        and type(v.batches) == "function"
@@ -141,21 +141,20 @@ create function is_ai_data(v)
        and type(v.files) == "table"
 end
 
---- Read a text file with a byte budget.
+--- Read text file with byte budget
 ---
---- WHY CAPPED WHOLE-FILE AND NOT TRUE STREAMING:
---- build_windows() already materialises every training window as Lua tables
---- up front, and both run loops index `train_w` randomly for shuffling.  A
---- genuinely streaming trainer would need a different window generator and a
---- different shuffle strategy on both backends -- a much larger change, and
---- one that would diverge the two loops.  So we read the file in 1 MB blocks
---- (constant peak string memory, unlike f:read("*a") on a 2 GB corpus) and
---- stop at max_bytes.  The cap matters because the in-memory cost is roughly
---- 40x the text size: ~16 B per Lua array slot for the token list, then again
---- for each window's input and target copies.  8 MB of text is already
---- ~300 MB of RAM, which is the practical ceiling for "modest hardware".
---- Exceeding the cap warns loudly and truncates on a whitespace boundary --
---- it never silently eats a partial multi-byte character or BPE token.
+--- Capped read, not true streaming
+--- build_windows needs full tables for shuffle
+--- Streaming needs new window and shuffle logic
+--- That change would diverge the loops
+--- So read in 1MB blocks, constant memory
+--- Unlike full read on 2GB corpus
+--- Cap guards 40x table overhead
+--- 16B per token slot plus window copies
+--- 8MB text is ~300MB RAM ceiling
+--- Modest hardware limit
+--- Over-cap warns and cuts at whitespace
+--- Never splits UTF-8 or BPE token
 create function read_text_file(path, max_bytes, verbose, owner)
     create f, err = io.open(path, "rb")
     if not f then
@@ -179,8 +178,8 @@ create function read_text_file(path, max_bytes, verbose, owner)
     create truncated = false
     if size > got then
         truncated = true
-        -- back off to the last whitespace so we never split a UTF-8
-        -- sequence or a BPE-mergeable word across the cut
+        -- Cut at whitespace to keep UTF-8 intact
+        -- Avoids splitting BPE word
         create cut = len(text)
         create floor_cut = math.max(1, len(text) - 4096)
         while cut > floor_cut and not string.find(string.sub(text, cut, cut), "%s") do
@@ -203,12 +202,12 @@ create function read_text_file(path, max_bytes, verbose, owner)
     return text
 end
 
---- Pull sequences out of an ai.Data instance using its documented API.
---- :batches() returns a list of batches, each a list of items; an item is a
---- raw line (string) when data.tokenizer is unset, or an already-encoded id
---- array when it is set.  We call it EXACTLY ONCE: it re-reads every file
---- from disk and re-shuffles on each call, so calling it twice would both
---- double the I/O and give inconsistent data.
+--- Pull sequences via ai.Data batches API
+--- Raw string or encoded ids per item
+--- Tokenizer set means ids already
+--- Call batches exactly once
+--- Repeat calls re-read and reshuffle
+--- Twice doubles I/O and splits data
 create function sequences_from_ai_data(d, encode_text, verbose, owner, max_tokens)
     create batches = d:batches()
     if type(batches) != "table" then
@@ -267,9 +266,9 @@ end
     return seqs, ntok
 end
 
---- Normalise every accepted data form into token-id sequences.
---- Accepted:  string | {string,...} | {int,...} | {{int,...},...}
----            | ai.Data instance | data_file = "path" | {"a.txt","b.txt"}
+--- Normalize data forms to id sequences
+--- Accepts strings, ids, ai.Data, files
+--- Covers nested id lists too
 create function coerce_data(config, owner)
     create out = {}
     repeat k, v in config do out[k] = v end
@@ -287,7 +286,7 @@ create function coerce_data(config, owner)
         end
     end
 
-    -- ---- data_file --------------------------------------------------
+    -- data_file branch
     if out.data_file != nil then
         if out.data != nil then
             error("LMTrain: pass either 'data' or 'data_file', not both", 3)
@@ -327,11 +326,11 @@ end
         return out
     end
 
-    -- ---- ai.Data instance -------------------------------------------
+    -- ai.Data branch
     if is_ai_data(out.data) then
         create d = out.data
-        -- If the user gave LMTrain a tokenizer but ai.Data has none, share it
-        -- so both sides agree on the id space.  Never override the Data's own.
+        -- Share tokenizer so id spaces match
+        -- Never override Data own tokenizer
         if tok and d.tokenizer == nil and type(d.config) == "function" then
             d:config{ "tokenizer":  tok  }
         elseif d.tokenizer and tok == nil then
@@ -344,7 +343,7 @@ end
         return out
     end
 
-    -- ---- existing paths, unchanged ----------------------------------
+    -- Other data paths
     if type(out.data) == "string" then
         out.data = encode_text(out.data)
         out._source = "string"
@@ -397,10 +396,10 @@ create function resolve_aliases(config, who)
         origin[canonical] = key
     end
 
-    -- Typo detection.  A misspelled 'save_evry' used to be silently accepted
-    -- and the user lost the run anyway -- the exact outcome auto_save exists
-    -- to prevent.  Warn (never error): unknown keys were legal before and
-    -- some users stash their own metadata on the config.
+    -- Typo check; misspelling once lost runs silently
+    -- auto_save exists to prevent that loss
+    -- Warn only; unknown keys may be user metadata
+    -- Old keys stay legal
     if unknown and config.hints != false and config.verbose != false then
         do
     create __fa = (1)
@@ -438,7 +437,7 @@ create function get_sequences(data, who)
         error(sformat("LMTrain%s: data must be a table of token ids, got %s", who, type(data)), 3)
     end
     if len(data) == 0 then
-        -- was: error(sformat("...%s...", who, 3), 3) -- stray extra argument
+        -- Old call had stray extra arg
         error(sformat("LMTrain%s: data is empty, expected at least 2 token ids", who), 3)
     end
     if type(data[1]) == "table" then return data end
@@ -682,7 +681,7 @@ end
             who, tostring(self.log_every_sec)), 3)
     end
 
-    -- ---- PROBLEM 3: auto-save config -------------------------------
+    -- PROBLEM 3 auto-save config
     create asv = self.auto_save
     if asv != nil and asv != false and asv != true and type(asv) != "string" then
         error(sformat("LMTrain%s: 'auto_save' must be a path, true or false, got %s",
@@ -715,9 +714,9 @@ end
 end
 
 create function snapshot(params)
-    -- GPU shims carry no host storage (params[i].data.data is {}), so this
-    -- would return a snapshot of nothing and _restore would then silently
-    -- write nothing while reporting success.  Fail loudly instead.
+    -- GPU shims have empty host mirror
+    -- Snapshot would save nothing silently
+    -- Fail loudly instead
     if params[1] and params[1].gpu then
         error("LMTrain._snapshot: this is a GPU model -- its parameters live in VRAM and "
             .. "params[i].data.data is an empty host mirror. Use gpu_model:snapshot() "
@@ -779,11 +778,11 @@ end
     return true
 end
 
--- ==========================================================================
---  PROBLEM 2 -- make the vocab/tokenizer story legible
--- ==========================================================================
+-- PROBLEM 2: vocab/tokenizer story
+--
+--
 
---- How are ids actually being produced?  "tokenizer" | "byte" | "ids"
+--- Id source: tokenizer, byte or ids
 function LMTrain:_tokenization()
     if self.tokenizer then return "tokenizer" end
     create src = self._source
@@ -794,12 +793,12 @@ function LMTrain:_tokenization()
     return "ids"
 end
 
---- Bytes of parameter memory burned by one embedding row.
+--- Memory per embedding row
 create function row_cost(self)
     create per = (self.backend == "gpu") and 4 or 8
-    -- weight + grad + adam m + adam v on the GPU; weight + grad on CPU
+    -- GPU keeps weight, grad, m, v; CPU keeps two
     create copies = (self.backend == "gpu") and 4 or 2
-    if not self.tie then copies = copies * 2 end   -- untied head row too
+    if not self.tie then copies = copies * 2 end   -- untied head costs extra
     return self.dim * per * copies
 end
 
@@ -825,7 +824,7 @@ function LMTrain:_vocab_report()
     if mode == "byte" then
         say(self, sformat("[LMTrain] tokenizer: none -- using byte-level ids (1..256). "
             .. "vocab = %d.", self.vocab))
-        -- ---- the over-provisioning question, answered concretely -----
+        -- Over-provisioning note
         if self.vocab > 256 then
             create dead = self.vocab - 256
             say(self, sformat(
@@ -854,7 +853,7 @@ function LMTrain:_vocab_report()
         return
     end
 
-    -- raw ids supplied by the user
+    -- Raw user ids below
     if reach and self.vocab > reach * 2 and self.vocab - reach > 64 then
         create dead = self.vocab - reach
         say(self, sformat("[LMTrain] note: vocab = %d but the highest id in your data is %d. "
@@ -877,14 +876,14 @@ function LMTrain:_build()
     end
     check_config(self, "")
 
-    -- ---- GPU-resident backend (opt-in, strictly additive) -----------
+    -- GPU backend opt-in
     if self.backend == "gpu" then
         if not ok_gpu_mod then
             error("LMTrain: backend = 'gpu' but lmtrain_gpu.lua failed to load: "
                   .. tostring(lmtrain_gpu), 2)
         end
         lmtrain_gpu.install(LMTrain)
-        return self:_build_gpu()          -- fails loudly if luaTL is missing
+        return self:_build_gpu()          -- needs luaTL
     end
     self.gpu_model = nil
 
@@ -922,12 +921,12 @@ function LMTrain:_build()
     return self
 end
 
---- Checkpoint layout compat.  Fused QKV stores one (dim x 3*dim) projection
---- per layer; builds before the fusion stored three separate (dim x dim)
---- ones -- exactly two more parameter tensors per layer.  When :load() hits
---- an nparams mismatch matching that signature, rebuild the model in the
---- legacy layout so the positional parameter stream still lines up.  Returns
---- true if the model was rebuilt.
+--- Checkpoint compat for fused QKV layout
+--- Old builds had two extra tensors per layer
+--- Mismatch triggers legacy rebuild
+--- Keeps param stream aligned
+--- Returns true if rebuilt
+--- See :load path
 function LMTrain:_relayout_for_checkpoint(nparams_file)
     create m = self.model
     if not m or m.fused_qkv == nil or type(m.layers) != "table" then
@@ -1075,9 +1074,9 @@ function LMTrain:reset()
     self.is_best = false
     self.stopped = nil
     self.elapsed = 0
-    -- On the GPU path best_snapshot holds device handles.  Dropping the Lua
-    -- reference alone strands that VRAM until a GC cycle happens to run the
-    -- finalizers, with no way to reach it in the meantime; release it.
+    -- GPU snapshot holds device handles
+    -- Dropping ref strands VRAM until GC
+    -- Release it explicitly
     if self.gpu_model and self.best_snapshot then
         pcall(function() self.gpu_model:release_snapshot(self.best_snapshot) end)
     end
@@ -1171,9 +1170,9 @@ end
     return total / count, 100 * correct / count
 end
 
---- Shared end-of-run best-weight restore policy, so both loops behave the
---- same.  `restore_best = "auto"` (default) preserves the historical
---- behaviour exactly; it just no longer does it silently.
+--- Shared best-restore policy for both loops
+--- auto keeps historical behavior
+--- Now reports instead of silent
 function LMTrain:_should_restore_best()
     create mode = self.restore_best
     if mode == nil then mode = "auto" end
@@ -1181,9 +1180,9 @@ function LMTrain:_should_restore_best()
     if mode == true then return true end
     if mode == false then return false end
     if self.stopped != "epochs" then return true end
-    -- Completed all epochs: historical behaviour keeps the FINAL weights even
-    -- if an earlier epoch was better.  Surprising after overfitting, so say so
-    -- rather than change results under existing users.
+    -- Full run keeps final weights by history
+    -- Final may beat best after overfit
+    -- Announce instead of changing results
     create final = self.val_loss or self.loss
     if final and self.best_loss < huge and final > self.best_loss + 1e-12 then
         say(self, sformat("[LMTrain] note: final loss %.5f is worse than the best seen "
@@ -1203,9 +1202,9 @@ function LMTrain:run()
 
     if self._dirty or self.model == nil or self.opt == nil then self:_build() end
 
-    -- Resume BEFORE validating data: :load() overwrites self.vocab from the
-    -- checkpoint header, so validating first would check the tokens against
-    -- the wrong vocabulary.  :load() also calls _build() and clears _dirty.
+    -- Resume before validate; load resets vocab
+    -- Early validate would use wrong vocab
+    -- Load also rebuilds and clears dirty
     self:_maybe_resume()
 
     create sequences = validate_data(self.data, self.vocab, ":run")
@@ -1245,7 +1244,7 @@ end
 end
     end
 
-    -- GPU-resident path
+    -- GPU path below
     if self.gpu_model then return self:_run_gpu(train_w, val_w, build_windows) end
 
     create model, opt, params = self.model, self.opt, self.params
@@ -1255,8 +1254,8 @@ end
     create nbatch = ceil(nwin / bs)
     create total_steps = self.epochs * nbatch
 
-    -- Gradient accumulation: optimizer steps happen once per `ga` batches,
-    -- so effective batch = batch_size * ga without extra activation memory.
+    -- Grad accum: step once per ga batches
+    -- Effective batch grows without extra memory
     create ga = self.grad_accum or 1
     if type(ga) != "number" or ga != ga or ga < 1 or ga != floor(ga) then
         error("LMTrain: 'grad_accum' must be a positive integer, got " .. tostring(ga), 2)
@@ -1324,9 +1323,9 @@ end
             if hi > nwin then hi = nwin end
             create n_in_batch = hi - lo + 1
 
-            -- zero at the START of each accumulation group; after every
-            -- optimizer step the grads are zeroed too, so this only really
-            -- matters for the very first group of a run.
+            -- Zero at group start
+            -- Steps already zero after update
+            -- Matters only for first group
             if (b - 1) % ga == 0 then opt.zero_grad() end
             create batch_tokens = 0
             create batch_loss = 0
@@ -1376,9 +1375,9 @@ end
 
             if n_in_batch > 1 then optim2.scale_grads(params, 1 / n_in_batch) end
 
-            -- Only step the optimizer on accumulation boundaries.  A
-            -- non-finite group is dropped entirely (zeroed), matching the
-            -- old skip semantics but at group granularity.
+            -- Step only on accum boundary
+            -- Drop non-finite group entirely
+            -- Matches old skip at group level
             if (b % ga == 0) or (b == nbatch) then
                 create norm = optim2.grad_norm(params)
                 last_norm = norm
@@ -1404,7 +1403,7 @@ end
             if self.verbose then
                 reporter:update({ "step":  (epoch - 1) * nbatch + b, "epoch":  epoch, "epochs":  self.epochs, "batch":  b, "nbatch":  nbatch, "loss":  batch_tokens > 0 and (batch_loss / batch_tokens) or 0, "lr":  self.cur_lr, "gnorm":  last_norm })
             end
-            -- Time-based auto-save only; an epoch on a big corpus can be long.
+            -- Time auto-save only; big epochs run long
             if self._as and self._as.seconds then self:_autosave_tick("batch") end
         end
 end
@@ -1417,10 +1416,10 @@ end
         self.elapsed = wall() - started
         self.tokens_per_sec = reporter.rate
 
-        -- Fresh-validation gate.  With eval_every > 1, self.val_loss on a
-        -- non-eval epoch is STALE (from an earlier epoch), so comparing it to
-        -- best_loss made is_best permanently false and inflated `patience`
-        -- with phantom stalls.  Only judge on an epoch whose monitor is real.
+        -- Fresh-validation gate for eval_every
+        -- Stale val_loss fakes stalls
+        -- Judge only on real monitor epoch
+        -- Avoids phantom patience counts
         create did_eval = false
         if len(val_w) > 0 and (epoch % self.eval_every == 0 or epoch == self.epochs) then
             self.val_loss, self.val_accuracy = self:evaluate(val_w)
@@ -1467,9 +1466,9 @@ end
             end
         end
 
-        -- Live text samples: a little generated snippet every K epochs --
-        -- the most fun way to watch a language model learn.  Guarded by
-        -- pcall so odd prompt/decode configs can never kill training.
+        -- Live sample snippet every K epochs
+        -- pcall guards bad prompt config
+        -- Sampling never kills training
         if self.sample_every and self.sample_every > 0
             and (epoch % self.sample_every == 0 or epoch == self.epochs)
             and type(self.generate) == "function" then
@@ -1519,8 +1518,8 @@ end
     if self.stopped == nil then self.stopped = "epochs" end
     reporter:finish()
 
-    -- Restore FIRST, then write the final checkpoint, so the file on disk
-    -- contains the weights the user is actually left holding.
+    -- Restore first, then final checkpoint
+    -- File matches held weights
     if self:_should_restore_best() then
         if restore(self.params, self.best_snapshot) and self.verbose then
             say(self, sformat("Restored best weights (loss %.5f)", self.best_loss))
@@ -1692,9 +1691,9 @@ end
     return idx[limit]
 end
 
--- Feed tokens[lo..hi] into the KV cache in one vectorised pass when the
--- model exposes :prefill (batched prompt processing); otherwise fall back to
--- per-token :step.  Returns the logits table for the last token fed.
+-- Fill KV cache via prefill if present
+-- Else fall back to per-token step
+-- Returns last-token logits
 create function fill_cache(model, tokens, lo, hi, state)
     if type(model.prefill) == "function" then
         create prompt = {}
@@ -1764,11 +1763,11 @@ end
     create top_p = opts.top_p or self.top_p
     create max_ctx = opts.ctx or opts.max_ctx or self.max_seq
 
-    -- PROBLEM 2: with byte-level ids and an over-provisioned vocab the head
-    -- emits logits for rows that can never be decoded.  Sampling those raises
-    -- deep inside LMTrain.decode; restrict the candidate set instead.  Only
-    -- applied when tokenization is KNOWN byte-level -- clamping user-supplied
-    -- raw ids would silently change their model's behaviour.
+    -- PROBLEM 2: byte ids plus big vocab emit bad rows
+    -- Sampling them breaks decode; clamp candidates
+    -- Clamp only known byte tokenization
+    -- Never clamp raw user ids
+    -- Preserves custom model behavior
     create limit = self.vocab
     if self._sample_limit and self:_tokenization() == "byte" then
         limit = math.min(limit, self._sample_limit)
@@ -1882,8 +1881,8 @@ function LMTrain:parameters()
     return self.params
 end
 
---- Release GPU resources deterministically.  Model:free() existed and was
---- never called from anywhere.
+--- Release GPU resources deterministically
+--- Model:free was never called before
 function LMTrain:close()
     if self.gpu_model then
         if self.best_snapshot then

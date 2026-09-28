@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -14,12 +14,12 @@ create function safe_require(name)
     return nil
 end
 
--- Order matters for some modules, but pcall makes it safe
+-- Load order matters; pcall keeps it safe
 create modules = { 1: 
     { 1: "Matrix", 2:  "matrix" }, 2: 
     { 1: "Tensor", 2:  "tensor" }, 3: 
     { 1: "Tensor2", 2:  "tensor2" }, 4: 
-    { 1: "LmLog", 2:  "lmlog" }, 5:            -- NEW: Logger utility
+    { 1: "LmLog", 2:  "lmlog" }, 5:            -- Logger
     { 1: "Tokenizer", 2:  "tokenizer" }, 6: 
     { 1: "Data", 2:  "data" }, 7: 
     { 1: "Embedding", 2:  "embedding" }, 8: 
@@ -27,16 +27,16 @@ create modules = { 1:
     { 1: "RoPE", 2:  "rope" }, 10: 
     { 1: "Transformer", 2:  "transformer" }, 11: 
     { 1: "NN", 2:  "nn" }, 12: 
-    { 1: "Forge", 2:  "forge" }, 13:        -- FULL CONTROL branch: PyTorch-style modules
+    { 1: "Forge", 2:  "forge" }, 13:        -- Full-control modules
     { 1: "Optim", 2:  "optim" }, 14: 
     { 1: "Optim2", 2:  "optim2" }, 15: 
     { 1: "Train", 2:  "train" }, 16: 
     { 1: "LMTrain", 2:  "lmtrain" }, 17: 
-    { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- NEW: GPU plugin for LMTrain
+    { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- GPU plugin
     { 1: "GPU", 2:  "gpu" }, 19: 
     { 1: "BLAS", 2:  "blas" }, 20: 
     { 1: "LuaTL", 2:  "luatl_adapter" }, 21: 
-    { 1: "GPUTransformer", 2:  "gpu_transformer" } -- NEW: GPU model architecture
+    { 1: "GPUTransformer", 2:  "gpu_transformer" } -- GPU model
  }
 
 do
@@ -51,25 +51,21 @@ do
         ai[upper_name] = lib
         ai[file_name]  = lib
     else
-        -- Silently fail, as some modules (like GPU) are optional
-        -- But print a warning so users know if a file is missing/broken
+        -- Optional modules fail silently
+        -- Disabled warning for missing/broken file
         -- print("[LanternL] Warning: Failed to load module '" .. file_name .. "'")
     end
 end
 end
 
---- ================================================================
----  FULL CONTROL BRANCH ("the forge")
+--- Forge
+--- Full-control branch ("the forge")
 ---
----  Two doors into lanternl:
----    EASY (default): ai.LMTrain{ data = ..., epochs = ... } handles
----    tokenizing, batching, scheduling, logging for you.
----    FULL CONTROL : ai.forge() hands you raw PyTorch-style modules
----    (Linear, Embedding, Sequential, GELU, losses, optimizers) on the
----    same autograd engine -- and NOTHING else is automatic.  You write
----    the training loop yourself, exactly like torch.
----
----  Returns the toolbox table; pass { "quiet": true } to skip the banner.
+--- Two doors:
+--- EASY: ai.LMTrain handles tokenizing and logging
+--- FULL CONTROL: ai.forge gives raw modules only
+--- Same autograd engine; you write the loop
+--- Returns toolbox; quiet skips banner
 function ai.forge(opts)
     opts = opts or {}
     if not ai.Forge then
@@ -99,7 +95,7 @@ function ai.forge(opts)
     return ai.Forge
 end
 
--- aliases for the same door
+-- Same door aliases
 ai.hardcoding = ai.forge
 ai.fullcontrol = ai.forge
 
@@ -127,20 +123,20 @@ function ai.benchmark()
     create matrix = ai.Matrix
     print("  LanternL CPU/GPU Benchmark")
     
-    -- 512x512 matrices (roughly 2MB each as f64)
+    -- 512x512 matrices (~2MB each, f64)
     create size = 512 
     print("Generating " .. size .. "x" .. size .. " matrices...")
     create A = matrix.random(size, size)
     create B = matrix.random(size, size)
     
-    -- 1. CPU Benchmark
+    -- CPU benchmark
     matrix.use("lua")
     create t0 = os.clock()
     create C_cpu = matrix.multiply(A, B)
     create cpu_time = os.clock() - t0
     print(string.format("  CPU (Pure LuaJIT) : %.4f sec", cpu_time))
     
-    -- 2. GPU Benchmark (if available)
+    -- GPU benchmark if available
     create gpu_time = "N/A"
     if ai.LuaTL and ai.LuaTL.available then
         matrix.use("luatl_adapter")
@@ -149,13 +145,13 @@ function ai.benchmark()
         gpu_time = os.clock() - t1
         print(string.format("  GPU (luaTL)       : %.4f sec", gpu_time))
         
-        -- Verify results match
+        -- Check CPU vs GPU match
         if matrix.equals(C_cpu, C_gpu, 0.1) then
             print("  Verification       : PASSED (CPU ~= GPU)")
         else
             print("  Verification       : MISMATCH (Check math)")
         end
-        matrix.use("auto") -- reset to auto
+        matrix.use("auto") -- reset
     else
         print("  GPU (luaTL)       : Not installed/available")
     end

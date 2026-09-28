@@ -1,6 +1,6 @@
-/* luc_core.c - LUC 0.1 core: platform, values, GC, tables, lexer, parser, compiler, VM, modules, CLI driver */
+/* LUC core: platform, values, GC, tables, lexer, parser, compiler, VM, modules, CLI */
 
-/* update 2026-09-01: added luc install command */
+/* 2026-09-01: added luc install */
 
 #include "luc.h"
 #define LUC_JIT_FALLBACK (-1)
@@ -306,7 +306,7 @@ Value list_removeat(Table *t,int pos){
     return v;
 }
 
-/* iteration order: array part, then hash part */
+/* Iterate array then hash */
 int tab_next(Table *t,Value key,Value *ok,Value *ov){
     int i, start=0;
     if(key.t==LT_NIL) start=0;
@@ -595,7 +595,7 @@ static int lx_check_kw(Lexer *lx,const char *s,int len){
     return TK_NAME;
 }
 
-/* long bracket:  [=[ ... ]=]  (level >= 1).  Plain [[ ]] is reserved for list literals, so LUC long strings need at least one '='. */
+/* Long bracket [=[ ]=]: plain [[ ]] is a list, so strings need '=' */
 static int lx_long_level(Lexer *lx,int incomment){
     const char *p=lx->p;
     if(*p!='[') return -1;
@@ -650,8 +650,7 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
         if(t==TK_NAME){
             *str=str_new(s,len);
             if(lx->strict){
-                /* !strict: catch Python/Lua habits with a precise message
-                 * instead of a silent nil global. */
+                /* !strict: reject True/False/None with hint, avoid silent nil */
                 if((len==4 && memcmp(s,"True",4)==0) || (len==5 && memcmp(s,"False",5)==0))
                     lex_error(lx,"strict: use lowercase 'true'/'false', not 'True'/'False'");
                 if(len==4 && memcmp(s,"None",4)==0)
@@ -824,7 +823,7 @@ struct Stat {
     FuncBody *fb;
 };
 
-/* AST nodes live until process exit (scripts are compiled once). */
+/* AST lives until exit, compiled once */
 static void *anew(size_t n){ return lcalloc(n); }
 static Expr *new_expr(EKind k,int line){ Expr *e=(Expr*)anew(sizeof(Expr)); e->k=k; e->line=line; return e; }
 static void el_add(EList *l,Expr *e){
@@ -888,7 +887,7 @@ static Str *expect_name(Parser *ps){
     Str *s=ps->lx.str; lx_next(&ps->lx); return s;
 }
 
-/* name position after '.' or ':' - keywords allowed so t.create keeps working */
+/* After '.'/':' allow keywords, so t.create works */
 static Str *expect_kwname(Parser *ps){
     char b[8];
     if(ps->lx.t==TK_NAME){ Str *s=ps->lx.str; lx_next(&ps->lx); return s; }
@@ -900,7 +899,7 @@ static Str *expect_kwname(Parser *ps){
     return str_fromc("");
 }
 
-/* optional type annotations: parsed and discarded */
+/* Type annotations: parsed, then discarded */
 static void parse_type(Parser *ps){
     for(;;){
         if(ps->lx.t=='{'){                 /* {number}, {[string]:number} */
@@ -963,7 +962,7 @@ static Expr *parse_primary(Parser *ps){
         lx_next(&ps->lx);
         Expr *e=parse_expr(ps);
         expect(ps,')');
-/* parenthesised expressions are truncated to one value */
+/* Parens truncate to one value */
         if(e->k==E_CALL||e->k==E_METHCALL||e->k==E_VARARG){
             Expr *p=new_expr(E_UN,line); p->op='('; p->a=e; return p;
         }
@@ -1006,12 +1005,10 @@ static Expr *parse_postfix(Parser *ps,Expr *e){
                 Expr *ix=new_expr(E_INDEX,line); ix->a=e; ix->b=k; e=ix; break; }
             case ':':
                 if(ps->inkey) return e;       /* dict separator */
-                /* `name:` + newline starts a libs block-call (a body block
-                 * plus `end` follows); a method name on the SAME line stays
-                 * an ordinary obj:method(args) call */
+                /* ':' + newline starts libs block-call; same-line ':' stays method call */
                 { int cl=ps->lx.tline; (void)lx_peek(&ps->lx);
                   if(ps->lx.atline!=cl) return e; }
-                lx_next(&ps->lx);             /* obj:method(args) - self passed implicitly */
+                lx_next(&ps->lx);             /* obj:method(args), self passed implicitly */
                 {
                     Str *n=expect_kwname(ps);
                     Expr *c=new_expr(E_METHCALL,line);
@@ -1031,13 +1028,13 @@ static Expr *parse_suffixed(Parser *ps){
     return parse_postfix(ps,parse_primary(ps));
 }
 
-/* dicts: {key: value, ...} - keys are expressions, { } empty dict */
+/* Dict: {key: value}; keys are exprs, {} is empty */
 static Expr *parse_table(Parser *ps){
     int line=ps->lx.tline;
     Expr *e=new_expr(E_TABLE,line);
     expect(ps,'{');
     while(ps->lx.t!='}'){
-        ps->inkey=1;                        /* ':' after a dict key is a separator */
+        ps->inkey=1;                        /* ':' after dict key is a separator */
         Expr *k=parse_expr(ps);
         ps->inkey=0;
         if(ps->strict && k->k==E_NAME)
@@ -1090,7 +1087,7 @@ static Expr *parse_simple(Parser *ps){
     }
 }
 
-/* operator priorities (left, right) */
+/* Operator priority (left, right) */
 typedef struct { unsigned char left,right; } Prio;
 static int getbinop(int t){
     switch(t){
@@ -1166,9 +1163,7 @@ static int block_follow(int t){
     return t==TK_EOF||t==TK_END||t==TK_ELSE||t==TK_ELSEIF;
 }
 
-/* `command name() end` / `function name() end` shared definition parsing.
- * iscmd=1 marks a procedure: `return` directly inside is a compile error
- * (enforced in comp_stat S_RETURN); nested `function`s inside may return. */
+/* Shared fn/command def; iscmd=1 bans direct return (see S_RETURN) */
 static Stat *parse_named_func(Parser *ps,int line,int iscmd){
     if(iscmd && !ps->libs_on)
         perr(ps,"'command' needs 'import libs' first (commands live in the libs system)");
@@ -1207,14 +1202,13 @@ static Stat *parse_named_func(Parser *ps,int line,int iscmd){
     return s;
 }
 
-/* tokens that can start an expression (bare calls: `print x`, `math 3, 4`) */
+/* Tokens starting an expr (bare calls: `print x`) */
 static int tok_starts_expr(int t){
     return t==TK_NAME||t==TK_NUMBER||t==TK_STRING||t==TK_NIL||t==TK_TRUE||t==TK_FALSE||
            t==TK_FUNCTION||t==TK_DOTS||t==TK_NOT||t=='('||t=='{'||t=='['||t=='-';
 }
 
-/* bare call: `name args...` on ONE line desugars to name(args).
- * Every such line was a syntax error before, so no valid program changes meaning. */
+/* Bare call: `name args` on one line is name(args); was syntax error */
 static Expr *maybe_bare_call(Parser *ps,Expr *e,int line){
     if(e->k==E_NAME && ps->lx.tline==line && tok_starts_expr(ps->lx.t)){
         Expr *c=new_expr(E_CALL,line); c->a=e;
@@ -1227,9 +1221,7 @@ static Expr *maybe_bare_call(Parser *ps,Expr *e,int line){
     return e;
 }
 
-/* libs block-call: `name:` + body + `end` == `name() do body end`.
- * The body arrives as one trailing closure argument (same shape as the
- * trailing-do sugar). Needs `import libs` first. */
+/* Libs block-call: `name:` + body + `end` is `name() do body end`; needs `import libs` */
 static Expr *maybe_colon_block(Parser *ps,Expr *e,int line){
     if(ps->lx.t!=':') return e;
     if(e->k!=E_NAME && e->k!=E_INDEX && e->k!=E_CALL && e->k!=E_METHCALL)
@@ -1251,8 +1243,7 @@ static Expr *maybe_colon_block(Parser *ps,Expr *e,int line){
     return c;
 }
 
-/* trailing-do sugar shared by plain calls, `run` calls and bare calls:
- * f(x) do ... end == f(x, function() ... end). Same-line only, no VM change. */
+/* Trailing-do: f(x) do end is f(x, function() end); same line only */
 static Expr *maybe_trailing_do(Parser *ps,Expr *e){
     if((e->k==E_CALL||e->k==E_METHCALL) && ps->lx.t==TK_DO && ps->lx.tline==e->line){
         int bl=ps->lx.tline;
@@ -1270,18 +1261,14 @@ static Expr *maybe_trailing_do(Parser *ps,Expr *e){
     return e;
 }
 
-/* repeat index alias, import-style: `repeat 1("i"), 10 do` == `repeat 1, 10 as i do`.
- * Triggers only for number-literal "calls" (calling a number is a runtime
- * error today) or a bare number followed by ("name") (a leftover of the
- * unary-minus fold), so no valid program changes meaning.
- * Returns the alias or NULL; *base receives the step expression. */
+/* Repeat alias: `repeat 1("i"),10 do` is `repeat 1,10 as i do`; number-call only, so safe */
 static Str *repeat_alias(Parser *ps,Expr *e,Expr **base){
     *base=e;
     Expr *num=NULL;
     if(e->k==E_CALL && e->args.n==1 && e->args.e[0]->k==E_STR && e->a->k==E_NUM)
-        num=e->a;                       /* 1("i") or 1"i": postfix made a call */
+        num=e->a;                       /* 1("i"): postfix made a call */
     else if(e->k==E_NUM && ps->lx.t=='(')
-        num=e;                          /* -1("i"): the unary fold left '(' behind */
+        num=e;                          /* -1("i"): unary fold left '(' behind */
     else return NULL;
     Str *al=NULL;
     if(num==e){
@@ -1291,7 +1278,7 @@ static Str *repeat_alias(Parser *ps,Expr *e,Expr **base){
         al=ps->lx.str; lx_next(&ps->lx);
         expect(ps,')');
     } else al=e->args.e[0]->str;
-    /* the alias becomes a real loop variable, so it must be a plain name */
+    /* Alias is a loop var, so must be a plain name */
     { const char *s=al->s; int n=al->len, ok=n>0 && (isalpha((unsigned char)s[0])||s[0]=='_');
       for(int i=1;ok && i<n;i++) ok=isalnum((unsigned char)s[i])||s[i]=='_';
       if(!ok) perr(ps,"repeat index must be a plain name, got \"%s\"", al->s); }
@@ -1340,11 +1327,7 @@ static Stat *parse_statement(Parser *ps){
             return NULL;
 
         case TK_REPEAT: {
-/* repeat [step,] destination [as i] do ... end
-   step > 0 counts up from 0, stops BEFORE destination
-   step < 0 counts down destination..0 (0 still runs)
-   repeat destination do ... end is short for step 1
-   repeat name [, name] in expr do ... end     iterate list/string/dict */
+/* repeat [step,] dest [as i] do: step>0 counts up to dest, step<0 counts down to 0 */
             Stat *s=NULL;
             lx_next(&ps->lx);
             Expr *e1=parse_subexpr(ps,3);
@@ -1449,9 +1432,7 @@ static Stat *parse_statement(Parser *ps){
             return s; }
 
         case TK_MAKE: {
-/* make <name> -- this file is a lib part. Needs `import libs` first, and
- * nothing but `import libs` may precede it. Every top-level
- * create/function/command is auto-exported; the chunk returns its table. */
+/* make <name>: lib part; needs `import libs` first, top-level creates auto-exported */
             if(ps->fndepth>0) perr(ps,"'make' must be a top-level statement");
             if(!ps->libs_on) perr(ps,"'make' needs 'import libs' first (lib parts live in the libs system)");
             if(ps->saw_nonlib) perr(ps,"'make' must come before any code (only 'import libs' may precede it)");
@@ -1461,9 +1442,7 @@ static Stat *parse_statement(Parser *ps){
             return NULL; }
 
         case TK_GET: {
-/* get a, b -- load lib parts by MAKE name (not filename) into locals:
- * create a = __get("a"); create b = __get("b"). Names are also recorded
- * so a later `pack` knows what to bundle. Needs `import libs` first. */
+/* get a, b: load lib parts by MAKE name; recorded for later `pack` */
             if(!ps->libs_on) perr(ps,"'get' needs 'import libs' first");
             lx_next(&ps->lx);
             Stat *s=new_stat(S_LOCAL,line);
@@ -1481,9 +1460,7 @@ static Stat *parse_statement(Parser *ps){
             return s; }
 
         case TK_PACK: {
-/* pack <lib> -- bundle every part named by `get` in this file into
- * <lib>.luic next to it: __pack("lib", {"a", "b", ...}).
- * Needs `import libs` first. */
+/* pack <lib>: bundle `get` parts into <lib>.luic */
             if(!ps->libs_on) perr(ps,"'pack' needs 'import libs' first");
             lx_next(&ps->lx);
             Str *lib=expect_name(ps);
@@ -1503,11 +1480,7 @@ static Stat *parse_statement(Parser *ps){
             return s; }
 
         case TK_IMPORT: {
-/* import a, b("x")  ==  do a = __import("a") x = __import("b") end
-   the optional ("alias") binds the system library to a shorter name:
-   import window("w")  ->  w = __import("window")
-   import a, b from lib  ==  do create a = __import_from("lib","a") ... end
-   (`from` is contextual: plain `from` stays a valid identifier elsewhere) */
+/* import a, b("x"): alias binds short name; `from` is contextual */
             lx_next(&ps->lx);
             Str *bnames[64]; Str *balias[64]; int nn=0, has_alias=0;
             do{
@@ -1542,8 +1515,7 @@ static Stat *parse_statement(Parser *ps){
                     if(!opt(ps,'.')) break;
                 }
                 Str *lib=str_fromc(libbuf);
-                /* one S_LOCAL (NOT wrapped in S_DO: do-block locals would
-                 * die at `end`, unlike classic import's globals) */
+                /* Single S_LOCAL: do-block locals would die at `end` */
                 Stat *fs=new_stat(S_LOCAL,line);
                 fs->names=(Str**)anew(sizeof(Str*)*64);
                 for(int i=0;i<nn;i++){
@@ -1643,10 +1615,7 @@ static Stat *export_assign(Str *exps,Str *name,int line){
     return s;
 }
 
-/* `make` export: every top-level `create` / bare `function` / `command`
- * binding is copied into the hidden __exports table right where it is
- * declared (tables and functions are references, so later mutations show).
- * Plain global writes (`x = ...`) are NOT exported. */
+/* `make` export: top-level creates copy into __exports; globals not exported */
 static void maybe_export(Parser *ps,Block *b,Stat *s,int line){
     if(!ps->intop || !ps->makename || !s) return;
     Str *exps=str_fromc("__exports");
@@ -1681,7 +1650,7 @@ static Block *parse_block(Parser *ps){
     return b;
 }
 
-/* 9. BYTECODE (opcodes + codecs now shared via luc.h) */
+/* 9. BYTECODE (opcodes in luc.h) */
 
 /* 10. COMPILER (AST -> bytecode) */
 
@@ -1723,7 +1692,7 @@ static int emit(FuncState *fs,uint32_t ins,int line){
     return p->ncode++;
 }
 
-/* patch a jump at `pc` so that it continues at `target` */
+/* Patch jump at `pc` to continue at `target` */
 static void patch(FuncState *fs,int pc,int target){
     uint32_t ins=fs->p->code[pc];
     int op=GET_OP(ins), a=GET_A(ins);
@@ -1799,7 +1768,7 @@ static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source,int karat
 
 static int multiret(Expr *e){ return e->k==E_CALL||e->k==E_METHCALL||e->k==E_VARARG; }
 
-/* compile e producing `nres` results (nres<0 = all), returns first register */
+/* Compile e to `nres` results (nres<0 = all) */
 static int comp_multi(FuncState *fs,Expr *e,int nres){
     if(e->k==E_CALL||e->k==E_METHCALL) return comp_call(fs,e,nres);
 /* vararg */
@@ -1809,7 +1778,7 @@ static int comp_multi(FuncState *fs,Expr *e,int nres){
     return r;
 }
 
-/* compile expression into a temporary or existing register, return that reg */
+/* Compile expr to temp reg */
 static int exprtmp(FuncState *fs,Expr *e){
     if(e->k==E_NAME){
         int r=findlocal(fs,e->name);
@@ -1820,9 +1789,7 @@ static int exprtmp(FuncState *fs,Expr *e){
     return r;
 }
 
-/* fused x.append(args): dot-form call whose method is the literal "append".
- * Colon-form (E_METHCALL) is deliberately NOT fused: its generic path
- * passes self explicitly, a different contract. */
+/* Fused x.append: dot-form only; colon-form keeps explicit self */
 static int is_append_call(Expr *e,Expr **pself){
     if(e->k==E_CALL && e->a && e->a->k==E_INDEX && e->a->b && e->a->b->k==E_STR &&
        e->a->b->str && e->a->b->str->len==6 &&
@@ -1833,9 +1800,7 @@ static int is_append_call(Expr *e,Expr **pself){
 static int comp_call(FuncState *fs,Expr *e,int nres){
     Expr *aself=NULL;
     if(is_append_call(e,&aself)){
-        /* layout: self at func, explicit args at func+1.. (no method slot,
-         * no bound-method object). OP_APPEND B = explicit count (0 = take
-         * from stack top, for multiret tails), C = nres encoding as CALL. */
+        /* APPEND layout: self at func, args after; B=count, C=nres as CALL */
         int func=fs->freereg;
         reserve(fs,1);
         exprd(fs,aself,func);
@@ -1899,7 +1864,7 @@ static void comp_ctor(FuncState *fs,Expr *e,int reg){
             emit(fs,I_ABC(OP_SETLIST,tmp,0,startidx),e->line);
             fs->freereg=tmp+1;
         } else if(startidx+pending>240){
-/* very long literal: fall back to explicit index stores */
+/* Long literal: use explicit index stores */
             if(pending){ emit(fs,I_ABC(OP_SETLIST,tmp,pending,startidx),e->line);
                          startidx+=pending; pending=0; fs->freereg=tmp+1; }
             int rb=reserve(fs,1);
@@ -2002,7 +1967,7 @@ static void exprd(FuncState *fs,Expr *e,int reg){
     }
 }
 
-/* compile a list of expressions into nvars consecutive registers at `base` */
+/* Compile expr list into nvars regs at `base` */
 static void adjust_assign(FuncState *fs,int nvars,EList *rhs,int base){
     int n=rhs->n;
     for(int i=0;i<n;i++){
@@ -2023,8 +1988,7 @@ static void adjust_assign(FuncState *fs,int nvars,EList *rhs,int base){
     checkreg(fs,fs->freereg);
 }
 
-/* side-effect-free index expressions: safe to evaluate once instead of
- * twice when fusing X[k] <op>= e into a single read-modify-write */
+/* Pure index exprs: safe to eval once when fusing X[k] <op>= e */
 static int pure_index_expr(Expr *e){
     switch(e->k){
         case E_NAME: case E_NUM: case E_STR:
@@ -2044,8 +2008,7 @@ static int same_index_expr(Expr *a,Expr *b){
         default: return 0;
     }
 }
-/* X[k] <op>= e  with X,k pure and repeated identically -> one opcode.
- * Returns 1 when fused (registers restored), 0 to use the generic path. */
+/* Fuse X[k] <op>= e with pure identical X,k; 1=fused, 0=generic */
 static int try_compound(FuncState *fs,Stat *s){
     if(s->lhs.n!=1||s->rhs.n!=1) return 0;
     Expr *lhs=s->lhs.e[0], *rhs=s->rhs.e[0];
@@ -2080,10 +2043,7 @@ static void store_to(FuncState *fs,Expr *lhs,int valreg,int line){
     fs->freereg=save;
 }
 
-/* !strict read-only declaration lookup (no upval creation side effects).
- * true when `name` is a local in this function or any enclosing one,
- * or an already-captured upvalue. Globals (print, require, ...) are NOT
- * declared: writing to them without `create` is exactly what !strict forbids. */
+/* !strict decl check: true for locals or captured upvals; globals not declared */
 static int strict_declared(FuncState *fs,Str *n){
     for(FuncState *f=fs; f; f=f->prev){
         for(int i=f->nlocals-1;i>=0;i--) if(f->locals[i].name==n) return 1;
@@ -2112,10 +2072,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             break; }
         case S_ASSIGN: {
             if(fs->p->uses_strict && !s->is_import){
-                /* !strict: every `name = ...` / `name += ...` must refer to a
-                 * `create`-declared local (or an enclosing one). Bare writes
-                 * would otherwise create globals silently. Index writes
-                 * (t.k = v) stay allowed: they mutate, not declare. */
+                /* !strict: `name=` needs `create` local; t.k=v stays allowed */
                 for(int i=0;i<s->lhs.n;i++){
                     Expr *lhs=s->lhs.e[i];
                     if(lhs->k==E_NAME && !strict_declared(fs,lhs->name))
@@ -2179,7 +2136,7 @@ static void comp_stat(FuncState *fs,Stat *s){
         case S_REPEAT: {
             int start=here(fs);
             BlockCnt bl; enterblock(fs,&bl,1);
-/* condition can see the body's locals -> evaluate before leaveblock */
+/* Cond sees body locals, eval before leaveblock */
             comp_block(fs,s->body);
             int save=fs->freereg;
             int r=reserve(fs,1);
@@ -2188,7 +2145,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             int jf=emit(fs,I_AsBx(OP_JMPIFNOT,r,0),s->line);
             leaveblock(fs,s->line);
             patch(fs,jf,start);
-/* fallthrough when condition is true */
+/* Fallthrough when true */
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_NUMFOR: {
@@ -2235,7 +2192,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_RANGE: {
-/* repeat [step,] destination [as i] - FORPREP validates step and picks direction */
+/* repeat [step,] dest [as i]: FORPREP checks step, picks dir */
             int base=fs->nlocals;
             fs->freereg=base;
             int r0=reserve(fs,1); exprd(fs,s->e1,r0);
@@ -2256,7 +2213,7 @@ static void comp_stat(FuncState *fs,Stat *s){
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_ITER: {
-/* repeat a [, b] in expr - a,b get value/index for lists+strings, key/value for dicts */
+/* repeat a[,b] in expr: value/index or key/value */
             int base=fs->nlocals;
             fs->freereg=base;
             int r0=reserve(fs,1); exprd(fs,s->e1,r0);
@@ -2308,7 +2265,7 @@ static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source,int karat
     FuncState fs; memset(&fs,0,sizeof fs);
     fs.prev=parent;
     fs.p=proto_new();
-    /* !karatsuba / !strict are per-chunk: nested functions inherit them, imports don't */
+    /* !karatsuba/!strict per chunk: children inherit, imports don't */
     fs.p->uses_karatsuba = karatsuba || (parent && parent->p->uses_karatsuba);
     fs.p->uses_strict = strict || (parent && parent->p->uses_strict);
     fs.is_command = fb->is_command ? 1 : 0;
@@ -2321,8 +2278,7 @@ static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source,int karat
     for(int i=0;i<fb->nparams;i++) newlocal(&fs,fb->params[i]);
     fs.freereg=fs.nlocals;
     fs.p->maxstack = fs.nlocals+2;
-    /* `make` parts collect top-level creates into a hidden export table
-     * that the chunk returns (run_chunk discards it; get/import-from keep it) */
+    /* `make` parts return export table (run discards it) */
     int exreg=-1;
     if(mkmod && !parent){
         exreg=newlocal(&fs,str_fromc("__exports"));
@@ -2344,16 +2300,11 @@ static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source,int karat
     return fs.p;
 }
 
-/* full compile of a source chunk -> closure for the main function */
+/* Compile chunk to main closure */
 Closure *luc_compile(const char *src,int len,const char *chunkname){
     Parser ps; memset(&ps,0,sizeof ps);
     int karatsuba=0, strict=0, ndir=0;
-    /* !karatsuba / !strict directives: leading lines only, skipped like #!.
-     * Per-chunk flags (nested functions inherit, imports unaffected).
-     * Order is free, each directive on its own line:
-     *   !strict
-     *   !karatsuba
-     */
+    /* !karatsuba/!strict: leading lines only, one per line */
     for(;;){
         int consumed=0;
         if(len>10 && !strncmp(src,"!karatsuba",10) &&
@@ -2366,8 +2317,7 @@ Closure *luc_compile(const char *src,int len,const char *chunkname){
             consumed=7;
         } else if(len>0 && src[0]=='!' &&
            (len==1||src[1]=='\n'||src[1]=='\r'||src[1]==' '||src[1]=='\t'||(src[1]>='a'&&src[1]<='z'))){
-            /* Unknown !directive on the first line: fail loudly so a typo
-             * like !strcit does not silently run in easy mode. */
+            /* Unknown !directive: fail loudly, avoid silent typo like !strcit */
             int e=1;
             while(e<len && src[e]!='\n' && src[e]!='\r' && e<32) e++;
             char b[32]; int n=e<31?e:31;
@@ -2460,21 +2410,11 @@ int vm_lessthan(Value a,Value b,int orequal){
     luc_error("attempt to compare %s with %s",type_name(a),type_name(b));
     return 0;
 }
-/* bound native methods: obj.append(x) receives obj as hidden first argument.
-   obj:append(x) passes self explicitly (E_METHCALL), so when the first
-   argument already IS the bound object the trampoline must not inject it again. */
+/* Bound method: dot-form hides self; colon-form keeps explicit self */
 static int meth_trampoline(LucState *L,int base,int nargs,CFunc *cf){
     if(cf->up[1].t==LT_FUNC){
-        /* User override (e.g. list.append = function...): call the closure
-         * with self injected, unless self is already first (colon-form).
-         * The frame is rebuilt IN PLACE so results land at base directly
-         * and this C frame does nothing after vm_call returns (tail
-         * position): a yield inside unwinds past us safely, and resumption
-         * continues inside the callee -- never skipping needed epilogue.
-         * (The old code cast it to CFunc* and jumped to a wild address;
-         * a tmp-frame + post-copy version corrupted results whenever a
-         * yield/resume cycle intervened.) */
-        Value meth=cf->up[1], self=cf->up[0];   /* heap-stable across GC */
+        /* User override: rebuild frame in place, tail call stays yield-safe */
+        Value meth=cf->up[1], self=cf->up[0];   /* Heap-stable across GC */
         int has_self=nargs>0 && val_rawequal(L->stack[base],self);
         if(has_self){
             ensure_stack(L,base+nargs+8);
@@ -2490,11 +2430,11 @@ static int meth_trampoline(LucState *L,int base,int nargs,CFunc *cf){
     }
     CFunc *t=(CFunc*)cf->up[1].u.o;
     if(nargs>0 && val_rawequal(L->stack[base],cf->up[0]))
-        return t->fn(L,base,nargs,t);   /* self passed explicitly: use as-is */
+        return t->fn(L,base,nargs,t);   /* Self already explicit: use as-is */
     ensure_stack(L,base+nargs+8);
     for(int i=nargs;i>0;i--) L->stack[base+i]=L->stack[base+i-1];
     L->stack[base]=cf->up[0];
-    return t->fn(L,base,nargs+1,t);   /* results already land at base */
+    return t->fn(L,base,nargs+1,t);   /* Results already land at base */
 }
 static Value bind_method(Value self,Value m){
     CFunc *cf=cfunc_new(meth_trampoline,"method",2);
@@ -2502,7 +2442,7 @@ static Value bind_method(Value self,Value m){
     return mkobj(LT_CFUNC,cf);
 }
 
-/* core list methods that override the list lib (remove is by VALUE here) */
+/* Core list remove is by value */
 static int f_core_remove(LucState *L,int base,int nargs,CFunc *self){
     (void)self;
     Table *t=checktab(L,base,nargs,0,"remove");
@@ -2636,7 +2576,7 @@ int vm_in(Value x,Value c){
     return 0;
 }
 
-/* dict methods reachable through dot access: t.keys(), t.values() */
+/* Dict dot methods: t.keys(), t.values() */
 static int f_dict_keys(LucState *L,int base,int nargs,CFunc *self){
     (void)self; (void)nargs;
     Table *t=checktab(L,base,nargs,0,"keys");
@@ -2654,13 +2594,13 @@ static int f_dict_values(LucState *L,int base,int nargs,CFunc *self){
     RET(0,mkobj(LT_LIST,r)); return 1;
 }
 
-/* len(x) replaces the Lua '#' operator */
+/* len(x) replaces Lua '#' */
 static int f_core_len(LucState *L,int base,int nargs,CFunc *self){
     (void)self;
     RET(0,mknum((double)vm_len(AR(0)))); return 1;
 }
 
-/* pairs/ipairs die with friendly migration hints */
+/* pairs/ipairs trap with migration hint */
 static int f_lua_trap(LucState *L,int base,int nargs,CFunc *self){
     (void)L; (void)base; (void)nargs;
     if(!strcmp(self->name,"ipairs"))
@@ -2696,7 +2636,7 @@ static void pushframe(LucState *L,int func,int nargs,int nres){
     L->top=bse+p->maxstack;
 }
 
-/* generic call usable from C; results are left at `func`, count returned */
+/* Generic C call; results at `func` */
 int vm_call(LucState *L,int func,int nargs,int nres){
     Value f=L->stack[func];
     if(f.t==LT_CFUNC){
@@ -2713,7 +2653,7 @@ int vm_call(LucState *L,int func,int nargs,int nres){
         return n;
     }
     if(f.t==LT_FUNC){
-        int jn=luc_jit_call(L,func,nargs,nres);      /* add these two lines */
+        int jn=luc_jit_call(L,func,nargs,nres);      /* JIT fast path */
         if(jn!=LUC_JIT_FALLBACK) return jn;
         int level=L->nci;
         pushframe(L,func,nargs,nres);
@@ -2728,9 +2668,9 @@ int vm_call(LucState *L,int func,int nargs,int nres){
     return 0;
 }
 
-/* metatable-lite runtime (after vm_call is available) */
+/* Metatable-lite runtime */
 
-/* call f(args...) from deep inside VM/C helpers; single result on return. NOTE: may reallocate L->stack and L->ci — caller must refresh base/pc. */
+/* Call f(args) for one result. NOTE: may grow stack/frames, refresh base/pc */
 static Value meta_callv(LucState *L,Value f,Value *args,int n){
     ensure_stack(L,L->top+n+8);
     int slot=L->top;
@@ -2743,7 +2683,7 @@ static Value meta_callv(LucState *L,Value f,Value *args,int n){
     return r;
 }
 
-/* lookup metamethod 'ev' for a binary op: x side first, then y side. returns 1 and fills *out when a handler fired. */
+/* Find 'ev' metamethod, x then y; 1 with *out on hit */
 static int vm_metabin(LucState *L,Value x,Value y,const char *ev,Value *out){
     if(x.t==LT_TABLE && AS_TAB(x)->meta){
         Value f=tab_get(AS_TAB(x)->meta,mkobj(LT_STR,str_fromc(ev)));
@@ -2756,9 +2696,7 @@ static int vm_metabin(LucState *L,Value x,Value y,const char *ev,Value *out){
     return 0;
 }
 
-/* OP_APPEND fast-path validation: the stock list.append method, resolved
- * once at startup. If scripts override list.append the pointer differs and
- * APPEND takes the generic (but still fused, alloc-free) method-call path. */
+/* OP_APPEND check: stock append fast path, override uses generic path */
 static Str *g_appendStr=NULL;
 static Value g_origAppend;
 static void append_cache_init(void){
@@ -2766,11 +2704,7 @@ static void append_cache_init(void){
     g_origAppend=tab_get(V.listmeta,mkobj(LT_STR,g_appendStr));
 }
 
-/* fused X[k] <op>= v (which: 0:+ 1:- 2:* 3:/). Fast path mirrors the
- * interpreter's GETTABLE/SETTABLE list fast paths plus a numeric op; the
- * generic path is GETTABLE semantics + ADD/SUB/MUL/DIV-label semantics +
- * SETTABLE semantics, so behavior (including concat/metamethods/errors)
- * is identical to the unfused triple. pc = dispatch pc (post-increment). */
+/* Fused X[k] <op>= v (0:+,1:-,2:*,3:/); matches unfused behavior */
 static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Value vv){
     static const char *mnames[4]={"__add","__sub","__mul","__div"};
     if(tv.t==LT_LIST && kv.t==LT_NUM && vv.t==LT_NUM){
@@ -2880,9 +2814,7 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(GETTABLE) {
             Value tv=base[GET_B(ins)], kv=base[GET_C(ins)];
             if(tv.t==LT_LIST && kv.t==LT_NUM){
-                /* fast path: exact in-range int key. Anything else
-                 * (NaN, fractional, negative-miss, out of range) falls
-                 * through to vm_index, which is behavior-identical. */
+                /* Fast path: in-range int key, else generic vm_index */
                 double d=kv.u.n;
                 if(d>=-2147483648.0 && d<2147483648.0){
                     int i=(int)d;
@@ -2908,9 +2840,7 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(SETTABLE) {
             Value tv=base[A], kv=base[GET_B(ins)], vv=base[GET_C(ins)];
             if(tv.t==LT_LIST && kv.t==LT_NUM && vv.t!=LT_NIL){
-                /* fast path: in-bounds store of non-nil with a non-nil
-                 * tail (so tab_set's trailing trim is a proven no-op).
-                 * Growth, nil-store, errors -> generic path, identical. */
+                /* Fast path: in-bounds non-nil store, else generic path */
                 double d=kv.u.n;
                 if(d>=-2147483648.0 && d<2147483648.0){
                     int i=(int)d;
@@ -2984,8 +2914,7 @@ static void vm_execute(LucState *L,int baselevel){
                 L->top=ci->base+pr->maxstack;
                 base[A]=mr; VM_NEXT;
             }
-            /* exact big-int * for integer strings too large for doubles
-             * (>15 digits), or any size under !karatsuba */
+            /* Exact big-int * for large int strings or !karatsuba */
             if(luc_try_bigmul(x,y,pr->uses_karatsuba,&mr)){ base[A]=mr; VM_NEXT; }
             base[A]=mknum(arith_num(x)*arith_num(y));
         } VM_NEXT;
@@ -3092,30 +3021,18 @@ static void vm_execute(LucState *L,int baselevel){
             }
             if(f.t==LT_CFUNC && AS_CF(f)->fn==meth_trampoline &&
                AS_CF(f)->up[1].t==LT_FUNC){
-                /* bound user-method (obj:method / obj.method where the
-                 * method is a LUC closure): splice into a direct closure
-                 * call here in the interpreter -- no C frame involved, so
-                 * a yield inside unwinds past nothing pending and results
-                 * land via CallInfo/RETURN exactly like a plain call.
-                 * (Routing this through the trampoline CFunc cannot be
-                 * made yield-safe: any C post-processing after the nested
-                 * call is skipped on unwind, corrupting the caller's
-                 * result slot with the stale bound-method object.) */
+                /* Bound LUC closure: direct call, no C frame, stays yield-safe */
                 CFunc *tr=AS_CF(f);
                 Value meth=tr->up[1], self=tr->up[0];
                 int has_self=na>0 && val_rawequal(L->stack[func+1],self);
                 ci->savedpc=pc;
                 if(has_self){
-                    /* args already home: [func+1]=self, rest after.
-                     * Only the callee slot needs the method. (No shift:
-                     * unlike the trampoline's arg-base layout, nothing
-                     * moves here -- shifting would duplicate self.) */
+                    /* Args home, only callee slot needs method */
                     ensure_stack(L,func+na+8);
                     L->stack[func]=meth;
                     pushframe(L,func,na,nres);
                 } else {
-                    /* explicit args live at [func+1..func+na]; shift only
-                     * those (never the callee slot itself). */
+                    /* Shift args only, never callee slot */
                     ensure_stack(L,func+na+16);
                     for(int i=na;i>=1;i--) L->stack[func+i+1]=L->stack[func+i];
                     L->stack[func]=meth; L->stack[func+1]=self;
@@ -3137,7 +3054,7 @@ static void vm_execute(LucState *L,int baselevel){
                 ci->savedpc=pc;
                 int jn=luc_jit_call(L,func,na,nres);
                 if(jn!=LUC_JIT_FALLBACK){
-                    base=L->stack+ci->base;   /* ensure_stack may have moved it */
+                    base=L->stack+ci->base;   /* Stack may have moved */
                     L->top = (nres<0)? func+jn : ci->base+pr->maxstack;
                 } else {
                     pushframe(L,func,na,nres);
@@ -3146,17 +3063,14 @@ static void vm_execute(LucState *L,int baselevel){
             } else luc_error("attempt to call a %s value",type_name(f));
         } VM_NEXT;
         VM_LABEL(APPEND) {
-            /* fused x.append(args...): A=self, B=explicit arg count
-             * (0 = rest from stack top, multiret tail), C=nres as CALL */
+            /* Fused append: A=self, B=arg count, C=nres as CALL */
             int b=GET_B(ins), c=GET_C(ins);
             int n = b? b : (int)(L->top-(ci->base+A+1));
             int nres = c? c-1 : -1;
             Value self=base[A];
             if(self.t==LT_LIST &&
                val_rawequal(tab_get(V.listmeta,mkobj(LT_STR,g_appendStr)),g_origAppend)){
-                /* stock list.append: push directly, no method object, no
-                 * call. list_push never allocates GC-visible memory and
-                 * never errors, so no savedpc/GC bookkeeping is needed. */
+                /* Stock append: direct push, no alloc or error */
                 Table *t=AS_TAB(self);
                 for(int i=0;i<n;i++) list_push(t,base[A+1+i]);
                 base[A]=self;
@@ -3164,15 +3078,7 @@ static void vm_execute(LucState *L,int baselevel){
                 else L->top=ci->base+A+1;
                 VM_NEXT;
             }
-            /* Generic .append: identical to GETTABLE "append" + CALL with
-             * (args...) and no self (dot-form contract). The callee runs
-             * IN PLACE at A so its results land at A directly and this
-             * label does nothing after vm_call returns (tail position):
-             * a yield inside unwinds safely, resumption continues inside
-             * the callee -- never skipping needed epilogue (same hazard
-             * class as meth_trampoline's old tmp-frame, now fixed there
-             * too). Self is parked in a keep-slot above top so the
-             * overwrite of A can't unroot a temporary self mid-call. */
+            /* Generic append: callee runs in place at A, tail-safe; self parked above top */
             ci->savedpc=pc; L->yield_A=A; L->yield_C=nres;
             ensure_stack(L,L->top+2*n+16);
             base=L->stack+ci->base;
@@ -3191,13 +3097,13 @@ static void vm_execute(LucState *L,int baselevel){
                 Table *mtb=AS_TAB(m)->meta;
                 Value hf=mtb?tab_get(mtb,mkobj(LT_STR,str_fromc("__call"))):NIL;
                 if(hf.t==LT_FUNC||hf.t==LT_CFUNC){
-                    /* shift [A..A+n] right by one: [A]=hf [A+1]=m, args */
+                    /* Shift [A..A+n] right: [A]=hf [A+1]=m */
                     for(int i=n;i>=0;i--) base[A+i+1]=base[A+i];
                     base[A]=hf; nargs=n+1; plain=0;
                 }
             }
             if(plain){
-                /* park self above top (stay rooted), method goes at A */
+                /* Park self above top, method at A */
                 int keep=L->top;
                 L->stack[keep]=base[A];
                 L->top=keep+1;
@@ -3227,7 +3133,7 @@ static void vm_execute(LucState *L,int baselevel){
             if(want>=0) L->top=ci->base+pr->maxstack;
         } VM_NEXT;
         VM_LABEL(FORPREP) {
-/* repeat [step,] destination: going up stops BEFORE destination, going down lands on 0 */
+/* repeat up stops before dest, down lands on 0 */
             double st=arith_num(base[A]), tg=arith_num(base[A+1]);
             if(st==0) luc_error("repeat: step cannot be zero");
             if(st>0){ base[A]=mknum(-st); base[A+1]=mknum(tg); }
@@ -3284,8 +3190,7 @@ static void vm_execute(LucState *L,int baselevel){
             }
         } VM_NEXT;
         VM_LABEL(NEXT) {
-/* base[A]=target, base[A+1]=state; outputs base[A+2], base[A+3]
-   lists/strings: value, index (0-based); dicts: key, value */
+/* NEXT: in target/state, out value/index or key/value */
             Value tv=base[A], st=base[A+1];
             if(tv.t==LT_LIST||tv.t==LT_STR){
                 int len=tv.t==LT_LIST? AS_TAB(tv)->alen : AS_STR(tv)->len;
@@ -3314,7 +3219,7 @@ static void vm_execute(LucState *L,int baselevel){
 #undef VM_NEXT
 }
 
-/* coroutines + task scheduler */
+/* Coroutines and scheduler */
 
 int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
     if(co->status==CO_DEAD){ V.errval=mkobj(LT_STR,str_fromc("cannot resume dead coroutine")); return 1; }
@@ -3330,7 +3235,7 @@ int co_resume(LucState *co,Value *args,int nargs,Value *res,int *nres){
     if(setjmp(yp.jb)==0){
         if(setjmp(ej.jb)==0){
             if(co->status==CO_RUNNING && co->nci==0){
-/* first start: function already at stack[0] */
+/* First start: func already at stack[0] */
                 ensure_stack(co,nargs+8);
                 for(int i=0;i<nargs;i++) co->stack[1+i]=args[i];
                 Value f=co->stack[0];
@@ -3402,8 +3307,7 @@ void sched_run(void){
         }
     }
 }
-/* run tasks whose wake time already passed; never sleep. Lets main-thread
- * waits (task.wait at top level) pump other tasks instead of freezing. */
+/* Run due tasks only, no sleep; lets top-level wait pump tasks */
 void sched_poll(void){
     Value res[32]; int nres;
     double now=luc_now();
@@ -3433,7 +3337,7 @@ int hexval(int c){
     return -1;
 }
 
-/* lib argument-check helpers */
+/* Arg check helpers */
 
 double checknum(LucState *L,int base,int nargs,int i,const char *fn){
     Value v=AR(i);
@@ -3504,9 +3408,9 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     char rel[512]; modname_to_path(name,rel,sizeof rel);
     char *src;
     if(*g_scriptdir && (src=try_dir(g_scriptdir,rel,len,found,fcap))) return src;
-/* fallback: also try CWD in case scriptdir is empty or relative */
+/* Fallback: try CWD if scriptdir empty */
     if((src=try_dir(".",rel,len,found,fcap))) return src;
-/* local bundle first: ./luc_modules shadows the installed LUC_PATH so a refreshed copy next to the project is always the one that loads */
+/* Local bundle first: ./luc_modules shadows LUC_PATH */
     if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
     const char *lp=getenv("LUC_PATH");
     if(lp){
@@ -3527,9 +3431,7 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     return NULL;
 }
 
-/* system libraries load only from the luc install bundle: ./luc_modules and
-   the LUC_PATH dirs.  The script dir and cwd are skipped on purpose so a
-   user's own module (say their own ai.luc) can never shadow a system lib. */char *find_system_module(const char *name,int *len,char *found,size_t fcap){
+/* System libs only from bundle/LUC_PATH; script/cwd can't shadow them */char *find_system_module(const char *name,int *len,char *found,size_t fcap){
     char rel[512]; modname_to_path(name,rel,sizeof rel);
     char *src;
     if((src=try_dir("luc_modules",rel,len,found,fcap))) return src;
@@ -3552,11 +3454,10 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
     return NULL;
 }
 
-/* libs (make/get/pack): where the main script lives. Packs land next to it. */
+/* Libs live by main script; packs land next to it */
 const char *luc_scriptdir(void){ return g_scriptdir; }
 
-/* first meaningful line of a file: skip blanks and -- comments.
- * Returns 1 with the `make <name>` name when the file declares a lib part. */
+/* First real line: 1 with `make <name>` if lib part */
 int part_make_name(const char *path,char *out,size_t cap){
     FILE *f=fopen(path,"rb");
     if(!f) return 0;
@@ -3566,7 +3467,7 @@ int part_make_name(const char *path,char *out,size_t cap){
         while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
         if(!*p || (*p=='-' && p[1]=='-')) continue;
         if(*p=='!') continue;   /* !strict / !karatsuba may precede make */
-        /* `import libs` must precede make: skip it while scanning */
+        /* `import libs` precedes make: skip while scanning */
         if(!strncmp(p,"import",6) && (p[6]==' '||p[6]=='\t')){
             char *q=p+6; while(*q==' '||*q=='\t') q++;
             if(!strncmp(q,"libs",4) && (q[4]==' '||q[4]=='\t'||q[4]=='\r'||q[4]=='\n'||q[4]=='('||q[4]==0||q[4]==';'))
@@ -3593,7 +3494,7 @@ static char *try_file(const char *dir,const char *filename,int *len,char *found,
     return NULL;
 }
 
-/* libs: find a packed lib <name>.luic (script dir, cwd, luc_modules, LUC_PATH) */
+/* Find packed <name>.luic in script/cwd/bundle/PATH */
 char *find_pack(const char *name,int *len,char *found,size_t fcap){
     char rel[512];
     snprintf(rel,sizeof rel,"%s.luic",name);
@@ -3631,7 +3532,7 @@ Table *newlib(const char *name){
     return t;
 }
 
-/* the standard libs live in luc_lib_*.c; each exports one open function */
+/* Std libs in luc_lib_*.c, one open fn each */
 static void luc_openlibs(void){
     lucL_open_base();
     lucL_open_string();
@@ -3642,9 +3543,9 @@ static void luc_openlibs(void){
     lucL_open_buffer();
     lucL_open_coro();
     lucL_open_net();
-/* core-level additions on top of the libs */
+/* Core additions on libs */
     V.listcore=tab_new(0);
-    reg(V.listcore,"remove",f_core_remove);       /* by value, returns bool */
+    reg(V.listcore,"remove",f_core_remove);       /* By value, returns bool */
     V.tabmeta=tab_new(0);
     append_cache_init();
     reg(V.tabmeta,"keys",f_dict_keys);
@@ -3661,9 +3562,9 @@ static void luc_init(void){
     V.strcap=256;
     V.strtab=(Str**)lcalloc(sizeof(Str*)*(size_t)V.strcap);
     V.gcthresh=1u<<16;
-    V.gcoff=1;                               /* no GC while bootstrapping */
+    V.gcoff=1;                               /* No GC while bootstrapping */
     V.globals=tab_new(0);
-    V.loaded=tab_new(0);                     /* module cache */
+    V.loaded=tab_new(0);                     /* Module cache */
     V.mainco=state_new(256);
     V.mainco->status=CO_RUNNING;
     V.cur=V.mainco;
@@ -3683,7 +3584,7 @@ static int run_chunk(const char *src,int len,const char *name,int argc,char **ar
         for(int i=0;i<n;i++) L->stack[1+i]=cstrv(argv[firstarg+i]);
         V.cur=L;
         vm_call(L,0,n,0);
-        sched_run();                      /* drain task.delay / task.wait */
+        sched_run();                      /* Drain task.delay/wait */
         fflush(stdout);
         V.errjmp=ej.prev;
         return 0;
@@ -3710,9 +3611,9 @@ static char *read_file(const char *path,int *outlen){
     return b;
 }
 
-/* package installer (luc install) */
+/* Package installer */
 
-/* Packages live in the LUC GitHub repo itself, so no release step is needed: raw file downloads from the main branch. Override with the LUC_INSTALL_URL env var for mirrors/tests. */
+/* Packages fetch raw from repo main; LUC_INSTALL_URL overrides */
 #define LUC_REPO_URL "https://raw.githubusercontent.com/hsusulist/luc/main"
 
 typedef struct { const char *name; const char *desc; } PkgInfo;
@@ -3749,7 +3650,7 @@ static int pkg_mkdir(const char *path){
 #endif
 }
 
-/* install root: the folder the luc binary itself lives in */
+/* Install root: folder with luc binary */
 static int pkg_exe_dir(char *out,size_t cap){
 #if defined(_WIN32)
     DWORD n=GetModuleFileNameA(NULL,out,(DWORD)cap);
@@ -3777,7 +3678,7 @@ static void pkg_fmt_size(long bytes,char *out,size_t cap){
 
 #if defined(_WIN32)
 
-/* GET url -> outpath via WinHTTP (system TLS, follows redirects). */
+/* GET url via WinHTTP, follows redirects */
 static int pkg_http_get(const char *url,const char *outpath,long *outsize){
     const char *p=url;
     int secure=1;
@@ -3843,7 +3744,7 @@ static int pkg_http_get(const char *url,const char *outpath,long *outsize){
 
 #else
 
-/* POSIX: curl is near-universal and handles TLS + redirects for us */
+/* POSIX: curl handles TLS and redirects */
 static int pkg_http_get(const char *url,const char *outpath,long *outsize){
     char cmd[1600];
     snprintf(cmd,sizeof cmd,"curl -fL --connect-timeout 10 -s -o '%s' '%s'",outpath,url);
@@ -3871,7 +3772,7 @@ static void pkg_install_path(char *out,size_t cap,const char *sub){
     snprintf(out,cap,"%s/%s",dir,sub);
 }
 
-/* Swap a freshly downloaded tmp file into its final place. On Windows a running exe cannot be overwritten, so the old one is renamed to .old first (allowed while running) and swept away on the next run. */
+/* Swap tmp into place; running exe renamed to .old first on Windows */
 static int pkg_put_file(const char *tmp,const char *dest){
 #if defined(_WIN32)
     if(!MoveFileExA(tmp,dest,MOVEFILE_REPLACE_EXISTING)) return 0;
@@ -3896,9 +3797,9 @@ static int pkg_install_window(int force){
     pkg_install_path(newexe,sizeof newexe,"luc-new.exe");
     snprintf(exetmp,sizeof exetmp,"%s.tmp",newexe);
     pkg_install_path(oldexe,sizeof oldexe,"luc.exe.old");
-    remove(oldexe);                       /* sweep stale backup */
+    remove(oldexe);                       /* Sweep stale backup */
 
-    /* the installer ships packages/window next to luc.exe: try it first */
+    /* Bundled packages/window next to exe: try first */
     pkg_install_path(pd,sizeof pd,"packages/window");
     snprintf(pdll,sizeof pdll,"%s/SDL2.dll",pd);
     snprintf(pexe,sizeof pexe,"%s/luc-win.exe",pd);
@@ -3948,9 +3849,7 @@ static int pkg_install_window(int force){
         if(!offline) remove(exetmp);
         return 1;
     }
-    /* satellite media files: TTF/image/mixer DLLs + deps + default font.
-       Missing ones only degrade features (bitmap font, BMP-only, no sound),
-       so failures here warn instead of aborting. */
+    /* Media extras: missing files only degrade features, warn only */
     { static const char *extra[]={
         "SDL2_ttf.dll","SDL2_image.dll","SDL2_mixer.dll",
         "libfreetype-6.dll","libharfbuzz-0.dll","libbz2-1.dll",
@@ -3994,7 +3893,7 @@ static int pkg_install_window(int force){
     return 0;
 }
 
-/* Unpack a text bundle: lines '#=lucfile: <name>' switch output files, '#=lucpkg:..' starts it, '#=endpkg' closes it. CRLF is normalized. */
+/* Unpack bundle: '#=lucfile:' switches files, CRLF normalized */
 static int pkg_unpack_bundle(const char *path,const char *outdir){
     int len; char *src=read_file(path,&len);
     if(!src) return -1;
@@ -4038,7 +3937,7 @@ static int pkg_install_ai(void){
     int offline;
     pkg_install_path(mods,sizeof mods,"luc_modules");
     pkg_mkdir(mods);
-    /* the installer ships packages/ai.lucpkg next to luc.exe: try it first */
+    /* Bundled packages/ai.lucpkg next to exe: try first */
     pkg_install_path(pkg,sizeof pkg,"packages/ai.lucpkg");
     offline=pkg_file_exists(pkg);
     if(offline){
@@ -4073,7 +3972,7 @@ static int pkg_install_discord(void){
     int offline;
     pkg_install_path(mods,sizeof mods,"luc_modules");
     pkg_mkdir(mods);
-    /* the installer ships packages/discord.lucpkg next to luc.exe: try it first */
+    /* Bundled packages/discord.lucpkg next to exe: try first */
     pkg_install_path(pkg,sizeof pkg,"packages/discord.lucpkg");
     offline=pkg_file_exists(pkg);
     if(offline){
@@ -4141,8 +4040,7 @@ static void print_banner_tail(void){
 "  luc --help      full help\n");
 }
 
-/* ASCII banner: kept in sync with ascii2.txt (the whole file).
- * Plain ASCII only (no box/block glyphs) so any console font shows it. */
+/* ASCII banner synced with ascii2.txt; plain ASCII for all fonts */
 static void print_ascii_banner(void){
     printf(
 "██╗     ██╗   ██╗ ██████╗  Version: 0.2 beta 1\n"
@@ -4154,9 +4052,8 @@ static void print_ascii_banner(void){
 }
 
 static void print_banner(void){
-    printf("\n");   /* priming empty line: some consoles mangle the first bytes */
-    /* ASCII art is the default banner (ascii2.txt); braille needs a font
-     * with those glyphs, so it is opt-in via LUC_BRAILLE=1. */
+    printf("\n");   /* Prime line: some consoles mangle first bytes */
+    /* ASCII default; braille opt-in via LUC_BRAILLE=1 */
     if(!getenv("LUC_BRAILLE")){ print_ascii_banner(); return; }
     printf(
 "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀\n"
@@ -4237,20 +4134,18 @@ static void print_help(void){
     LUC_VERSION);
 }
 
-/* mwindows builds are GUI-subsystem: cmd does not attach stdout/stderr, so print()/errors are invisible when run from a terminal. Re-attach to the parent console if we have no standard handles (GUI subsystem run from cmd/PowerShell). Double-clicked from Explorer: stay silent. */
+/* GUI build: reattach parent console if no handles; double-click stays quiet */
 #if defined(_WIN32)
 static UINT g_saved_cp = 0;
 static void luc_win_restore_cp(void){
     if(g_saved_cp) SetConsoleOutputCP(g_saved_cp);
 }
-/* braille banner (and Vietnamese text) is UTF-8: without this a console
- * left in a legacy codepage shows mojibake (E2 A0 80 -> ΓáÇ). Save the
- * old page and restore it at exit so the user's shell is untouched. */
+/* UTF-8 console: avoid mojibake, restore codepage on exit */
 static void luc_win_utf8_console(void){
     HANDLE out=GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD mode=0;
     if(!out || out==INVALID_HANDLE_VALUE) return;
-    if(!GetConsoleMode(out,&mode)) return;   /* redirected: bytes already UTF-8 */
+    if(!GetConsoleMode(out,&mode)) return;   /* Redirected: bytes already UTF-8 */
     g_saved_cp=GetConsoleOutputCP();
     SetConsoleOutputCP(65001);
     atexit(luc_win_restore_cp);
@@ -4265,11 +4160,11 @@ static void luc_win_enable_vt(HANDLE out){
 }
 static void luc_win_attach_console(void){
     HANDLE out=GetStdHandle(STD_OUTPUT_HANDLE);
-    if(out && out!=INVALID_HANDLE_VALUE){        /* console build or redirected */
-        luc_win_enable_vt(out);                  /* io.replace ANSI erase works */
+    if(out && out!=INVALID_HANDLE_VALUE){        /* Console or redirected */
+        luc_win_enable_vt(out);                  /* ANSI erase works */
         return;
     }
-    if(!AttachConsole(ATTACH_PARENT_PROCESS)) return;   /* double-click: quiet */
+    if(!AttachConsole(ATTACH_PARENT_PROCESS)) return;   /* Double-click: quiet */
     freopen("CONOUT$","w",stdout);
     freopen("CONOUT$","w",stderr);
     freopen("CONIN$","r",stdin);
@@ -4485,7 +4380,7 @@ static const char LUC_LICENSE[] =
 "   See the License for the specific language governing permissions and\n"
 "   limitations under the License.\n"
 ;
-/* ---- interactive help shell: bare `luc` (or `luc --help`) on a console ---- */
+/* Interactive help shell */
 #if defined(_WIN32)
 static int luc_stdin_console(void){
     HANDLE h=GetStdHandle(STD_INPUT_HANDLE);
@@ -4495,10 +4390,10 @@ static int luc_stdin_console(void){
 #else
 static int luc_stdin_console(void){ return isatty(STDIN_FILENO); }
 #endif
-/* LUC_REPL=1 forces the interactive shell (also useful over pipes) */
+/* LUC_REPL=1 forces shell, even piped */
 static int repl_wanted(void){ return luc_stdin_console() || getenv("LUC_REPL") != NULL; }
 
-/* print prompt (stays on the same line), read one line; NULL on EOF */
+/* Prompt, read line; NULL on EOF */
 static char *repl_readline(const char *prompt,char *buf,size_t cap){
     fputs(prompt,stdout); fflush(stdout);
     if(!fgets(buf,(int)cap,stdin)){ printf("\n"); return NULL; }
@@ -4507,7 +4402,7 @@ static char *repl_readline(const char *prompt,char *buf,size_t cap){
     return buf;
 }
 
-/* leading keyword of a query: print()/print(..) -> print, !strict kept */
+/* Query keyword: print(..) to print, keep !strict */
 static void help_key(const char *in,char *out,size_t cap){
     size_t i=0,n=0;
     while(in[i]==' '||in[i]=='\t') i++;
@@ -4619,54 +4514,51 @@ static void repl_help_loop(void){
 }
 
 #if defined(_WIN32)
-/* ---- tiny built-in editor (`edit file.luc` in the REPL) ----
- * Keys: type, Backspace, Enter (split line), Tab (4 spaces), arrows,
- * Ctrl+C copy line, Ctrl+V paste, Ctrl+S save, Esc quit (twice if dirty).
- * .luc, .lua and .py files. UTF-8 bytes pass through untouched. */
+/* Tiny editor (`edit file.luc`); .luc/.lua/.py, UTF-8 safe */
 
 typedef struct { char *b; size_t len, cap; } EdLine;
 
-/* a parked open buffer (kept when switching files with unsaved changes) */
+/* Parked buffer for unsaved file switch */
 typedef struct { EdLine *ln; size_t n, cap, cx, cy, top; int dirty; char path[1024]; } EdStash;
 
 typedef struct { const char *label; int id; } EdMenuItem;
 
 typedef struct {
     EdLine *ln; size_t n, cap;
-    size_t cx, cy;            /* cursor: byte column, line */
-    size_t top;               /* first visible line */
-    size_t dleft;             /* horizontal scroll (display cols) */
+    size_t cx, cy;            /* Cursor: byte col, line */
+    size_t top;               /* First visible line */
+    size_t dleft;             /* H-scroll in display cols */
     int dirty, quit_arm;
     char *clip; size_t cliplen;
     char status[160];
     char path[1024];
-    int numw;                 /* gutter width for line numbers */
-    /* explorer (left pane) */
+    int numw;                 /* Gutter width */
+    /* Explorer (left pane) */
     struct ExItem *ex; size_t exn, excap;
     size_t exsel, extop;
     char exdir[1024];
     int focus;                /* 0 code, 1 files */
-    int show_ex;              /* explorer visible (Ctrl+B) */
-    int vw, vh;               /* last drawn size (mouse mapping) */
-    unsigned short surr_hi;   /* pending UTF-16 lead surrogate */
-    char **rsav; size_t rsavn, rsavcap;  /* collapse-all restore set */
-    int root_shut;            /* folder header toggled shut */
-    /* parked dirty buffers (switch files freely, nothing is lost) */
+    int show_ex;              /* Explorer visible */
+    int vw, vh;               /* Last drawn size */
+    unsigned short surr_hi;   /* Pending lead surrogate */
+    char **rsav; size_t rsavn, rsavcap;  /* Collapse-all restore set */
+    int root_shut;            /* Folder header shut */
+    /* Parked dirty buffers */
     EdStash *stash; size_t nstash, scap;
-    /* popup menu (... button, right-click) */
+    /* Popup menu */
     int menu; EdMenuItem mitems[8]; int nitems, msel;
-    int click_eat;        /* swallow double-click second half after a pick */
-    /* inline naming (new file/folder, F2 rename): popup input */
+    int click_eat;        /* Swallow double-click after pick */
+    /* Inline naming popup input */
     int naming; /* 0 off, 1 new file, 2 new dir, 3 rename */
     char namb[256]; size_t namlen, namcur;
-    char namdir[1024];   /* target dir (new) or parent dir (rename) */
-    char namold[1024];   /* rename source full path (mode 3) */
-    /* file clipboard (explorer copy/paste) */
+    char namdir[1024];   /* Target or parent dir */
+    char namold[1024];   /* Rename source path */
+    /* File clipboard */
     char fcb[1024]; int fcb_dir, fcb_ok;
-    /* popup placement/title: right-click anchors the menu at the mouse */
+    /* Popup anchored at mouse */
     int menu_anch, menu_ax, menu_ay;
     char menutitle[320];
-    /* pending delete (confirmed through a small popup) */
+    /* Pending delete confirm */
     char deltarget[1024]; int delisdir;
 } Editor;
 
@@ -4699,7 +4591,7 @@ static void ed_clamp(Editor *e){
     if(e->cx>e->ln[e->cy].len) e->cx=e->ln[e->cy].len;
 }
 
-/* keep scroll offsets inside the reachable range (wheel can overshoot) */
+/* Keep scroll in range */
 static void ed_clamp_view(Editor *e,int H){
     size_t rows=H>2?(size_t)(H-2):1;
     size_t maxtop=e->n>rows?e->n-rows:0;
@@ -4720,8 +4612,7 @@ static void ed_move_right(Editor *e){
       if(e->cx<L){ do e->cx++; while(e->cx<L && ed_is_cont((unsigned char)e->ln[e->cy].b[e->cx])); } }
 }
 
-/* display width of one byte at display column col (tabs expand, C0/DEL
- * show as one placeholder, UTF-8 continuation bytes take no room) */
+/* Byte width: tabs expand, controls 1, continuations 0 */
 static int ed_chw(unsigned char c,int col){
     if(c=='\t') return 4-(col%4);
     if(c<32||c==127) return 1;
@@ -4729,13 +4620,13 @@ static int ed_chw(unsigned char c,int col){
     return 1;
 }
 
-/* printable form for display (binary files stay viewable, never execute) */
+/* Printable form; binaries stay viewable */
 static unsigned char ed_chshow(unsigned char c){
     if(c=='\t'||c>=32&&c!=127) return c;
     return '.';
 }
 
-/* display column of the cursor */
+/* Cursor display col */
 static size_t ed_dcol(Editor *e){
     ed_clamp(e);
     { size_t d=0,col=0,k=0; char *b=e->ln[e->cy].b;
@@ -4743,7 +4634,7 @@ static size_t ed_dcol(Editor *e){
       return d; }
 }
 
-/* byte offset holding display column dc (snaps forward over continuations) */
+/* Byte offset for display col */
 static size_t ed_byte_at(char *b,size_t len,size_t dc){
     size_t k=0,d=0,col=0;
     while(k<len&&d<dc){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
@@ -4819,7 +4710,7 @@ static int ed_save(Editor *e){
     return 1;
 }
 
-/* anything worth keeping when switching away? (named, or non-empty) */
+/* Worth keeping: named or non-empty */
 static int ed_cur_worth(Editor *e){
     return e->path[0] || e->n>1 || (e->n==1 && e->ln[0].len>0);
 }
@@ -4850,7 +4741,7 @@ static int ed_unstash(Editor *e,const char *path){
     return 0;
 }
 
-/* open path: keep it if already open, restore parked copy, else load fresh */
+/* Open path: reuse open, restore parked, else load */
 static void ed_open_path(Editor *e,const char *full){
     if(e->path[0] && !strcmp(e->path,full)){ e->focus=0; return; }
     ed_stash_current(e);
@@ -4899,7 +4790,7 @@ static int ed_dir_dirty(Editor *e,const char *full){
     return 0;
 }
 
-/* fix open buffer + parked paths after a rename */
+/* Fix open and parked paths after rename */
 static void ed_rename_paths(Editor *e,const char *oldp,const char *newp){
     size_t i;
     if(e->path[0] && !strcmp(e->path,oldp)) snprintf(e->path,sizeof e->path,"%s",newp);
@@ -4925,7 +4816,7 @@ static void ed_load(Editor *e){
               s=i+1;
           }
       }
-      /* "a\n" is one line, not ["a",""]: drop the phantom tail */
+      /* "a\n" is one line: drop phantom tail */
       if(e->n>1&&e->ln[e->n-1].len==0){ free(e->ln[e->n-1].b); e->n--; }
       if(e->n==0) ed_ins_line(e,0);
       snprintf(e->status,sizeof e->status,"loaded '%s' (%d line(s))",e->path,(int)e->n); }
@@ -4938,14 +4829,14 @@ static void ed_free(Editor *e){
     free(e->ln); free(e->clip);
 }
 
-/* ---- lc code syntax colors (truecolor, VS Code Dark+-ish) ---- */
+/* LC syntax colors */
 #define EC_NONE 0
-#define EC_KEY 1     /* keywords: pink */
-#define EC_STR 2     /* strings: orange */
-#define EC_NUM 3     /* numbers: pale green */
-#define EC_COM 4     /* comments: green */
-#define EC_FN 5      /* calls: yellow */
-#define EC_DIR 6     /* directives: blue */
+#define EC_KEY 1     /* Keywords */
+#define EC_STR 2     /* Strings */
+#define EC_NUM 3     /* Numbers */
+#define EC_COM 4     /* Comments */
+#define EC_FN 5      /* Calls */
+#define EC_DIR 6     /* Directives */
 static const char *EC_SEQ[]={ "",
     "38;2;197;134;192", "38;2;206;145;120", "38;2;181;206;168",
     "38;2;106;153;85", "38;2;220;220;170", "38;2;86;156;214" };
@@ -4962,11 +4853,11 @@ static int ed_is_kw(const char *s,size_t n){
     return 0;
 }
 
-#define EC_LINEBG "\x1b[48;2;42;45;46m"   /* cursor-line background */
-#define EC_CODEBG "\x1b[48;2;30;30;30m"   /* code pane background */
-#define EC_EXBG "\x1b[48;2;17;17;17m"     /* explorer pane background */
-#define EC_TOPBG "\x1b[48;2;22;22;22m"    /* top/bottom strip background */
-static int ed_hl_bg = 0;   /* 0 plain reset, 1 code bg, 2 cursor-line bg */
+#define EC_LINEBG "\x1b[48;2;42;45;46m"   /* Cursor-line bg */
+#define EC_CODEBG "\x1b[48;2;30;30;30m"   /* Code pane bg */
+#define EC_EXBG "\x1b[48;2;17;17;17m"     /* Explorer pane bg */
+#define EC_TOPBG "\x1b[48;2;22;22;22m"    /* Top strip bg */
+static int ed_hl_bg = 0;   /* 0 plain, 1 code bg, 2 line bg */
 static void ed_hl_emit(int code,int *cur){
     if(code==*cur) return;
     if(code) printf("\x1b[%sm",EC_SEQ[code]);
@@ -4976,8 +4867,7 @@ static void ed_hl_emit(int code,int *cur){
     *cur=code;
 }
 
-/* advance long-block state (comments/strings) through one line.
- * cm/st: open level, or -1. Shared closer: ]=*lvl] . */
+/* Track block state per line; closer is ]=lvl] */
 static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
     size_t k=0;
     if(*cm>=0||*stt>=0){
@@ -5010,9 +4900,7 @@ static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
       } }
 }
 
-/* render one code line with highlight. start = first visible byte (h-scroll),
- * maxw = visible width. cm/stt carry an open long block from previous lines
- * (cm = comment level+1, stt = string level+1, 0 = none). */
+/* Render line; start=h-scroll, cm/stt=open block */
 static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int cm,int stt){
     size_t k=0;
     int w=0, col=0, cur=EC_NONE, done=0;
@@ -5168,18 +5056,18 @@ static void ed_draw(Editor *e){
         title[W-4]=0;
         printf(EC_TOPBG "\x1b[97m  %s",title);
         printf("\x1b[K\x1b[0m\n"); }
-      /* .luc files get full highlight, others generic strings/comments */
+      /* .luc gets full highlight, others generic */
       { int is_luc=0;
         const char *dd=strrchr(e->path,'.');
         if(dd&&(!strcmp(dd,".luc")||!strcmp(dd,".LUC"))) is_luc=1;
-        /* block state carried from line 0 to the visible window */
+        /* Block state from line 0 to view */
         int pcm=-1, pst=-1;
         { size_t pre; for(pre=0;pre<e->top&&pre<e->n;pre++)
             ed_scan_state(e->ln[pre].b,e->ln[pre].len,&pcm,&pst); }
         for(r=0;r<H-2;r++){
           size_t li=e->top+r;
           printf("\x1b[K");
-          /* explorer cell: header rows, then tree entries */
+          /* Explorer cell: header, then entries */
           if(EXW){
           printf(EC_EXBG);
           if(r==0){
@@ -5206,8 +5094,7 @@ static void ed_draw(Editor *e){
                 const char *nm=e->ex[ei].name;
                 int cw=0, kk=0, i, isd=e->ex[ei].isdir;
                 int dep=e->ex[ei].depth; if(dep>4) dep=4;
-                /* VSCode-like: dirty names glow yellow (files and their
-                 * folders); files keep their extension color otherwise */
+                /* Dirty names yellow, else extension color */
                 int col=isd ? (ed_dir_dirty(e,e->ex[ei].full)?33:0)
                             : (ed_path_dirty(e,e->ex[ei].full)?33:ed_ex_color(nm,isd));
                 int sel=(e->focus==1&&ei==e->exsel);
@@ -5253,7 +5140,7 @@ static void ed_draw(Editor *e){
             if(isthumb) printf("\x1b[97;7m \x1b[0m"); else printf("\x1b[90m|\x1b[0m");
             printf("\x1b[%d;1H",r+3); }
       }
-      { /* bottom strip: message, else unsaved count, else empty */
+      { /* Bottom strip: message or unsaved count */
         int u=0;
         if(e->status[0]){
             char msg[256];
@@ -5268,9 +5155,9 @@ static void ed_draw(Editor *e){
             printf(EC_TOPBG "  ");
         }
         printf("\x1b[K\x1b[0m"); }
-      /* popup overlay (menu or naming input) draws last, owns the cursor */
+      /* Popup draws last, owns cursor */
       if(e->menu||e->naming) ed_popup_draw(e,W,H);
-      /* cursor (hidden entirely with no file open, or while a menu is up) */
+      /* Cursor hidden with no file or open menu */
       { size_t dc2=ed_dcol(e);
         if(e->menu) { /* hidden */ }
         else if(e->naming) { /* positioned by ed_popup_draw */ }
@@ -5320,7 +5207,7 @@ static void ex_refresh(Editor *e){
     if(e->exsel>=e->exn && e->exn>0) e->exsel=e->exn-1;
 }
 
-/* exdir = exdir/name (.. goes up) */
+/* Join exdir/name, .. goes up */
 static void ex_join(Editor *e,const char *name){
     if(!strcmp(name,"..")){
         char *d=e->exdir; size_t n=strlen(d), k;
@@ -5348,7 +5235,7 @@ static void ex_full(Editor *e,const char *name,char *out,size_t cap){
     memcpy(out+n,name,strlen(name)+1);
 }
 
-/* expand a collapsed dir node: insert its sorted children after it */
+/* Expand dir: insert sorted children after it */
 static void ex_expand(Editor *e,size_t idx){
     char pat[1120];
     WIN32_FIND_DATAA fd;
@@ -5398,8 +5285,7 @@ static void ex_collapse(Editor *e,size_t idx){
     if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
 }
 
-/* folder-header toggle: collapse everything (remembering the set) or
- * restore the remembered expansion, like the dir rows below */
+/* Header toggle: collapse all or restore expansion */
 static void ex_toggle_all(Editor *e){
     size_t i;
     if(!e->root_shut){
@@ -5424,7 +5310,7 @@ static void ex_toggle_all(Editor *e){
     if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
 }
 
-/* open explorer entry: dir toggles, file loads (unsaved current parks aside) */
+/* Open entry: dir toggles, file loads */
 static void ex_open_idx(Editor *e,size_t idx){
     if(idx>=e->exn) return;
     e->exsel=idx;
@@ -5435,11 +5321,11 @@ static void ex_open_idx(Editor *e,size_t idx){
     ed_open_path(e,e->ex[idx].full);
 }
 
-/* ---- lc code popup menu + inline naming + file ops ---- */
+/* Popup menu and file ops */
 enum { MA_OPEN=1, MA_NEWFILE, MA_NEWDIR, MA_SAVEALL, MA_COPY, MA_RENAME, MA_PASTE,
        MA_DELETE, MA_DELYES, MA_DELNO };
 
-/* target dir for new/paste: selected dir, parent of selected file, or root */
+/* Target dir: selected dir, file parent, or root */
 static void ex_target_dir(Editor *e,char *out,size_t cap){
     if(e->exsel<e->exn && e->ex[e->exsel].isdir){
         snprintf(out,cap,"%s",e->ex[e->exsel].full);
@@ -5463,7 +5349,7 @@ static void ed_menu_add(Editor *e,const char *label,int id){
     e->nitems++;
 }
 
-/* kind 0 = ... button (root), 1 = context on exsel */
+/* Kind 0=root button, 1=context on selection */
 static void ed_menu_open(Editor *e,int kind){
     char dir[1024];
     e->nitems=0; e->msel=0; e->menu=1; e->naming=0;
@@ -5495,7 +5381,7 @@ static void ed_menu_open(Editor *e,int kind){
     if(e->nitems==0) e->menu=0;
 }
 
-/* expand chain to parent of full, then select full */
+/* Reveal path: expand parents, then select */
 static void ex_reveal(Editor *e,const char *full){
     char dir[1024], comp[1024];
     size_t dl, pos;
@@ -5504,7 +5390,7 @@ static void ex_reveal(Editor *e,const char *full){
       for(p=dir;*p;p++) if(*p=='\\'||*p=='/') b=p;
       if(b) *b=0; else snprintf(dir,sizeof dir,"."); }
     ex_refresh(e);
-    /* walk components under exdir */
+    /* Walk parts under exdir */
     dl=strlen(e->exdir);
     if(strncmp(full,e->exdir,dl)!=0) return;
     pos=dl;
@@ -5527,7 +5413,7 @@ static void ex_reveal(Editor *e,const char *full){
     e->focus=1;
 }
 
-/* recursive copy (file or dir tree) */
+/* Recursive copy */
 static int ed_copy_tree(const char *src,const char *dst,int depth){
     DWORD a=GetFileAttributesA(src);
     size_t i;
@@ -5554,7 +5440,7 @@ static int ed_copy_tree(const char *src,const char *dst,int depth){
     return 1;
 }
 
-/* unique sibling name: "x - copy.ext", "x - copy (2).ext" ... */
+/* Unique sibling name */
 static void ed_unique(char *out,size_t cap,const char *dir,const char *name,int isdir){
     char stem[256], ext[64]="", cand[512];
     const char *d=strrchr(name,'.');
@@ -5572,17 +5458,16 @@ static void ed_unique(char *out,size_t cap,const char *dir,const char *name,int 
     snprintf(out,cap,"%s",name);
 }
 
-/* ---- delete: permanent, so it always goes through a confirm popup ---- */
+/* Delete is permanent: always confirm */
 
-/* is p the deleted path, or (for folders) anything below it? */
+/* True if p is path or below it */
 static int ed_under(const char *p,const char *full,int isdir){
     size_t n=strlen(full);
     if(!strcmp(p,full)) return 1;
     return isdir && !strncmp(p,full,n) && (p[n]=='\\'||p[n]=='/');
 }
 
-/* delete a file or a whole folder tree. Junctions/symlinks are unlinked,
- * never walked into. Read-only flags are cleared first. */
+/* Delete file/tree; links unlinked, read-only cleared */
 static int ed_delete_tree(const char *path,int depth){
     DWORD a=GetFileAttributesA(path);
     if(a==INVALID_FILE_ATTRIBUTES) return 0;
@@ -5609,7 +5494,7 @@ static int ed_delete_tree(const char *path,int depth){
     return DeleteFileA(path)!=0;
 }
 
-/* drop open/parked buffers that belong to a deleted path */
+/* Drop buffers under deleted path */
 static void ed_forget_path(Editor *e,const char *full,int isdir){
     size_t i, k;
     if(e->path[0] && ed_under(e->path,full,isdir)){
@@ -5628,7 +5513,7 @@ static void ed_forget_path(Editor *e,const char *full,int isdir){
     }
 }
 
-/* remove one entry (and its expanded children) from the visible tree */
+/* Remove entry and children from tree */
 static void ex_remove_by_path(Editor *e,const char *full){
     size_t i;
     for(i=0;i<e->exn;i++) if(!strcmp(e->ex[i].full,full)) break;
@@ -5640,7 +5525,7 @@ static void ex_remove_by_path(Editor *e,const char *full){
     e->exsel=(i<e->exn)?i:(e->exn?e->exn-1:0);
 }
 
-/* ask "delete X?" (Cancel is preselected so a stray Enter is harmless) */
+/* Confirm delete; Cancel preselected for safety */
 static void ed_delete_confirm_open(Editor *e){
     if(e->exsel>=e->exn) return;
     snprintf(e->deltarget,sizeof e->deltarget,"%s",e->ex[e->exsel].full);
@@ -5662,7 +5547,7 @@ static void ed_delete_do(Editor *e){
         ex_remove_by_path(e,e->deltarget);
         snprintf(e->status,sizeof e->status,"deleted '%s'",name);
     } else {
-        if(e->delisdir) ex_refresh(e);   /* may be partly deleted: resync the tree */
+        if(e->delisdir) ex_refresh(e);   /* Partly deleted: resync tree */
         snprintf(e->status,sizeof e->status,"cannot delete '%s' (in use?)",name);
     }
     e->focus=1;
@@ -5724,7 +5609,7 @@ static void ed_naming_confirm(Editor *e){
     }
 }
 
-/* popup geometry (shared by draw + click) */
+/* Popup geometry for draw and click */
 static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
     int bw, bh, i, maxw=0;
     if(e->naming){
@@ -5780,7 +5665,7 @@ static void ed_popup_draw(Editor *e,int W,int H){
     fputc('+',stdout);
 }
 
-/* menu pick */
+/* Menu pick */
 static void ed_menu_pick(Editor *e,int id){
     char dir[1024];
     e->menu=0;
@@ -5812,7 +5697,7 @@ static void ed_menu_pick(Editor *e,int id){
     }
 }
 
-/* popup input: Up/Dn/Enter/Esc/click/wheel. Returns 1 when consumed. */
+/* Popup input: 1 when consumed */
 static int ed_popup_key(Editor *e,WORD vk,WCHAR ch){
     int i;
     if(e->naming){
@@ -5825,7 +5710,7 @@ static int ed_popup_key(Editor *e,WORD vk,WCHAR ch){
             return 1;
         }
         if(ch>=32&&e->namlen+1<sizeof e->namb){
-            /* BMP -> UTF-8 (astral chars arrive as surrogate halves) */
+            /* BMP to UTF-8; astral via surrogates */
             unsigned long cp=ch;
             char tmp[4]; int m=0, k;
             if(cp<0x80) tmp[m++]=(char)cp;
@@ -5860,13 +5745,13 @@ static void ed_popup_click(Editor *e,int x,int y,int W,int H){
     int x0,y0,bw,bh,i;
     if(!e->menu&&!e->naming) return;
     ed_popup_geom(e,W,H,&x0,&y0,&bw,&bh);
-    if(e->naming){ return; }   /* clicks elsewhere cancel (handled by caller) */
+    if(e->naming){ return; }   /* Outside clicks cancel, handled by caller */
     for(i=0;i<e->nitems&&i<bh-2;i++){
         if(y==y0+1+i && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
     }
 }
 
-/* wait for any key-down (used after run) */
+/* Wait for key after run */
 static void wait_key(HANDLE hin){    INPUT_RECORD ir; DWORD n=0;
     for(;;){
         if(!ReadConsoleInputW(hin,&ir,1,&n)) return;
@@ -5874,8 +5759,7 @@ static void wait_key(HANDLE hin){    INPUT_RECORD ir; DWORD n=0;
     }
 }
 
-/* run the current file with luc (^R or ^`). Saves first, clears the
- * screen, streams the program output, waits for a key, redraws. */
+/* Run .luc: save, show output, wait key, redraw */
 static void ed_run(Editor *e,HANDLE hin,DWORD oldmode){
     const char *dot=strrchr(e->path,'.');
     if(!dot||(strcmp(dot,".luc")&&strcmp(dot,".LUC"))){
@@ -5898,7 +5782,7 @@ static void ed_run(Editor *e,HANDLE hin,DWORD oldmode){
     e->status[0]=0;
 }
 
-/* insert one Unicode codepoint as UTF-8 (surrogate pairs combined) */
+/* Insert codepoint as UTF-8 */
 static void ed_insert_cp(Editor *e,unsigned long cp){
     char tmp[4]; int m=0;
     if(cp<0x80) tmp[m++]=(char)cp;
@@ -5908,14 +5792,14 @@ static void ed_insert_cp(Editor *e,unsigned long cp){
     ed_insert_bytes(e,tmp,(size_t)m);
 }
 
-/* keyboard. Returns 1 when the editor should quit. */
+/* Keyboard: 1 quits editor */
 static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
     int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
     int alt=(ctl&(LEFT_ALT_PRESSED|RIGHT_ALT_PRESSED))!=0;
-    if(alt&&!ctrl) return 0;   /* menu compositions: ignore */
-    if(ch==2){ e->show_ex=!e->show_ex; return 0; }   /* ^B toggles explorer */
+    if(alt&&!ctrl) return 0;   /* Ignore menu keys */
+    if(ch==2){ e->show_ex=!e->show_ex; return 0; }   /* ^B toggles tree */
     if(e->focus==1){
-        if(ch==27||ch==5){ e->focus=0; return 0; }        /* Esc/^E back to code */
+        if(ch==27||ch==5){ e->focus=0; return 0; }        /* Esc back to code */
         if(ch==13){ ex_open_idx(e,e->exsel); return 0; }
         if(ch==8){ ex_join(e,".."); return 0; }
         if(!ctrl&&(ch=='n'||ch=='N')){ ex_target_dir(e,e->namdir,sizeof e->namdir); ed_naming_start(e,1); return 0; }
@@ -6000,7 +5884,7 @@ static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
     return 0;
 }
 
-/* click/wheel. Coordinates are console-buffer based; vw/vh map them. */
+/* Click/wheel in buffer coords */
 static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
     HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_SCREEN_BUFFER_INFO bi;
@@ -6028,7 +5912,7 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
       size_t CW=(size_t)(W-EXW)-e->numw; if((int)CW<8) CW=8;
       if(y<1||y>H-2||x<0) return;
       if(m->dwButtonState&RIGHTMOST_BUTTON_PRESSED){
-          /* right-click: context menu (files) or nothing (code) */
+          /* Right-click: file menu, else nothing */
           if(EXW&&x<EXW){
               int r=y-1;
               e->focus=1;
@@ -6074,7 +5958,7 @@ static int ed_isfile(const char *p){
     return a!=INVALID_FILE_ATTRIBUTES && !(a&FILE_ATTRIBUTE_DIRECTORY);
 }
 
-/* lc code entry: start=NULL (cwd + no file), a file, or a directory */
+/* Entry: NULL=cwd, file, or dir */
 static void lc_code(const char *start){
     HANDLE hin=GetStdHandle(STD_INPUT_HANDLE);
     DWORD m=0, old=0;
@@ -6111,11 +5995,10 @@ static void lc_code(const char *start){
         e.focus=1;
     }
     ex_refresh(&e);
-    /* fullscreen TUI: alternate screen (user scrollback untouched),
-     * no autowrap (overlong rows truncate, never scroll the frame) */
+    /* Alt screen, no wrap: long rows truncate */
     printf("\x1b[?1049h\x1b[?7l");
     fflush(stdout);
-    /* batch the whole frame into one write: many small writes flicker */
+    /* One write per frame: avoids flicker */
     setvbuf(stdout,NULL,_IOFBF,65536);
     for(;;){
         ed_clamp(&e);
@@ -6124,7 +6007,7 @@ static void lc_code(const char *start){
             INPUT_RECORD ir; DWORD n=0;
             if(!ReadConsoleInputW(hin,&ir,1,&n)) goto done;
             if(e.menu||e.naming){
-                /* popup owns all input until dismissed */
+                /* Popup owns input until dismissed */
                 if(ir.EventType==MOUSE_EVENT){
                     WORD f=ir.Event.MouseEvent.dwEventFlags;
                     if(f==MOUSE_MOVED) continue;
@@ -6163,7 +6046,7 @@ static void lc_code(const char *start){
             }
             if(ir.EventType==MOUSE_EVENT){
                 WORD f=ir.Event.MouseEvent.dwEventFlags;
-                if(f==MOUSE_MOVED) continue;   /* hover redraws = flicker */
+                if(f==MOUSE_MOVED) continue;   /* Hover redraw flickers */
                 if((f==0||f==DOUBLE_CLICK)
                    && (ir.Event.MouseEvent.dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)
                    && e.click_eat){ e.click_eat=0; continue; }
@@ -6214,7 +6097,7 @@ static void interactive_shell(void){
     }
 }
 
-/* lccode [path] -- open lc code on a file, a directory, or the cwd */
+/* lccode [path]: open file, dir, or cwd */
 static void lccode_cmd(const char *line){
     const char *p=line+6;
     char path[1024];
@@ -6235,7 +6118,7 @@ int main(int argc,char **argv){
     if(argc>0) snprintf(g_exepath,sizeof g_exepath,"%s",argv[0]);
     luc_init();
     {   char *esrc=NULL; int elen=0;
-        if(luc_aot_embedded(&esrc,&elen)){          /* we are a built executable */
+        if(luc_aot_embedded(&esrc,&elen)){          /* Built executable */
             set_scriptdir(argv[0]);
             int rc=run_chunk(esrc,elen,"=(embedded)",argc,argv,1);
             free(esrc);
@@ -6284,7 +6167,7 @@ int main(int argc,char **argv){
     int len=0;
     char *src=read_file(argv[1],&len);
     if(!src){ fprintf(stderr,"luc: cannot open '%s'\n",argv[1]); return 1; }
-/* allow a #! line at the start of a script */
+/* Allow leading #! line */
     int off=0;
     if(len>1 && src[0]=='#'){ while(off<len && src[off]!='\n') off++; }
     set_scriptdir(argv[1]);

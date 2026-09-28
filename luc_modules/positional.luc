@@ -1,14 +1,14 @@
--- positional.lua -- fixed sinusoidal absolute position encoding.
--- Kept for the older non-Transformer code path and selectable in
--- transformer.lua via pos = "sinusoidal". The Transformer default is RoPE
--- (rope.lua), which is relative, parameter-free and length-extrapolating.
+-- Fixed sinusoidal position encoding
+-- Used by older path and transformer pos=sinusoidal
+-- Default is RoPE in rope.luc
+-- RoPE is relative and length-extrapolating
 --
--- Fixed vs the previous version:
---   * positions are now 0-based (pos 0 => sin 0 / cos 1), as in the paper
---   * a sin/cos PAIR now shares one frequency: exponent 2*floor((i-1)/2)/dim
---     instead of (i-1)/dim. Without this, PE(pos+k) is not a fixed linear
---     map of PE(pos) and the encoding loses its relative-offset property.
---   * the table grows lazily, so :add() past seq_len no longer nil-indexes.
+-- Fixes vs old version:
+-- Positions are 0-based per paper
+-- Sin/cos pair shares one frequency
+-- Keeps relative-offset property
+-- Table grows lazily past seq_len
+-- No nil-index on long input
 
 create ok_matrix, matrix = pcall(require, "matrix")
 
@@ -51,7 +51,7 @@ end
     return self
 end
 
--- make positions 0 .. n-1 available (pe[pos+1])
+-- Expose positions 0..n-1 as pe[pos+1]
 function positional:build(n)
     if n <= self.built then return self end
     create dim, inv = self.dim, self.inv_freq
@@ -88,13 +88,13 @@ end
     return self
 end
 
--- rows[i] is the encoding for position i-1
+-- rows[i] encodes position i-1
 function positional:rows(n)
     self:build(n)
     return self.pe
 end
 
--- legacy API: token_vecs is an array of per-position vectors
+-- Legacy API takes per-position vectors
 function positional:add(token_vecs)
     create n = len(token_vecs)
     self:build(n)
@@ -128,7 +128,7 @@ end
     return out
 end
 
--- flat matrix.lua helpers (in-place add, and a standalone PE matrix)
+-- Flat matrix helpers for in-place add
 function positional:add_matrix(m, scale)
     scale = scale or 1
     assert(m.cols == self.dim, "positional: matrix width must equal dim")

@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -6,7 +6,7 @@ create function __at(L, i)
     return L[i]
 end
 
--- keep just for fun
+-- Imports
 create Value = require("tensor")
 create nn = require("nn")
 create optim = require("optim")
@@ -85,7 +85,7 @@ create function default_on_log(info)
     ))
 end
 
--- Called every epoch with structured info; uses custom on_log if user set one
+-- Per-epoch report; uses custom on_log if set
 function Train:report(epoch, loss)
     table.insert(self.loss_history, loss)
 
@@ -199,9 +199,9 @@ end
 setmetatable(Train, { "__call":  function(_, ...) return Train.new(...) end
  })
 
--- persist weights (layers + params, exact %.17g round-trip).
--- t:save(path) writes; ai.Train.load(path) rebuilds. Optimizer
--- state is not kept: set lr/epochs via :config to keep training.
+-- Save weights with exact %.17g round-trip
+-- t:save writes; Train.load rebuilds
+-- Optimizer state not kept; reset lr via :config
 function Train:save(path)
     create f, ferr = io.open(path, "w")
     if f == nil then error("train:save: cannot open '" .. path .. "'", 2) end

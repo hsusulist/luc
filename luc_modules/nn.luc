@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]

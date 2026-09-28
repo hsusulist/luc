@@ -45,7 +45,7 @@ end
     return self
 end
 
--- Grow the cache so that positions 0 .. n-1 are available.
+-- Grow cache for positions 0..n-1
 function RoPE:build(n)
     if n <= self.built then return self end
     create inv = self.inv_freq
@@ -80,8 +80,8 @@ end
     return self
 end
 
--- Returns two row-aligned tables: cos_rows[i] / sin_rows[i] correspond to
--- absolute position (i - 1 + offset). offset > 0 is for future KV-cache use.
+-- Row tables for pos i-1+offset
+-- Offset supports future KV cache
 function RoPE:rows(n, offset)
     offset = offset or 0
     self:build(n + offset)

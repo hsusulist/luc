@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -6,49 +6,49 @@ create function __at(L, i)
     return L[i]
 end
 
---  lmio.lua -- checkpoint persistence + crash-safe auto-save.
+-- lmio: checkpoint persistence and crash-safe auto-save
 --
---  Installed onto LMTrain by lmtrain.lua:  lmio(LMTrain).
+-- Installed on LMTrain by lmtrain.lua
 --
---  ============================ FORMATS ==================================
---  v3 bin  (default when ffi is available)
---      lanternl-checkpoint 3\n
---      format=bin dtype=f32 endian=le vocab=.. dim=.. ... nparams=..\n
---      per parameter:  "<rows> <cols>\n"  then rows*cols raw LE floats
---  v3 text / v2 text
---      ... format=text ...
---      per parameter:  "<rows> <cols>|v,v,v,...\n"
---  v1 legacy: no tag line, no "r c|" prefix.  Still readable.
+-- Formats
+-- v3 bin default with ffi
+-- tag line lanternl-checkpoint 3
+-- header with format, dtype, arch, nparams
+-- per param rows cols plus raw LE floats
+-- v3/v2 text uses rows cols plus CSV
+-- text per param is rows cols with values
+-- v1 legacy has no tag; still readable
 --
---  ======================== WHY BINARY IS THE DEFAULT ====================
---  The old text writer built one Lua string per element and table.concat'd
---  the whole tensor.  For a 134M-parameter model that is >130M transient
---  interned strings and a ~3.2 GB file at %.17g, taking minutes per write.
---  Auto-saving every epoch with that writer would have OOM'd or dominated
---  the run.  The binary path streams through a fixed 1M-element FFI buffer:
---  constant memory, ~4 bytes/param, one write(2) per chunk.
+-- Why binary is default
+-- Old text built one string per element
+-- 134M params made 130M strings and 3.2GB file
+-- Text writes took minutes each
+-- Auto-save with text would OOM or stall run
+-- Binary streams via 1M-element FFI buffer
+-- Constant memory, ~4 bytes per param, one write per chunk
 --
---  ======================== CRASH SAFETY =================================
---  Every write goes to "<path>.tmpNNNN" IN THE SAME DIRECTORY (a temp dir
---  would make rename(2) cross-device and fail with EXDEV -- Colab users
---  save to /content/drive constantly), is fully written and closed with
---  every write() and the close() result checked, and only then rotated
---  into place with os.rename(), which is atomic on POSIX.
+-- Crash safety
+-- Write to tmp in same dir, not temp dir
+-- Same dir avoids cross-device EXDEV rename fail
+-- Colab Drive paths need this
+-- Check every write and close result
+-- Then rotate via atomic POSIX rename
 --
---  With keep_last = K > 1 the rotation is oldest-first:
---      rm path.(K-1); path.(K-2)->path.(K-1); ... ; path.1->path.2;
---      path->path.1; tmp->path
---  There is a sub-millisecond window between the last two renames where
---  `path` does not exist -- but a COMPLETE, VALID checkpoint exists at
---  path.1 for the whole window, so the invariant "the only copy on disk is
---  never corrupt" holds.  LMTrain.latest_checkpoint() probes that window
---  away for the caller.
+-- keep_last K rotates oldest-first
+-- rm oldest, shift others, move current, install tmp
+-- Follows ordered rotation chain
+-- Sub-ms gap where path misses exists
+-- Valid checkpoint stays at path.1 in gap
+-- Disk never holds only corrupt copy
+-- latest_checkpoint probes that gap
+-- Caller always finds resume copy
 --
---  Durability note, stated honestly: rename(2) gives atomic *visibility*.
---  True power-loss durability needs fsync, which pure Lua cannot issue.
---  This protects fully against the reported failure modes (process crash,
---  SIGKILL, OOM-killer, notebook disconnect, forgotten :save()).  A kernel
---  panic mid-write is a weaker guarantee, mitigated by keep_last > 1.
+-- Durability note: rename gives atomic visibility
+-- Power-loss durability needs fsync, unavailable in Lua
+-- Covers crash, kill, OOM and disconnect
+-- Also covers forgotten save
+-- Kernel panic mid-write is weaker
+-- Mitigate with keep_last greater than 1
 
 create sformat = string.format
 create huge = math.huge
@@ -105,9 +105,9 @@ create function file_exists(path)
     return true
 end
 
---- Unique-per-process temp suffix.  Deterministic within a run so a crash
---- leaves at most ONE stale tmp file, and distinct across concurrent runs
---- so two processes sharing a path cannot shred each other's partial write.
+--- Unique temp suffix per process
+--- One stale tmp max per crashed run
+--- Concurrent runs cannot clash
 create TMP_SUFFIX
 do
     create seed = tostring(os.time()) .. tostring(math.random(0, 999999))
@@ -121,9 +121,9 @@ do
     TMP_SUFFIX = ".tmp" .. seed
 end
 
---- os.rename() is atomic replace on POSIX.  Windows' MSVCRT rename() fails
---- if the destination exists, so fall back to remove+rename there -- non
---- atomic, and we say so rather than pretending otherwise.
+--- POSIX rename is atomic replace
+--- Windows needs remove plus rename
+--- Windows path is non-atomic
 create function rename_over(src, dst)
     create ok, err = os.rename(src, dst)
     if ok then return true end
@@ -152,9 +152,9 @@ end
     os.rename(path, path .. ".1")
 end
 
---- Atomic byte-for-byte copy (used when the "latest" and "best" files are
---- both due in the same tick: serialize once, copy on disk, so there is
---- never more than one D2H pass over the parameters per save point).
+--- Atomic copy for latest plus best in one tick
+--- Serialize once, copy on disk
+--- One D2H pass per save point
 create function copy_file_atomic(src, dst)
     create fi, e1 = io.open(src, "rb")
     if not fi then return nil, tostring(e1) end
@@ -177,7 +177,7 @@ create function copy_file_atomic(src, dst)
     return true
 end
 
---- "5" -> 5 epochs ; "30s"/"5m"/"2h" -> wall-clock seconds.
+--- Interval: 5 is epochs; 30s/5m/2h is seconds
 create function parse_interval(v)
     if v == nil then return 1, nil end
     if type(v) == "number" then return v, nil end
@@ -203,19 +203,18 @@ return function(LMTrain)
     LMTrain.FORMAT_TAG     = FORMAT_TAG
     LMTrain.FORMAT_VERSION = FORMAT_VERSION
 
-    -- ================================================================
-    --  Parameter access hooks.
+    -- Param hooks
     --
-    --  These exist so lmio never has to know which backend it is talking
-    --  to, and -- critically -- so the GPU path can stream straight out of
-    --  VRAM in fixed-size chunks instead of materialising a 134M-entry Lua
-    --  table via _gpu_pull().  lmtrain_gpu.lua overrides all three.
-    -- ================================================================
+    -- Backend-agnostic access for lmio
+    -- GPU streams from VRAM in chunks
+    -- Avoids 134M-entry Lua table via _gpu_pull
+    -- lmtrain_gpu.lua overrides them
+    --
 
     function LMTrain:_param_dtype() return "f64" end
 
-    --- Copy elements [from, from+count-1] (1-indexed) of parameter i into
-    --- the 0-indexed FFI buffer `dst`.
+    --- Copy param slice into 0-indexed FFI dst
+    --- 1-indexed source range
     function LMTrain:_param_get(i, from, count, dst)
         create d = self.params[i].data.data
         do
@@ -229,7 +228,7 @@ return function(LMTrain)
 end
     end
 
-    --- Inverse of _param_get.
+    --- Inverse of _param_get
     function LMTrain:_param_set(i, from, count, src)
         create d = self.params[i].data.data
         do
@@ -248,13 +247,12 @@ end
     end
     create function esize(dtype) return dtype == "f32" and 4 or 8 end
 
-    -- ================================================================
-    --  Serialisation
-    -- ================================================================
+    -- Serialisation
+    --
 
     create function default_precision(dtype)
-        -- 9 significant digits round-trip an IEEE binary32 exactly; %.17g
-        -- on fp32 data writes 8 bytes per value of pure noise.
+        -- 9 digits round-trip fp32 exactly
+        -- %.17g on fp32 writes noise bytes
         return dtype == "f32" and "%.9g" or "%.17g"
     end
 
@@ -271,11 +269,11 @@ end
             sformat("ffn=%d", self.ffn), 9: 
             sformat("pos=%s", tostring(self.pos or "rope")), 10: 
             sformat("causal=%d", (self.causal != false) and 1 or 0), 11: 
-            -- tie changes the PARAMETER COUNT (untied adds a head matrix) and
-            -- max_seq / rope_base change behaviour.  None of the three were
-            -- recorded in v2, so a tie mismatch surfaced as a baffling
-            -- "N tensors vs M tensors" error and a max_seq mismatch was
-            -- silently wrong.  Recorded now.
+            -- tie changes param count; max_seq alters behavior
+            -- v2 omitted them, causing confusing mismatch
+            -- tie mismatch looked like tensor count error
+            -- max_seq mismatch stayed silent
+            -- Recorded now
             sformat("tie=%d", (self.tie != false) and 1 or 0), 12: 
             sformat("max_seq=%d", self.max_seq or 128), 13: 
             sformat("rope_base=%g", self.rope_base or 10000), 14: 
@@ -340,7 +338,7 @@ end
  strs[j + 1] = fmt_num(buf[j], prec) end
 end
                     else
-                        -- no ffi: read the flat store directly (CPU only)
+                        -- No ffi: read flat store on CPU
                         create d = m.data
                         do
     create __fa = (0)
@@ -375,9 +373,9 @@ end
         return true
     end
 
-    --- Serialise the whole model to `path` atomically.  Returns ok, err.
-    --- Never raises: callers on the training hot path must not die because
-    --- a disk filled up.
+    --- Atomic model write; returns ok, err
+    --- Never raises on hot path
+    --- Disk-full must not kill training
     function LMTrain:_write_checkpoint(path, opts)
         opts = opts or {}
         if self.params == nil or len(self.params) == 0 then
@@ -414,8 +412,8 @@ end
             return nil, tostring(werr)
         end
 
-        -- f:close() flushes.  Its result is the last chance to notice ENOSPC;
-        -- the old code discarded it and happily printed "Saved to ...".
+        -- close flushes; checks ENOSPC last chance
+        -- Old code ignored close result
         create okc, cerr = f:close()
         if okc == false then
             os.remove(tmp)
@@ -431,9 +429,8 @@ end
         return true
     end
 
-    -- ================================================================
-    --  Public :save / :load
-    -- ================================================================
+    -- Public save/load
+    --
 
     function LMTrain:save(path, opts)
         if type(path) != "string" or path == "" then
@@ -450,9 +447,9 @@ end
         return self
     end
 
-    --- Probe `path`, then its rotations, then the best file, and return the
-    --- first one whose header parses.  Closes the sub-millisecond rotation
-    --- window: after any crash there is always something here to resume from.
+    --- Probe path, rotations, then best file
+    --- Return first with valid header
+    --- Covers rotation gap after crash
     function LMTrain.latest_checkpoint(path, keep)
         if type(path) != "string" then return nil end
         create cands = { 1:  path  }
@@ -498,17 +495,17 @@ end
             error("LMTrain:load: " .. path .. " is empty", 2)
         end
 
-        -- ------------------------------------------------------------
-        --  CRITICAL FIX.  This used to be:
-        --      string.find(line, "^" .. FORMAT_TAG)
-        --  FORMAT_TAG is "lanternl-checkpoint", and '-' is a Lua pattern
-        --  QUANTIFIER (lazy zero-or-more).  The pattern therefore meant
-        --  "lantern" .. (zero or more 'l') .. "checkpoint", which can never
-        --  match the literal tag.  Every v2 file fell through to the legacy
-        --  branch, tried to parse the tag line as the header, and died with
-        --  "unrecognised header" -- i.e. NOTHING :save() ever wrote could be
-        --  loaded back.  Plain-text find, anchored explicitly.
-        -- ------------------------------------------------------------
+        -- Tag match fix
+        -- Old pattern treated - as quantifier
+        -- Pattern could never match literal tag
+        -- v2 files fell to legacy branch
+        -- Legacy parse failed with bad header
+        -- Saved files could not load back
+        -- Use plain-text find instead
+        -- Anchored at start
+        -- See load code below
+        -- Keeps v2 readable
+        --
         create legacy = true
         create version = 1
         create header = line
@@ -560,8 +557,8 @@ end
             create ep = string.match(header, "epoch=(%d+)")
             if ep then self.loaded_epoch = tonumber(ep) end
         end
-        -- Legacy checkpoints predate RoPE, but RoPE adds no parameters, so
-        -- the weight layout is identical and the file still loads cleanly.
+        -- Legacy predates RoPE but layout matches
+        -- RoPE adds no params, loads cleanly
 
         if fmt == "bin" then
             if not HAVE_FFI then
@@ -580,8 +577,8 @@ end
 
         create expected = tonumber(string.match(header, "nparams=(%d+)") or "")
         if expected and expected != len(self.params) then
-            -- Architecture drift (e.g. checkpoints written before fused QKV).
-            -- Give the model one chance to rebuild itself in the file's layout.
+            -- Arch drift, e.g. pre-fused QKV file
+            -- Rebuild once in file layout
             create adapted = false
             if type(self._relayout_for_checkpoint) == "function" then
                 adapted = self:_relayout_for_checkpoint(expected) or false
@@ -717,21 +714,19 @@ end
         return self
     end
 
-    -- ================================================================
-    --  AUTO-SAVE  (PROBLEM 3)
+    -- AUTO-SAVE, PROBLEM 3
     --
-    --  Lives here, not in the two run loops, so `run()` and `_run_gpu()`
-    --  call literally the same three methods and cannot drift apart.
+    -- Lives here so run and _run_gpu share methods
+    -- Both loops cannot drift apart
     --
-    --  Relationship to keep_best -- deliberately orthogonal:
-    --    keep_best  : in-memory (host RAM on CPU, GPU-to-GPU on the GPU
-    --                 path), fast, volatile, restored at end of run.
-    --    auto_save  : on-disk, survives SIGKILL/OOM/disconnect.
-    --  Auto-save NEVER calls :snapshot()/:restore().  When `is_best` fires
-    --  the live weights already ARE the best, so the .best file is written
-    --  straight from them -- no extra GPU-to-GPU copy, no window where the
-    --  live model holds stale weights.
-    -- ================================================================
+    -- keep_best is in-memory and volatile
+    -- keep_best restores at end of run
+    -- auto_save is on-disk and survives crashes
+    -- Auto-save never calls snapshot/restore
+    -- Live weights already are best on is_best
+    -- Best file writes straight from live weights
+    -- No extra copy, no stale window
+    --
 
     function LMTrain:_autosave_begin()
         self._as = nil
@@ -755,10 +750,10 @@ end
         create keep = self.keep_last or 1
         create st = { "path":  path, "best_path":  (self.save_best != false) and (path .. ".best") or nil, "epochs":  ep, "seconds":  sec, "keep":  keep, "last_save":  (ok_lmlog and lmlog.now() or os.time()), "last_epoch":  0, "writes":  0, "fails":  0 }
 
-        -- Fail fast.  Discovering a read-only Drive mount or a typo'd
-        -- directory at epoch 300 is the same lost run we are trying to
-        -- prevent.  Probe uses the per-process suffix so concurrent runs
-        -- sharing a path cannot delete each other's probe.
+        -- Fail fast on unwritable path
+        -- Late failure would lose long run
+        -- Probe uses per-process suffix
+        -- Concurrent runs cannot clash
         create probe = path .. TMP_SUFFIX .. ".probe"
         create pf, perr2 = io.open(probe, "wb")
         if not pf then
@@ -810,7 +805,7 @@ end
         return self
     end
 
-    --- kind: "batch" | "epoch" | "final"
+    --- kind is batch, epoch or final
     function LMTrain:_autosave_tick(kind)
         create st = self._as
         if not st then return false end
@@ -832,8 +827,8 @@ end
             if self.save_at_end == false then
                 want_latest = false
             elseif self.stopped == "diverged" then
-                -- Writing NaN-poisoned weights over the last good checkpoint
-                -- is exactly the loss this feature exists to prevent.
+                -- Skip write on diverged run
+                -- Protects last good checkpoint
                 want_latest = false
                 say(self, sformat("[LMTrain] auto_save: run diverged, NOT overwriting %s. "
                     .. "Recover from %s", st.path,
@@ -844,9 +839,9 @@ end
             end
         end
 
-        -- Best file only on the epoch the improvement actually happened, and
-        -- only when the monitor was genuinely computed this epoch (see the
-        -- eval_every staleness fix in the run loops).
+        -- Best file only on real improvement epoch
+        -- Needs fresh monitor this epoch
+        -- See eval_every fix in run loops
         create want_best = (kind == "epoch") and st.best_path
                           and self.is_best and self._monitor_valid
                           and (st.best_epoch != self.epoch)
@@ -862,8 +857,8 @@ end
                 st.writes = st.writes + 1
                 st.fails = 0
                 if want_best then
-                    -- One serialisation per tick: copy the bytes we just
-                    -- wrote rather than re-reading every parameter again.
+                    -- Copy bytes just written
+                    -- Avoids rereading params
                     create okc, ec = copy_file_atomic(st.path, st.best_path)
                     if okc then st.best_epoch = self.epoch
                     else say(self, "[LMTrain] auto_save: best copy failed: " .. tostring(ec)) end
@@ -877,9 +872,9 @@ end
         if not ok then
             st.fails = st.fails + 1
             self.save_error = tostring(err)
-            -- Never abort the run over a failed save: the in-memory model is
-            -- still the user's only copy and they may free space.  But shout
-            -- every single time -- silence here is the original bug.
+            -- Keep run alive on save failure
+            -- Memory copy may be only copy
+            -- Warn every time, never silent
             say(self, sformat("[LMTrain] !! auto_save FAILED (attempt %d): %s",
                 st.fails, tostring(err)))
             return false
@@ -907,9 +902,9 @@ end
         self._as = nil
     end
 
-    --- Weights-only resume.  Honest about its limits: optimizer moments and
-    --- the LR-schedule position are NOT persisted (Adam m/v are not part of
-    --- `params` on either backend), so the schedule restarts from step 0.
+    --- Weights-only resume; no optimizer state
+    --- Adam moments not in params
+    --- Schedule restarts from zero
     function LMTrain:_maybe_resume()
         create r = self.resume
         if r == nil or r == false then return false end
@@ -945,7 +940,7 @@ end
         return true
     end
 
-    -- ================================================================
+    -- Push helper
     function LMTrain:push(repo_id, opts)
         if type(repo_id) != "string" or not string.find(repo_id, "^[%w%-%._]+/[%w%-%._]+$") then
             error("LMTrain:push: repo_id must look like 'user/model', got " .. tostring(repo_id), 2)
@@ -954,7 +949,7 @@ end
         create file = opts.file or "lanternl_model.bin"
         self:save(file, opts)
 
-        -- Users must run "hf auth login" or "huggingface-cli login" once.
+        -- Needs hf login once
         create cmds = { 1: 
             sformat('hf upload %s %s %s', repo_id, file, file), 2: 
             sformat('huggingface-cli upload %s %s %s', repo_id, file, file) }

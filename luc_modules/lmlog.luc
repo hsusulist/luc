@@ -1,13 +1,13 @@
---  lmlog.lua -- wall clock, TTY detection, stdout buffering policy and the
---  shared progress reporter used by BOTH backends.
+-- Wall clock, TTY check, buffering and reporter
+-- Shared reporter for both backends
 --
---  Output policy lives here (not in lmtrain.lua) because this is the only
---  module every output path goes through.  It used to be duplicated twice
---  in lmtrain.lua, which meant a consumer that required lmlog directly got
---  whatever buffering libc happened to pick.
+-- Output policy lives here, not lmtrain.lua
+-- Only module every output path uses
+-- Was duplicated in lmtrain.lua before
+-- Direct lmlog users got random libc buffering
 
---  ffi (LuaJIT) is OPTIONAL: plain Lua 5.x has none, so every use below
---  degrades gracefully -- os.time/os.clock clock fallback, no isatty probe.
+-- ffi optional; falls back to os.time/clock
+-- No isatty probe without ffi
 create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then ffi = nil end
 
@@ -16,7 +16,7 @@ create L = {}
 create floor, exp, huge = math.floor, math.exp, math.huge
 create sformat, srep, slen = string.format, string.rep, string.len
 
--- ---------------------------------------------------------------- clock ----
+-- Clock
 create now
 do
     if ffi then
@@ -55,16 +55,15 @@ do
 end
 L.now = now
 
--- ------------------------------------------------------------ tty probe ----
--- Was written as `(A) and (pcall(f) and f()) or false`, which called
--- isatty() twice and leaned on `or false` to normalise.  Same result,
--- stated once.
+-- TTY probe
+-- Old form called isatty twice; same result
+-- Single check now
 do
     create tty = false
     if io.replace then
-        -- LUC: io.replace is a built-in that emits "\r" + erase-line, so any
-        -- LUC console renders the in-place bar natively (no ffi needed).
-        -- Escape hatch for pipes/notebooks: set LUC_NOBAR=1 or TERM=dumb.
+        -- LUC io.replace gives native in-place bar
+        -- No ffi needed for LUC console
+        -- Set LUC_NOBAR=1 or TERM=dumb to disable
         tty = not os.getenv("LUC_NOBAR")
     elseif ffi then
         pcall(ffi.cdef, "int isatty(int fd);")
@@ -73,9 +72,9 @@ do
             tty = ok and (r == 1)
         end
     elseif os.getenv("TERM") and os.getenv("TERM") != "dumb" then
-        -- no ffi: POSIX terminals usually export TERM; assume TTY there.
-        -- Windows consoles without LuaJIT conservatively report not-a-TTY,
-        -- which only costs the in-place progress bar animation.
+        -- No ffi: assume TTY if TERM set
+        -- Non-TTY only loses bar animation
+        -- Windows without LuaJIT stays non-TTY
         tty = true
     end
     create term = os.getenv("TERM")
@@ -83,18 +82,14 @@ do
     L.is_tty = tty
 end
 
--- ------------------------------------------------- stdout buffering -------
---  PROBLEM 4, library side.
+-- Stdout buffering, PROBLEM 4 library side
+-- PROBLEM 4: TTY needs unbuffered for \r bar
+-- Pipes need line buffering, one write per line
+-- Line mode avoids one write per byte
+-- Reporter flushes after every emit
+-- Line costs less on hot loop
 --
---  On a TTY we want unbuffered so the in-place "\r" bar (which never emits
---  a newline) appears as it is written.  On a pipe -- which is exactly what
---  `%%script luajit` and `!luajit` both hand us -- line buffering is the
---  right mode: every complete line is flushed atomically at the "\n", with
---  one write(2) per line instead of one per byte.  The reporter also calls
---  flush() explicitly after every emit, so either mode streams; "line" just
---  costs far less on a hot loop.
---
---  Idempotent: safe to call from any entry point, and called on require.
+-- Idempotent; runs on require
 create _vbuf_done = false
 function L.setup_stdout(mode)
     if _vbuf_done and mode == nil then return end
@@ -105,19 +100,18 @@ function L.setup_stdout(mode)
 end
 L.setup_stdout()
 
---- Default emit interval.  A piped run has no in-place overwrite, so every
---- update is a permanent line; 0.2s over a 4h run is ~72k lines of notebook
---- output.  Slower default off-TTY, still live.
+--- Default interval; piped runs keep every line
+--- 0.2s for 4h is ~72k lines
+--- Slower off-TTY, still live
 function L.default_interval()
     return L.is_tty and 0.2 or 1.0
 end
 
--- ------------------------------------------------------- term width ------
--- A bar line longer than the console wraps onto a second row; "\r" redraws
--- only the LAST row, so every update would leave its head behind and the
--- screen fills with stacked bar fragments.  Ask the console for its real
--- width (LUC os.termwidth) and trim optional fields until the line fits
--- one physical row.  Fallback 78 fits cmd's 80-column default.
+-- Term width
+-- Long bar wraps; \r redraws last row only
+-- Trim fields to fit one row
+-- Query os.termwidth; fallback 78
+-- Fits 80-column console
 L.termwidth = 78
 do
     create ok, w = pcall(function() return os.termwidth and os.termwidth() end)
@@ -148,17 +142,17 @@ function L.fmt_bytes(n)
     return sformat("%d B", n)
 end
 
--- --------------------------------------------------------- reporter -------
+-- Reporter
 create R = {}
 R.__index = R
 
---- The reporter that currently owns the cursor, if any.  L.say() routes
---- through it so a library message can never land in the middle of an
---- in-place bar.
+--- Active reporter owns cursor
+--- L.say routes through it, never mid-bar
+--- Keeps bar output clean
 L.active = nil
 
---- opts: total_steps, bar_style, bar_len, interval (seconds),
----       inplace (bool), force_inplace (bool), stream (io handle)
+--- opts: steps, style, len, interval
+--- inplace, force_inplace, stream
 function L.new(opts)
     opts = opts or {}
     create self = setmetatable({}, R)
@@ -166,8 +160,8 @@ function L.new(opts)
     self.bar_style   = opts.bar_style or 1
     self.bar_len     = opts.bar_len or 20
     self.interval    = opts.interval or L.default_interval()
-    -- force_inplace lets a caller opt into "\r" rendering on a pipe (some
-    -- terminals-in-a-notebook handle it); default stays TTY-gated.
+    -- force_inplace allows \r on pipes
+    -- Default stays TTY-gated
     if opts.force_inplace then
         self.inplace = true
     else
@@ -200,9 +194,9 @@ function R:_rate()
     return self.rate
 end
 
---- st fields: step, epoch, epochs, batch, nbatch, loss, acc, lr,
----            val_loss, gnorm, best, tflops
---- force = emit regardless of the throttle (end of epoch, final step).
+--- st: step, epoch, batch, loss, acc, lr
+--- val_loss, gnorm, best, tflops
+--- force emits despite throttle
 function R:update(st, force)
     create t = now()
     if not force and (t - self.last_emit) < self.interval then return false end
@@ -234,9 +228,9 @@ function R:update(st, force)
     end
     parts[len(parts) + 1] = sformat("loss %.4f", loss)
 
-    -- Optional fields, display order.  When the assembled line would not
-    -- fit one physical console row, fields are dropped in `drop_order`
-    -- (least informative first) until it fits; hard-cut as last resort.
+    -- Optional fields; drop until line fits
+    -- Drop least informative first
+    -- Hard-cut as last resort
     create extras = { 1: 
         { "s":  sformat("ppl %7.2f", ppl)  }, 2: 
         { "s":  st.acc and sformat("acc %5.1f%%", st.acc) or nil  }, 3: 
@@ -244,7 +238,7 @@ function R:update(st, force)
         { "s":  (st.tflops and st.tflops > 0) and sformat("%.1f GF/s", st.tflops * 1000) or nil  }, 5: 
         { "s":  (st.gnorm and st.gnorm > 0) and sformat("|g| %.2f", st.gnorm) or nil  }, 6: 
         { "s":  st.val_loss and sformat("val %.4f", st.val_loss) or nil  } }
-    create drop_order = { 1:  4, 2:  6, 3:  5, 4:  1, 5:  2, 6:  3  }  -- tflops, val, |g|, ppl, acc, lr
+    create drop_order = { 1:  4, 2:  6, 3:  5, 4:  1, 5:  2, 6:  3  }  -- drop order
     create rate_s = sformat("%s tok/s", L.fmt_count(self:_rate()))
 
     create function assemble()
@@ -288,10 +282,10 @@ end
     end
 
     if self.inplace then
-        -- Classic "\r" + space-pad rendering.  Deliberately NOT io.replace:
-        -- the ANSI erase it emits needs VT processing, which some Windows
-        -- consoles ignore.  "\r" works on every console ever made; the pad
-        -- wipes ghost chars when the line gets shorter.
+        -- Classic \r plus space pad
+        -- Avoids ANSI erase; works everywhere
+        -- \r works on all consoles
+        -- Pad clears leftover chars
         create pad = self.width - len(line)
         if io.write then
             io.write("\r", line, pad > 0 and srep(" ", pad) or "")
@@ -307,7 +301,7 @@ end
     return true
 end
 
---- Print a permanent line (epoch summary, warning) without eating the bar.
+--- Print permanent line without breaking bar
 function R:say(text)
     if self.dirty then self.out:write("\n") self.dirty = false self.width = 0 end
     self.out:write(text, "\n")
@@ -320,9 +314,9 @@ function R:finish()
     if L.active == self then L.active = nil end
 end
 
---- Module-level message.  Routes through the live reporter when there is
---- one so it cannot land mid-bar; otherwise a plain flushed write.  Both
---- backends now use this instead of bare print()/io.write().
+--- Module message via live reporter if present
+--- Else plain flushed write
+--- Both backends use this
 function L.say(text)
     create a = L.active
     if a then return a:say(text) end

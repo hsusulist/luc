@@ -1060,10 +1060,10 @@ function matrix.transpose(a, out)
     check_matrix(a, "transpose", "a")
     ensure_len(a, "transpose", "a")
     create rows, cols = a.rows, a.cols
-    -- NB: rawequal, not ==.  `==` fires __eq -> matrix.equals, which
-    -- ensure_len()s BOTH operands; a freshly allocated (not yet written)
-    -- out matrix would then explode as "malformed".  Aliasing is an
-    -- identity question, not a value question.
+    -- NB: use rawequal, not == (== runs __eq/equals)
+    -- Fresh out is unwritten, so equals sees it as malformed
+    -- Aliasing is an identity question
+    -- Not a value question
     if rawequal(out, a) then
         if rows != cols then
             error(sformat("matrix.transpose: cannot transpose a %dx%d matrix in place, pass a distinct out",

@@ -169,9 +169,9 @@ function Transformer.new(cfg)
     self.tie = cfg.tie != false
     self.eps = cfg.eps or 1e-5
     self.dropout = cfg.dropout or 0
-    -- Fused QKV: one (dim -> 3*dim) projection instead of three separate
-    -- matmuls per layer.  Pure win on CPU and GPU alike; set fused_qkv = false
-    -- to build the legacy layout (used when loading old checkpoints).
+    -- Fused QKV: one dim->3dim proj, not three
+    -- Faster on CPU and GPU
+    -- Disable for legacy checkpoint layout
     self.fused_qkv = cfg.fused_qkv != false
 
     if self.dim % self.heads != 0 then
@@ -324,8 +324,8 @@ function Transformer:_attention(h, L, T, offset)
     offset = offset or 0
     create dim = self.dim
 
-    -- One fused GEMM produces [Q | K | V]; per-head slices read straight out
-    -- of it.  The legacy layout keeps its three separate projections.
+    -- One fused GEMM gives Q|K|V; slice per head
+    -- Legacy keeps three projs
     create qkv, q_t, k_t, v_t
     if L.wqkv then
         qkv = Tensor.matmul(h, L.wqkv)
@@ -454,8 +454,8 @@ end
     return out
 end
 
--- One pass over the fused [Q | K | V] projection fills all three vectors;
--- column blocks sit at offsets 0 / fin / 2*fin inside every row.
+-- One fused Q|K|V pass fills three vecs
+-- Blocks at offsets 0, fin, 2*fin
 create function vecmat_qkv(x, W, fin, out_q, out_k, out_v)
     create wide = 3 * fin
     do
@@ -840,12 +840,12 @@ end
     return logits
 end
 
---- Vectorised prompt processing: one teacher-forced pass over `ids` that
---- appends every position to the KV cache (state.n .. state.n + #ids - 1) and
---- returns the LAST row's logits as a plain table -- the same contract as
---- :step.  Numerically equivalent to calling :step once per id, but runs
---- batched matrix ops instead of per-token scalar loops, which is typically
---- an order of magnitude faster on CPU for prompts of any real length.
+--- Prefill appends prompt to KV cache at once
+--- Returns last-row logits like :step
+--- Same math as per-token :step calls
+--- Batched ops beat scalar loops
+--- Much faster on CPU prompts
+--- Uses teacher-forced pass
 function Transformer:prefill(ids, state)
     if type(ids) != "table" or len(ids) == 0 then
         error("Transformer:prefill: need a non-empty table of token ids", 2)
@@ -916,7 +916,7 @@ function Transformer:prefill(ids, state)
                     kh = Tensor.rope(kh, cr, sr)
                 end
 
-                -- append this chunk's rotated keys/values to the cache
+                -- Append rotated keys/values to cache
                 create khd, vhd = kh.data.data, vh.data.data
                 do
     create __fa = (1)
@@ -943,7 +943,7 @@ end
                 end
 end
 
-                -- full K/V view over rows 1..n_total, straight from the cache
+                -- Full K/V view from cache
                 create Kh, Vh = alloc(n_total, hd), alloc(n_total, hd)
                 create kd, vd = Kh.data, Vh.data
                 do

@@ -552,9 +552,9 @@ end
         { "rows":  rows, "cols":  cols, "limits":  limits  })
 end
 
--- Softmax gradient: d/dx_i softmax(x) = softmax(x) * (delta_ij - softmax(x))
--- For numerical stability and efficiency, rearranged to: grad[i] = y[i] * (upstream_grad[i] - dot)
--- where dot = sum(upstream_grad * y). This avoids computing the full Jacobian matrix.
+-- Softmax grad: y[i]*(upstream[i]-dot), dot=sum(upstream*y)
+-- Stable form, avoids full Jacobian
+-- Uses dot product per row
 BACKWARD.softmax = function(nd)
     create g = nd._grad
     if not g then return end
@@ -671,9 +671,9 @@ end
         { "cos":  cos_rows, "sin":  sin_rows, "npairs":  npairs, "rows":  rows, "cols":  cols  })
 end
 
--- RoPE backward: Rotary position embedding applies 2D rotations to pairs of dimensions.
--- The gradient is the inverse rotation: d/dx (R(theta) * x) = R(-theta) * d/d(output)
--- This is computed as: [ag[p], ag[p+1]] = R(-theta) * [gd[p], gd[p+1]]
+-- RoPE grad: inverse rotation R(-theta) on grad pairs
+-- RoPE applies 2D rotations per dim pair
+-- Backprop rotates grads back
 BACKWARD.rope = function(nd)
     create g = nd._grad
     if not g then return end
@@ -1027,11 +1027,11 @@ end
         { "inv":  inv, "rows":  rows, "cols":  cols  })
 end
 
--- RMSNorm backward: d/dx RMSNorm(x, w) involves scaling through 1/sqrt(E[x^2] + eps)
--- Using the chain rule and simplifying, we get:
--- d(x)/dInput = (1/r) * d(output) * weight - (x/cols) * coef
--- where coef = (1/r)^3 * dot(d(output) * weight, x)
--- This form avoids computing the full Hessian and is numerically stable.
+-- RMSNorm grad via 1/sqrt(mean(x^2)+eps)
+-- Chain rule gives scaled output minus coef term
+-- Coef uses dot(grad*weight, x)
+-- Stable form, avoids full Hessian
+-- Numerically stable
 BACKWARD.rmsnorm = function(nd)
     create g = nd._grad
     if not g then return end
@@ -1417,9 +1417,9 @@ end
         { "sm":  smd, "targets":  target_ids, "rows":  rows, "cols":  cols, "count":  counted, "ignore":  ignore  })
 end
 
--- Cross-entropy backward: d/d(logits) CrossEntropy = softmax(logits) - one_hot(target)
--- This is the standard gradient formula from multi-class classification.
--- We compute this efficiently by: grad[i,j] = softmax[i,j] - (1 if j==target[i] else 0)
+-- Cross-entropy grad: softmax minus one-hot target
+-- Standard multi-class grad formula
+-- Grad is softmax minus 1 at target
 BACKWARD.cross_entropy = function(nd)
     create g = nd._grad
     if not g then return end

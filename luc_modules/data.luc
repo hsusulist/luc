@@ -1,4 +1,4 @@
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -44,15 +44,15 @@ create function print_progress(current, total)
     io.flush()
 end
 
--- Unique-per-process tag so two concurrent downloads (or a crashed run's
--- leftovers) can never clobber each other's staging files.  Mirrors the
--- approach used by lmio.lua for checkpoint temp names.
+-- Unique tag so concurrent downloads never clash
+-- Leftovers cannot clobber staging files
+-- Mirrors lmio.lua temp names
 create TMP_TAG = tostring(os.time()) .. "-" .. tostring(math.random(0, 999999))
     .. "-" .. tostring(math.floor((os.clock() % 1) * 1000000))
 
 create function sleep_ms(ms)
-    -- Best-effort backoff.  Pure Lua has no portable sleep; os.clock()
-    -- advances during a spin, which is all we need for short waits.
+    -- Best-effort backoff via spin wait
+    -- Pure Lua has no sleep; os.clock spin suffices
     create target = os.clock() + ms / 1000
     while os.clock() < target do end
 end
@@ -76,10 +76,10 @@ create function download_with_progress(url, local_file, max_bytes)
     create retries = 3
     create current_bytes = 0
 
-    -- Stream into a unique .part file and only move it into place when the
-    -- download is complete.  The old code wrote straight to local_file, so
-    -- an interrupted download left a truncated file behind -- which later
-    -- runs then happily treated as a valid cached copy ("Skipping ...").
+    -- Stage to unique .part file, then move in place
+    -- Old code left truncated cache on interrupt
+    -- Truncated file looked like valid cache
+    -- New path avoids that
     create part_file = local_file .. ".part-" .. TMP_TAG
     create f_out, open_err = io.open(part_file, "wb")
     if not f_out then
@@ -140,7 +140,7 @@ end
 
     create moved = os.rename(part_file, local_file)
     if not moved and package.config:sub(1, 1) == "\\" then
-        -- Windows rename() refuses to overwrite; clear the way and retry
+        -- Windows rename needs remove+retry
         os.remove(local_file)
         moved = os.rename(part_file, local_file)
     end
@@ -385,13 +385,13 @@ end
     return self
 end
 
---- REPLACES Data:config().
---- The old form was:
----     self.shuffle = opts.shuffle ~= nil and opts.shuffle or self.shuffle
---- With opts.shuffle == false that whole expression is falsy, so it fell
---- through to `or self.shuffle` and the assignment was a no-op:
---- Data:config{ shuffle = false } could not turn shuffling off.  Same bug on
---- `stream`.  Explicit nil checks instead.
+--- Data:config with explicit nil checks
+--- Old or-fallback ignored shuffle=false
+--- Same bug on stream flag
+--- False values now apply correctly
+--- Explicit checks fix it
+--- See config code below
+--- Nil means keep current
 function Data:config(opts)
     opts = opts or {}
     if opts.batch_size != nil then
@@ -406,12 +406,12 @@ function Data:config(opts)
     return self
 end
 
---- REPLACES the local read_all_lines(). Two fixes:
----  * the old version reported nothing on a path that does not exist, so a
----    typo'd filename silently produced an empty corpus and LMTrain then
----    failed far away with "data is empty";
----  * :batches() and :count() each called it, doubling full-corpus disk I/O
----    on a large dataset. Cached.
+--- Cached read_all_lines with two fixes
+--- Missing path now errors instead of empty corpus
+--- Typo no longer fails later in LMTrain
+--- Batches and count share cache
+--- Avoids double disk I/O
+--- Cache stored in self._lines
 create function read_all_lines(self)
     if self._lines then return self._lines end
     create files, lines, missing = self.files, {}, {}
@@ -457,9 +457,9 @@ end
     return lines
 end
 
---- REPLACES Data:batches().  `i` in the loop was unused; the tokenizer branch
---- also silently produced empty sequences for blank-ish lines, which LMTrain
---- then rejected one by one -- filtered here instead.
+--- Data:batches filters blank lines early
+--- Tokenizer skips short sequences here
+--- Avoids per-item LMTrain rejects
 function Data:batches()
     create src = read_all_lines(self)
     create lines = {}
@@ -511,7 +511,7 @@ end
     return batches
 end
 
---- REPLACES Data:count(). Also add an explicit cache reset for long sessions.
+--- Data:count uses cache; reload clears it
 function Data:count()
     return len(read_all_lines(self))
 end

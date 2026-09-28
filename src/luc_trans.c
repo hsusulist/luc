@@ -1,99 +1,19 @@
-/* luc_trans.c - LUC 0.1 native code translator: x86-64 JIT + AOT PE32+ writer.
- *
- * Windows x64 only for the native parts; compiles (as no-ops that request
- * interpretation) everywhere else, so the tree still builds on POSIX.
- *
- *   cl  /c /O2 luc_trans.c            (MSVC)
- *   gcc -c -O2 -std=c99 luc_trans.c   (MinGW-w64)
- *
- * -----------------------------------------------------------------------
- * luc_trans.h  (copy this block into luc_trans.h if you want a header)
- * -----------------------------------------------------------------------
- *   #define LUC_JIT_FALLBACK (-1)
- *   int  luc_jit_run(Closure *cl);
- *   int  luc_jit_call(LucState *L,int func,int nargs,int nres);
- *   void luc_jit_shutdown(void);
- *   int  luc_aot_build(const char *src,int srclen,const char *outpath);
- *   int  luc_aot_embedded(char **psrc,int *plen);
- * -----------------------------------------------------------------------
- *
- * DESIGN
- *
- * Translation unit is one Proto.  A Proto is translated only if every
- * instruction is in the whitelist below.  Numeric ops cannot touch the
- * heap; GETTABLE/SETTABLE on lists read/write array elements inline under
- * guards.  Nothing translated ever allocates, calls (except the leaf
- * MOD/POW helpers), or raises: that is what makes bail-out sound.  Numeric
- * code writes nothing observable until RETURN; table stores write
- * prefix-identical values, so at any guard failure we return -1 and the
- * caller re-runs the whole call through the interpreter to bit-identical
- * state.  No mid-function deoptimisation, no shadow interpreter state, no
- * GC safepoints (nothing allocates, so the collector can never run
- * mid-function and unrooted Table* values in registers/frame stay valid).
- *
- *   whitelist: MOVE LOADK LOADNIL LOADBOOL ADD SUB MUL DIV MOD POW
- *              UNM NOT EQ NE LT LE GT GE GETTABLE SETTABLE
- *              JMP JMPIF JMPIFNOT FORPREP FORLOOP CLOSE(no-op) RETURN(0/1)
- *
- * Kinds: K_INT (integral double) < K_NUM, K_BOOL (0.0/1.0 double), K_NIL
- * (no bits, never read), K_LIST (raw Table* bits in the 64-bit home).
- * Every kind is created by a guard (param checks, element-type checks), so
- * downstream constant folds (branch on list = truthy, not list = false,
- * x == nil = false) can never observe a mismatched value: a mismatch bails
- * first.  K_INT is created by integral LOADK constants, by closure of
- * +,-,*,unm over K_INT (integral doubles are closed under those; overflow
- * gives +-Inf, which fails the index range check and bails), and by
- * FORPREP when the step is K_INT and a runtime "step > 0" guard holds.
- *
- * Native ABI of translated code (Windows x64):
- *
- *   int fn(const Value *args (RCX), int nargs (EDX), Value *out (R8));
- *
- *   returns  -1  -> guard failed / step==0, nothing written, interpret
- *             n  -> n results (0 or 1) written to out[]
- *
- * Args are read through type guards; results are written as boxed Values by
- * the native code, but only into the caller-supplied out[] buffer - never
- * into LucState.stack.  The C wrapper does the LucState.stack stores, so
- * ensure_stack() reallocation can never be observed by native code and no
- * unrooted Obj* is ever held across anything.  out[] only ever receives
- * number / boolean / nil, so it needs no GC rooting either.
- *
- * Registers: RBX=args, RSI=out, R12D=nargs, RAX/RCX/RDX/R8 + XMM0-4 scratch.
- * Frame (RSP 16-aligned after the prologue, 16-aligned at every CALL):
- *   [0..31]                      shadow space
- *   [32 .. 32+16*nsave)          saved callee-saved XMMs we pin
- *   [slotoff + 8*i]              home of register i when it is not pinned
- *   [dscoff + 24*d]              list descriptor d: arr(8) alen(4) stok(4)
- * All memory homes and descriptors are zeroed in the prologue so an
- * unreachable read is deterministic rather than undefined; frames larger
- * than a page are stack-probed before RSP moves.
- *
- * Register homing (generalises the old all-or-nothing pinned mode): each
- * slot has exactly ONE home, either an XMM or a frame slot - never both.
- * Homes are handed to the registers with the highest loop-depth-weighted
- * use count, so a maxstack=23 proto still runs its innermost loop entirely
- * out of XMM registers ("mixed-pin").  XMM0-4 are always scratch; XMM5 is
- * only handed out when the proto emits no CALL (MOD/POW are the only ones);
- * pinned XMM6+ are saved/restored in the prologue/epilogue.
- *
- * List descriptors (the guard-hoisting mechanism): the first time a
- * register is proven to hold a list (parameter guard, GETTABLE returning a
- * list, MOVE from a list) we cache its arr pointer, alen, and a "stok" flag
- * (alen>0 and the tail element is non-nil) in the frame.  That is legal for
- * the whole native execution because (i) nothing we emit allocates or
- * calls into the runtime, so no other agent can touch the table, and (ii)
- * our own inlined stores only ever write in-bounds LT_NUM values, which
- * changes neither arr nor alen and can only turn a false stok true.  So
- * the base-is-list check, the arr/alen loads and the tail-nil check (which
- * is what makes an in-bounds store exactly tab_set's in-bounds branch, its
- * trailing trim being a proven no-op) all happen once per definition -
- * i.e. in the loop preheader for a loop-invariant base - and the inner
- * loop keeps only what actually varies: the key's exactness/range check,
- * and for reads the per-element type check.  A one-entry (base,key) cache
- * additionally lets "Ci[j] = Ci[j] + x" reuse the scaled, bounds-checked
- * index across the read/modify/write triple.
- */
+/* JIT + AOT writer (Windows x64; no-op elsewhere) */
+/* build: cl /c /O2 luc_trans.c or gcc -c -O2 -std=c99 luc_trans.c */
+/* API: LUC_JIT_FALLBACK, luc_jit_run/call/shutdown, luc_aot_build/embedded */
+/* DESIGN: one Proto per unit; whitelist-only; numeric ops heap-free; */
+/*  list GET/SETTABLE inlined under guards; no alloc/call (except MOD/POW) or raise, */
+/*  so bail returns -1 for bit-identical interpreter re-run, no deopt/GC roots. */
+/* whitelist: MOVE LOADK LOADNIL LOADBOOL ADD SUB MUL DIV MOD POW UNM NOT */
+/*  EQ NE LT LE GT GE GETTABLE SETTABLE JMP JMPIF JMPIFNOT FORPREP FORLOOP CLOSE(no-op) RETURN(0/1) */
+/* Kinds: K_INT<K_NUM, K_BOOL, K_NIL, K_LIST; guard-created so folds bail first. */
+/*  K_INT from integral LOADK, closed +,-,*,unm (overflow bails), FORPREP step guard. */
+/* ABI: int fn(args RCX, nargs EDX, out R8); -1=bail, n=results in out[]. */
+/*  out[] only num/bool/nil (no GC root); C wrapper stores to LucState.stack. */
+/* Frame: RBX=args RSI=out R12D=nargs; shadow+XMM saves+slot homes+list descs, zeroed. */
+/* Homes: one XMM or frame slot per reg, hot loop regs pinned (mixed-pin); XMM0-4 scratch, */
+/*  XMM5 only if no CALL (MOD/POW); XMM6+ saved/restored; large frames stack-probed. */
+/* Descs: cache arr/alen/stok per list def; safe (no alloc/call); hoists checks to preheader. */
 
 #include "luc.h"
 #include <stddef.h>
@@ -106,7 +26,7 @@ void luc_jit_shutdown(void);
 int  luc_aot_build(const char *src,int srclen,const char *outpath);
 int  luc_aot_embedded(char **psrc,int *plen);
 
-/* Value layout is derived, never assumed. */
+/* Value layout derived, never assumed. */
 #define VSZ   ((int)sizeof(Value))
 #define VOFT  ((int)offsetof(Value,t))
 #define VOFU  ((int)offsetof(Value,u))
@@ -116,9 +36,7 @@ typedef char luc_trans_value_assert[(sizeof(Value)==16 && offsetof(Value,u)==8)?
 
 #include <windows.h>
 
-/* ===================================================================== */
-/* 1. byte buffer                                                         */
-/* ===================================================================== */
+/* 1. byte buffer */
 
 typedef struct { unsigned char *p; int n, cap, bad; } Buf;
 
@@ -157,24 +75,22 @@ static void patch32(Buf *b,int at,int val){
 }
 static void patch_rel(Buf *b,int at,int target){ patch32(b,at,target-(at+4)); }
 
-/* ===================================================================== */
-/* 2. x86-64 emitter                                                      */
-/* ===================================================================== */
+/* 2. x86-64 emitter */
 
 enum { R_RAX=0,R_RCX=1,R_RDX=2,R_RBX=3,R_RSP=4,R_RBP=5,R_RSI=6,R_RDI=7 };
 /* condition codes */
 enum { CC_B=2,CC_AE=3,CC_E=4,CC_NE=5,CC_BE=6,CC_A=7,CC_S=8,CC_P=0xA,CC_NP=0xB,
        CC_L=0xC,CC_GE=0xD,CC_LE=0xE,CC_G=0xF };
 
-/* modrm for [rsp+disp32] : mod=10 rm=100 + sib 0x24 */
+/* modrm [rsp+disp32]: mod=10 rm=100+sib 0x24 */
 static void mrm_rsp(Buf *b,int reg,int disp){
     e1(b,0x80|((reg&7)<<3)|4); e1(b,0x24); e4(b,(unsigned)disp);
 }
-/* modrm for [base+disp32], base must be rbx/rsi/rcx/rdx/rax (not rsp/rbp) */
+/* modrm [base+disp32], base=rbx/rsi/rcx/rdx/rax (not rsp/rbp) */
 static void mrm_b(Buf *b,int reg,int base,int disp){
     e1(b,0x80|((reg&7)<<3)|(base&7)); e4(b,(unsigned)disp);
 }
-/* modrm for [rip+disp32] : mod=00 rm=101 */
+/* modrm [rip+disp32]: mod=00 rm=101 */
 static void mrm_rip(Buf *b,int reg,int disp){
     e1(b,0x00|((reg&7)<<3)|5); e4(b,(unsigned)disp);
 }
@@ -204,7 +120,7 @@ static void emit_mov_r32_imm(Buf *b,int r,unsigned v){
 static void emit_xor_eax(Buf *b){ e1(b,0x31); mrm_rr(b,R_RAX,R_RAX); }
 static void emit_ret(Buf *b){ e1(b,0xC3); }
 
-/* ---- generic [rsp+disp32] moves (frame homes + descriptors) ---- */
+/* [rsp+disp32] moves (frame homes+descs) */
 static void emit_ld_r64_rsp(Buf *b,int r,int d){ e1(b,0x48|((r>=8)?4:0)); e1(b,0x8B); mrm_rsp(b,r,d); }
 static void emit_st_r64_rsp(Buf *b,int r,int d){ e1(b,0x48|((r>=8)?4:0)); e1(b,0x89); mrm_rsp(b,r,d); }
 static void emit_ld_r32_rsp(Buf *b,int r,int d){ if(r>=8) e1(b,0x44); e1(b,0x8B); mrm_rsp(b,r,d); }
@@ -212,9 +128,9 @@ static void emit_st_r32_rsp(Buf *b,int r,int d){ if(r>=8) e1(b,0x44); e1(b,0x89)
 static void emit_mov_m32_imm_rsp(Buf *b,int d,int imm){ e1(b,0xC7); mrm_rsp(b,0,d); e4(b,(unsigned)imm); }
 static void emit_cmp_m32_imm_rsp(Buf *b,int d,int imm){ e1(b,0x81); mrm_rsp(b,7,d); e4(b,(unsigned)imm); }
 
-/* mov rax,[base+d] (base is rbx/rsi, 64-bit load for table pointers) */
+/* mov rax,[base+d] (rbx/rsi table ptr load) */
 static void emit_ld_rax_mb(Buf *b,int base,int d){ e1(b,0x48); e1(b,0x8B); mrm_b(b,R_RAX,base,d); }
-/* movq r64,xmmX / movq xmmX,r64 (raw 8 bytes, never interpreted as double) */
+/* movq r64<->xmmX (raw 8 bytes) */
 static void emit_movq_r_x(Buf *b,int r,int x){
     e1(b,0x66); e1(b,0x48|((r>=8)?1:0)|((x>=8)?4:0)); e1(b,0x0F); e1(b,0x7E); mrm_rr(b,x,r);
 }
@@ -222,9 +138,7 @@ static void emit_movq_x_r(Buf *b,int x,int r){
     e1(b,0x66); e1(b,0x48|((x>=8)?4:0)|((r>=8)?1:0)); e1(b,0x0F); e1(b,0x6E); mrm_rr(b,x,r);
 }
 
-/* SSE: prefix + [REX] + 0F + opcode. REX.R extends the xmm field so
- * XMM8-15 work; when every reg is <8 no REX byte is emitted and the
- * encoding is byte-identical to the legacy path. */
+/* SSE: REX.R covers XMM8-15; no REX if all regs <8. */
 static void sse_rsp(Buf *b,int pfx,int opc,int x,int d){
     if(pfx) e1(b,pfx);
     if(x>=8) e1(b,0x44);
@@ -263,8 +177,7 @@ static void emit_cvtsi2sd_x_r32(Buf *b,int x,int r){
     { int rex=((x>=8)?4:0)|((r>=8)?1:0); if(rex) e1(b,0x40|rex); }
     e1(b,0x0F); e1(b,0x2A); mrm_rr(b,x,r);
 }
-/* cvttsd2si r32,xmmX  (32-bit form: out-of-range/NaN yields INT_MIN, which
- * the sign test below rejects, so no 64-bit key can slip through) */
+/* cvttsd2si r32,xmmX: OOR/NaN gives INT_MIN, rejected below. */
 static void emit_cvttsd2si_r32_x(Buf *b,int r,int x){
     e1(b,0xF2);
     { int rex=((r>=8)?4:0)|((x>=8)?1:0); if(rex) e1(b,0x40|rex); }
@@ -274,7 +187,7 @@ static void emit_cvttsd2si_r32_x(Buf *b,int r,int x){
 static void emit_cvttsd2si_r32_rsp(Buf *b,int r,int d){
     e1(b,0xF2); if(r>=8) e1(b,0x44); e1(b,0x0F); e1(b,0x2C); mrm_rsp(b,r,d);
 }
-/* movaps [rsp+d],xmmX / xmmX,[rsp+d] (d keeps 16B alignment; XMM saves) */
+/* movaps [rsp+d]<->xmmX (16B aligned XMM saves) */
 static void emit_movaps_st_rsp(Buf *b,int x,int d){
     if(x>=8) e1(b,0x44);
     e1(b,0x0F); e1(b,0x29); mrm_rsp(b,x,d);
@@ -296,25 +209,25 @@ static int emit_jmp (Buf *b){ e1(b,0xE9); int at=b->n; e4(b,0); return at; }
 static void emit_cmp_m32_imm(Buf *b,int base,int d,int imm){
     e1(b,0x81); mrm_b(b,7,base,d); e4(b,(unsigned)imm);
 }
-/* cmp r32, imm32 (r may be r8-r15) */
+/* cmp r32,imm32 (r8-r15 ok) */
 static void emit_cmp_r32_imm(Buf *b,int r,int imm){
     if(r>=8) e1(b,0x41);
     e1(b,0x81); mrm_rr(b,7,r); e4(b,(unsigned)imm);
 }
-/* cmp r64,r64 : cmp a,bb */
+/* cmp r64,r64 */
 static void emit_cmp_rr64(Buf *b,int a,int bb){
     e1(b,0x48|((bb>=8)?4:0)|((a>=8)?1:0)); e1(b,0x39); mrm_rr(b,bb,a);
 }
-/* mov dword [rsi+d], imm32 ; mov [rsi+d], eax */
+/* mov [rsi+d],imm32/eax */
 static void emit_mov_m32_imm_rsi(Buf *b,int d,int imm){
     e1(b,0xC7); mrm_b(b,0,R_RSI,d); e4(b,(unsigned)imm);
 }
 static void emit_mov_m32_eax_rsi(Buf *b,int d){ e1(b,0x89); mrm_b(b,R_RAX,R_RSI,d); }
 
-/* ---- table-indexing primitives ---- */
+/* table-indexing helpers */
 #define TAB_ARR_OFF  ((int)offsetof(Table,arr))
 #define TAB_ALEN_OFF ((int)offsetof(Table,alen))
-#define SIB_DX_CX 0x0A   /* scale0, index RCX, base RDX */
+#define SIB_DX_CX 0x0A   /* scale0 RCX index, RDX base */
 static void emit_ld_r64_raxoff(Buf *b,int r,int off){  /* mov r64,[rax+off] */
     e1(b,0x48|((r>=8)?4:0)); e1(b,0x8B); mrm_b(b,r,R_RAX,off);
 }
@@ -347,29 +260,25 @@ static void emit_movsd_st_sib8(Buf *b,int x){  /* movsd [rdx+rcx+8],xmmX */
 static void emit_cmp_eax_imm32(Buf *b,int imm){ e1(b,0x3D); e4(b,(unsigned)imm); }  /* cmp eax,imm32 */
 static void emit_cmp_r8d_0(Buf *b){ e1(b,0x41); e1(b,0x83); e1(b,0xF8); e1(b,0); }  /* cmp r8d,0 */
 
-/* call an absolute host address, 32B shadow already reserved by the frame */
+/* call absolute host addr; 32B shadow already reserved. */
 static void emit_call_abs(Buf *b,void *fnp){
     unsigned long long a; memcpy(&a,&fnp,sizeof a);
     emit_mov_r64_imm(b,R_RAX,a);
     e1(b,0xFF); mrm_rr(b,2,R_RAX);            /* call rax */
 }
 
-/* ===================================================================== */
-/* 3. helpers the fast path may call (MOD / POW only)                     */
-/* ===================================================================== */
+/* 3. MOD/POW helpers only */
 
-/* Byte-for-byte the interpreter's semantics: x - floor(x/y)*y */
+/* interpreter-compatible mod: x-floor(x/y)*y */
 static double jit_mod(double x,double y){ return x-floor(x/y)*y; }
 static double jit_pow(double x,double y){ return pow(x,y); }
 
-/* ===================================================================== */
-/* 4. abstract kinds + translation-time analysis                          */
-/* ===================================================================== */
+/* 4. kinds + analysis */
 
 enum { K_NONE=0, K_INT, K_NUM, K_BOOL, K_NIL, K_LIST, K_BAD };
 #define KISNUM(k) ((k)==K_INT||(k)==K_NUM)
 
-/* EQ/NE lowering modes */
+/* EQ/NE modes */
 enum { CM_NUM=0, CM_PTR, CM_FALSE, CM_TRUE };
 
 typedef struct {
@@ -380,15 +289,15 @@ typedef struct {
     Proto *p;
     int    nregs, nslots;
     int    framesz, slotoff, dscoff, nsave, npin, nused;
-    int    pic;                 /* 1 = no absolute host addresses allowed  */
+    int    pic;                 /* 1=no absolute addrs (PIC) */
     OpInfo *info;
     unsigned char *istarget;
-    unsigned char **bs;         /* block-entry kind vectors (targets only) */
-    unsigned char *pinit;       /* initial kind per parameter (K_NUM/LIST) */
+    unsigned char **bs;         /* block-entry kinds (targets only) */
+    unsigned char *pinit;       /* param kinds (K_NUM/LIST) */
     unsigned char *asbase,*asnum,*askey,*needdsc;
-    int   *dsc, ndsc;           /* per-register descriptor index or -1     */
-    int   *home;                /* per-register XMM home or -1 (frame)     */
-    int    savoff[16];          /* per physical XMM: save offset or -1     */
+    int   *dsc, ndsc;           /* desc index or -1 */
+    int   *home;                /* XMM home or -1 (frame) */
+    int    savoff[16];          /* XMM save offset or -1 */
     int   *depth;
     int   *wl, nwl;
     char   err[160];
@@ -398,7 +307,7 @@ static int ana_fail(Ana *a,const char *what,int pc){
     if(!a->err[0]) snprintf(a->err,sizeof a->err,"%s at pc %d",what,pc);
     return 0;
 }
-/* lattice: NONE -> {INT,NUM,BOOL,NIL,LIST} -> NUM (from INT) -> BAD */
+/* kind lattice: NONE->INT/NUM/BOOL/NIL/LIST->NUM/BAD */
 static int kmerge(unsigned char *dst,const unsigned char *src,int n){
     int changed=0;
     for(int i=0;i<n;i++){
@@ -444,11 +353,10 @@ static int is_supported_op(int op){
         default: return 0;
     }
 }
-/* an integral, finite double: cvttsd2si round-trips it or overflows into
- * INT_MIN, which the index guards reject */
+/* integral finite double: round-trips or INT_MIN (rejected). */
 static int const_is_int(double d){
     if(!(d==d)) return 0;                       /* NaN */
-    if(!(d>=-1.0e300 && d<=1.0e300)) return 0;  /* +-Inf and absurd magnitudes */
+    if(!(d>=-1.0e300 && d<=1.0e300)) return 0;  /* +-Inf/OOR */
     return d==floor(d);
 }
 static void mark_list(Ana *a,unsigned char *cur,int r){
@@ -456,7 +364,7 @@ static void mark_list(Ana *a,unsigned char *cur,int r){
     if(r<a->nregs) a->needdsc[r]=1;
 }
 
-/* walk one straight-line region starting at pc, updating info[] */
+/* walk straight-line region, update info[] */
 static int ana_region(Ana *a,int startpc){
     Proto *p=a->p;
     int n=a->nregs;
@@ -493,8 +401,7 @@ static int ana_region(Ana *a,int startpc){
                 break; }
             case OP_LOADNIL:  cur[A]=K_NIL;  break;
             case OP_LOADBOOL:
-                /* LUC never emits the Lua "skip next" form; refuse it rather
-                   than silently dropping a control-flow edge. */
+                /* LUC has no LOADBOOL skip; refuse it (keeps CFG sound). */
                 if(C!=0){ ok=ana_fail(a,"LOADBOOL with skip",pc); break; }
                 cur[A]=K_BOOL;
                 break;
@@ -503,8 +410,7 @@ static int ana_region(Ana *a,int startpc){
                 if((op==OP_MOD||op==OP_POW) && a->pic){ ok=ana_fail(a,"MOD/POW needs a runtime call",pc); break; }
                 if(!KISNUM(cur[B])||!KISNUM(cur[C])){ ok=ana_fail(a,"non-numeric arithmetic",pc); break; }
                 in->kb=cur[B]; in->kc=cur[C];
-                /* integral doubles are closed under + - * ; overflow gives
-                   +-Inf, which fails the index range guard and bails */
+                /* +,-,* closed on ints; overflow bails at index guard. */
                 if((op==OP_ADD||op==OP_SUB||op==OP_MUL)&&cur[B]==K_INT&&cur[C]==K_INT) cur[A]=K_INT;
                 else cur[A]=K_NUM;
                 break;
@@ -521,13 +427,7 @@ static int ana_region(Ana *a,int startpc){
                 in->kb=cur[B]; in->kc=cur[C]; cur[A]=K_BOOL;
                 break;
             case OP_EQ: case OP_NE: {
-                /* class of a kind: 0 num, 1 bool, 2 nil, 3 list.  Different
-                   classes are rawequal-unequal by type, so EQ folds to false
-                   with no fallback (this is the common `x == nil` case).
-                   Same class: numbers/bools compare as doubles (our bools
-                   are exactly 0.0/1.0), lists compare as pointers, nil==nil
-                   is a constant.  Sound only because every kind was created
-                   by a runtime guard. */
+                /* EQ/NE by kind class; guard-created so folds bail first. */
                 unsigned char kb=cur[B],kc=cur[C];
                 if(kb==K_NONE||kb==K_BAD||kc==K_NONE||kc==K_BAD){ ok=ana_fail(a,"comparison of untyped reg",pc); break; }
                 int cb = KISNUM(kb)?0 : kb==K_BOOL?1 : kb==K_NIL?2 : 3;
@@ -550,12 +450,12 @@ static int ana_region(Ana *a,int startpc){
                 in->ka=K_LIST; in->kb=cur[B]; in->kc=cur[C]; in->iguard=(cur[B]==K_INT);
                 break;
             case OP_ADDEQ: case OP_SUBEQ: case OP_MULEQ: case OP_DIVEQ:
-                /* read-modify-write, no kind change: base stays K_LIST */
+                /* read-modify-write; base stays K_LIST */
                 if(cur[A]!=K_LIST||!KISNUM(cur[B])||!KISNUM(cur[C])){ ok=ana_fail(a,"compeq needs list+int+num",pc); break; }
-                a->needdsc[A]=1;   /* A<nregs verified by the frame check above */
+                a->needdsc[A]=1;   /* A checked above */
                 in->ka=K_LIST; in->kb=cur[B]; in->kc=cur[C]; in->iguard=(cur[B]==K_INT);
                 break;
-            case OP_CLOSE: break;   /* no upvalues can exist in a whitelisted proto */
+            case OP_CLOSE: break;   /* no upvalues in whitelisted proto */
             case OP_JMP:
                 ok=succ_to(a,pc+1+GET_sBx(ins),cur);
                 goto region_done;
@@ -573,7 +473,7 @@ static int ana_region(Ana *a,int startpc){
             case OP_FORPREP: {
                 if(A+3>=n){ ok=ana_fail(a,"loop registers out of frame",pc); break; }
                 if(!KISNUM(cur[A])||!KISNUM(cur[A+1])){ ok=ana_fail(a,"non-numeric loop bounds",pc); break; }
-                /* -st, tg-st and 0 are integral when st and tg are */
+                /* integral if st/tg integral */
                 unsigned char kk=(cur[A]==K_INT&&cur[A+1]==K_INT)?K_INT:K_NUM;
                 cur[A]=cur[A+1]=cur[A+2]=cur[A+3]=kk;
                 ok=succ_to(a,pc+1+GET_sBx(ins),cur);
@@ -634,11 +534,9 @@ static int ana_run(Ana *a){
     return 1;
 }
 
-/* ===================================================================== */
-/* 5. code generation                                                     */
-/* ===================================================================== */
+/* 5. codegen */
 
-#define DSCSZ 24                     /* arr(8) alen(4) stok(4) + padding */
+#define DSCSZ 24                     /* arr(8) alen(4) stok(4)+pad */
 
 typedef struct { int at, topc; } Fix;
 
@@ -649,7 +547,7 @@ typedef struct {
     Fix  *fix; int nfix, fixcap;
     int  *bailfix, nbail, bailcap;
     int  *retfix, nret, retcap;
-    int   kcv, kcr;      /* EDI caches the validated int key of register kcr */
+    int   kcv, kcr;      /* EDI caches validated int key */
 } Gen;
 
 static int gen_addfix(Gen *g,int at,int topc){
@@ -684,7 +582,7 @@ static void emit_cmp_r32_rsp(Buf *b,int r,int d){
     if(r>=8) e1(b,0x44); e1(b,0x3B); mrm_rsp(b,r,d);
 }
 
-/* ---- one home per slot: XMM(home[s]) or frame [rsp+slotoff+8*s] ---- */
+/* one home per slot: XMM(home[s]) or frame slot */
 static void g_ldx(Gen *g,int x,int s){
     int h=g->a->home[s];
     if(h>=0) sse_rr(&g->b,0x66,SSE_MOVAPD,x,h);
@@ -705,12 +603,12 @@ static void g_cmp0(Gen *g,int s){
     if(h>=0) sse_rr(&g->b,0x66,SSE_COMISD,0,h);
     else sse_rsp(&g->b,0x66,SSE_COMISD,0,SLOTO(g,s));
 }
-static void g_ldptr(Gen *g,int s){          /* RAX = raw bits of slot s */
+static void g_ldptr(Gen *g,int s){          /* RAX=raw bits */
     int h=g->a->home[s];
     if(h>=0) emit_movq_r_x(&g->b,R_RAX,h);
     else emit_ld_r64_rsp(&g->b,R_RAX,SLOTO(g,s));
 }
-static void g_stptr(Gen *g,int s){          /* slot s = RAX (raw bits) */
+static void g_stptr(Gen *g,int s){          /* slot=RAX raw bits */
     int h=g->a->home[s];
     if(h>=0) emit_movq_x_r(&g->b,h,R_RAX);
     else emit_st_r64_rsp(&g->b,R_RAX,SLOTO(g,s));
@@ -722,13 +620,7 @@ static void g_const(Gen *g,int s,double d){
 }
 static void g_kill(Gen *g,int r){ if(g->kcv&&g->kcr==r) g->kcv=0; }
 
-/* Build the list descriptor of register r from the Table* in RAX.
- * Clobbers RAX/RCX/RDX/R8.  stok = (alen>0 && arr[alen-1].t != LT_NIL):
- * the tail-non-nil precondition that makes an in-bounds numeric store
- * exactly tab_set's in-bounds branch (its trailing trim a proven no-op).
- * Legal to cache for the whole call: nothing we emit allocates or calls
- * into the runtime, and our own stores change neither arr nor alen and
- * can only turn stok from false to true. */
+/* Build list desc from Table* in RAX; safe to cache (no alloc/call). */
 static void g_dscbuild(Gen *g,int r){
     Buf *b=&g->b; int d=DSCO(g,r);
     emit_ld_r64_raxoff(b,R_RDX,TAB_ARR_OFF);
@@ -739,38 +631,32 @@ static void g_dscbuild(Gen *g,int r){
     emit_cmp_r8d_0(b);
     int j1=emit_jcc(b,CC_LE);
     emit_mov_ecx_r8d(b); emit_dec_ecx(b); emit_shl_rcx(b,4);
-    emit_ld_r32_sib(b,R_RAX);               /* EAX: Table* is dead here */
+    emit_ld_r32_sib(b,R_RAX);               /* EAX=arr[i].t */
     emit_cmp_eax_imm32(b,LT_NIL);
     int j2=emit_jcc(b,CC_E);
     emit_mov_m32_imm_rsp(b,d+12,1);
     patch_rel(b,j1,b->n); patch_rel(b,j2,b->n);
 }
 
-/* ECX = the key of slot s, guarded exact / non-negative int32.
- * cvttsd2si's 32-bit form yields INT_MIN for NaN, +-Inf and anything
- * outside int32, all rejected by the sign test, so keys >= 2^31 bail
- * instead of wrapping.  EDI caches the last validated key across the
- * read/modify/write triple of `Ci[j] = Ci[j] + ...` (EDI is callee-saved,
- * so even the MOD/POW helper calls preserve it). */
+/* ECX=guarded int key; EDI caches it across read/modify/write. */
 static int g_keyint(Gen *g,int s,int iguard){
     Buf *b=&g->b;
     if(g->kcv && g->kcr==s){ emit_mov_rr32(b,R_RCX,R_RDI); return 1; }
     int h=g->a->home[s], xk;
     if(h>=0) xk=h; else { g_ldx(g,0,s); xk=0; }
     emit_cvttsd2si_r32_x(b,R_RCX,xk);
-    if(!iguard){                              /* K_INT already proves this */
+    if(!iguard){                              /* K_INT proves exactness */
         emit_cvtsi2sd_x_r32(b,1,R_RCX);
         sse_rr(b,0x66,SSE_COMISD,xk,1);
         BAILCC(CC_P); BAILCC(CC_NE);
     }
-    emit_test_ecx(b); BAILCC(CC_S);           /* negative -> interpreter wrap */
+    emit_test_ecx(b); BAILCC(CC_S);           /* negative bails */
     emit_mov_rr32(b,R_RDI,R_RCX);
     g->kcv=1; g->kcr=s;
     return 1;
 }
 
-/* dest = base[key] under the hoisted descriptor: only the key check, the
- * bounds check and the element-type check remain per element. */
+/* dest=base[key] via hoisted desc; per-elem key/bounds/type checks. */
 static int gen_gettable(Gen *g,int A,int B,int C,int kr,int iguard){
     Buf *b=&g->b; Ana *a=g->a;
     if(a->dsc[B]<0) return 0;
@@ -779,7 +665,7 @@ static int gen_gettable(Gen *g,int A,int B,int C,int kr,int iguard){
     emit_cmp_r32_rsp(b,R_RCX,d+8); BAILCC(CC_AE);
     emit_ld_r64_rsp(b,R_RDX,d);
     emit_shl_rcx(b,4);
-    emit_ld_r32_sib(b,R_RAX);                 /* EAX = arr[i].t (dead reg) */
+    emit_ld_r32_sib(b,R_RAX);                 /* EAX=arr[i].t */
     if(kr==K_NUM){
         emit_cmp_eax_imm32(b,LT_NUM); BAILCC(CC_NE);
         emit_movsd_ld_sib8(b,0);
@@ -794,8 +680,7 @@ static int gen_gettable(Gen *g,int A,int B,int C,int kr,int iguard){
     return !b->bad;
 }
 
-/* base[key] = num, with the base-is-list / arr / alen / tail-non-nil
- * guards already in the descriptor (i.e. in the loop preheader). */
+/* base[key]=num; list/arr/alen/tail guards hoisted to preheader. */
 static int gen_settable(Gen *g,int A,int B,int C,int iguard){
     Buf *b=&g->b; Ana *a=g->a;
     if(a->dsc[A]<0) return 0;
@@ -811,10 +696,7 @@ static int gen_settable(Gen *g,int A,int B,int C,int iguard){
     return !b->bad;
 }
 
-/* base[key] <op>= num: read-modify-write under the hoisted descriptor.
- * One index computation serves the read and the write (vs GET+arith+SET);
- * old and new are both guarded numeric, so the op is pure XMM. XMM0 holds
- * old, XMM1 the value; EDI key cache untouched (RCX still the key after). */
+/* base[key]<op>=num: one index for read+write, pure XMM op. */
 static int gen_compeq(Gen *g,int A,int B,int C,int sop,int iguard){
     Buf *b=&g->b; Ana *a=g->a;
     if(a->dsc[A]<0) return 0;
@@ -824,7 +706,7 @@ static int gen_compeq(Gen *g,int A,int B,int C,int sop,int iguard){
     emit_cmp_r32_rsp(b,R_RCX,d+8); BAILCC(CC_AE);
     emit_ld_r64_rsp(b,R_RDX,d);
     emit_shl_rcx(b,4);
-    emit_ld_r32_sib(b,R_RAX);                 /* EAX = arr[i].t (dead reg) */
+    emit_ld_r32_sib(b,R_RAX);                 /* EAX=arr[i].t */
     emit_cmp_eax_imm32(b,LT_NUM); BAILCC(CC_NE);
     emit_movsd_ld_sib8(b,0);
     g_ldx(g,1,C);
@@ -839,7 +721,7 @@ static void emit_neg_x0(Gen *g){
     emit_movq_x_r(&g->b,1,R_RAX);
     sse_rr(&g->b,0x66,SSE_XORPD,0,1);
 }
-/* xmm0 := bool(cc after a comisd), stored to slot */
+/* xmm0:=bool(cc), stored to slot */
 static void emit_setbool(Gen *g,int cc,int slot){
     emit_setcc_al(&g->b,cc);
     emit_movzx_eax_al(&g->b);
@@ -864,8 +746,7 @@ static int gen_prologue(Gen *g){
     emit_sub_rsp(b,a->framesz);
     for(int x=6;x<16;x++) if(a->savoff[x]>=0) emit_movaps_st_rsp(b,x,a->savoff[x]);
 
-    /* deterministic state: pinned regs and frame homes all +0.0, every
-       descriptor zeroed (an unreachable read is then defined, not UB) */
+    /* zero homes+descs (unreachable reads stay defined) */
     sse_rr(b,0x66,SSE_XORPD,0,0);
     for(int i=0;i<a->nslots;i++){
         if(a->home[i]>=0) sse_rr(b,0x66,SSE_XORPD,a->home[i],a->home[i]);
@@ -880,10 +761,10 @@ static int gen_prologue(Gen *g){
             emit_st_r64_rsp(b,R_RAX,d+16);
         }
     }
-    /* parameter guards: nargs > i and args[i].t matches pinit */
+    /* param guards: nargs and arg types match pinit */
     for(int i=0;i<a->p->nparams;i++){
         emit_cmp_r32_imm(b,12,i);
-        BAILCC(CC_BE);                                     /* nargs <= i */
+        BAILCC(CC_BE);                                     /* nargs<=i */
         if(a->pinit[i]==K_LIST){
             emit_cmp_m32_imm(b,R_RBX,i*VSZ+VOFT,LT_LIST);
             BAILCC(CC_NE);
@@ -918,8 +799,8 @@ static int gen_body(Gen *g){
     for(int pc=0;pc<p->ncode;pc++){
         g->pcoff[pc]=b->n;
         OpInfo *in=&a->info[pc];
-        if(a->istarget[pc]) g->kcv=0;            /* joins: no cached key */
-        if(!in->vis) continue;                   /* unreachable: no code */
+        if(a->istarget[pc]) g->kcv=0;            /* joins drop key cache */
+        if(!in->vis) continue;                   /* unreachable */
 
         uint32_t ins=p->code[pc];
         int op=GET_OP(ins), A=GET_A(ins), B=GET_B(ins), C=GET_C(ins);
@@ -927,7 +808,7 @@ static int gen_body(Gen *g){
         switch(op){
             case OP_MOVE:
                 g_kill(g,A);
-                if(in->kb==K_NIL) break;         /* nil carries no bits */
+                if(in->kb==K_NIL) break;         /* nil has no bits */
                 if(in->kb==K_LIST){
                     if(a->dsc[A]<0||a->dsc[B]<0) return 0;
                     g_ldptr(g,B); g_stptr(g,A);
@@ -977,7 +858,7 @@ static int gen_body(Gen *g){
             case OP_NOT:
                 g_kill(g,A);
                 if(in->kb==K_NIL) g_const(g,A,1.0);
-                else if(in->kb!=K_BOOL) g_const(g,A,0.0);  /* numbers/lists truthy */
+                else if(in->kb!=K_BOOL) g_const(g,A,0.0);  /* num/list truthy */
                 else {
                     g_ldx(g,0,B);
                     sse_rr(b,0x66,SSE_XORPD,1,1);
@@ -985,9 +866,7 @@ static int gen_body(Gen *g){
                     emit_setbool(g,CC_E,A);
                 }
                 break;
-            /* COMISD sets CF/ZF like an unsigned compare and sets CF=ZF=PF=1
-               when unordered, so LT/LE are emitted with swapped operands and
-               A/AE, which yield false for NaN - matching the interpreter. */
+            /* COMISD unordered; swapped LT/LE false for NaN. */
             case OP_LT:
                 g_ldx(g,0,C); g_cmp0(g,B); g_kill(g,A); emit_setbool(g,CC_A,A);
                 break;
@@ -1013,7 +892,7 @@ static int gen_body(Gen *g){
                     emit_mov_rr64(b,R_RCX,R_RAX);
                     g_ldptr(g,C);
                     emit_cmp_rr64(b,R_RCX,R_RAX);
-                    g->kcv=0;                       /* RCX clobbered, EDI kept */
+                    g->kcv=0;                       /* RCX clobbered */
                     g_kill(g,A);
                     emit_setcc_al(b,iseq?CC_E:CC_NE);
                     emit_movzx_eax_al(b);
@@ -1021,8 +900,7 @@ static int gen_body(Gen *g){
                     g_stx(g,A,0);
                     break;
                 }
-                /* val_rawequal on numbers is ==, so NaN must compare unequal:
-                   fold the parity flag in explicitly. */
+                /* numbers use ==, so fold parity for NaN. */
                 g_ldx(g,0,B);
                 g_cmp0(g,C);
                 g_kill(g,A);
@@ -1059,10 +937,8 @@ static int gen_body(Gen *g){
                 JCCTO(op==OP_JMPIF?CC_NE:CC_E,tgt);
                 break; }
             case OP_FORPREP: {
-                /* st=[A] tg=[A+1]; st>0 -> A=-st, A+1=tg ; st<0 -> A=tg-st,
-                   A+1=0 ; A+2=st ; then jump.  step 0 / NaN is an interpreter
-                   error, so both bail. */
-                g_ldx(g,4,A);                                 /* xmm4 = st */
+                /* FORPREP normalizes loop; step 0/NaN bails. */
+                g_ldx(g,4,A);                                 /* xmm4=st */
                 sse_rr(b,0x66,SSE_XORPD,1,1);
                 sse_rr(b,0x66,SSE_COMISD,4,1);
                 BAILCC(CC_P);
@@ -1077,7 +953,7 @@ static int gen_body(Gen *g){
                 patch_rel(b,jpos,b->n);
                 sse_rr(b,0xF2,SSE_MOVSD_LD,0,4);
                 emit_neg_x0(g);
-                g_stx(g,A,0);                                 /* A = -st */
+                g_stx(g,A,0);                                 /* A=-st */
                 patch_rel(b,jend,b->n);
                 g_stx(g,A+2,4);
                 g_const(g,A+3,0.0);
@@ -1086,7 +962,7 @@ static int gen_body(Gen *g){
                 break; }
             case OP_FORLOOP: {
                 g_ldx(g,0,A);
-                g_op0(g,SSE_ADD,A+2);                         /* xmm0 = idx */
+                g_op0(g,SSE_ADD,A+2);                         /* xmm0=idx */
                 g_ldx(g,2,A+2);
                 sse_rr(b,0x66,SSE_XORPD,3,3);
                 sse_rr(b,0x66,SSE_COMISD,2,3);                /* comisd st,0 */
@@ -1134,7 +1010,7 @@ static int gen_body(Gen *g){
         }
         if(b->bad) return 0;
     }
-    /* falling off the end of the code behaves like "return no values" */
+    /* fallthrough returns no values */
     emit_xor_eax(b);
     RETJMP();
     return !b->bad;
@@ -1159,10 +1035,7 @@ static int gen_finish(Gen *g){
     return !b->bad;
 }
 
-/* Which operand fields are registers (vs immediates/offsets).
- * AsBx ops (JMP/JMPIF/FORPREP/...) keep the jump offset in B/C, and
- * LOADK/LOADBOOL/LOADNIL/RETURN/CLOSE keep constants there -- only A
- * (plus A+3 for the loop pair) is a register for those. */
+/* Register operands; AsBx/const ops use only A (+A+3 for loops). */
 static int op_hasB(int op){
     switch(op){
         case OP_MOVE:
@@ -1189,12 +1062,7 @@ static int op_hasC(int op){
 }
 static int op_hasA(int op){ return op!=OP_JMP && op!=OP_CLOSE; }
 
-/* Pre-scan: initial kind of each parameter, and result kind of each
- * GETTABLE.  A slot read as a table base (GETTABLE-B / SETTABLE-A) wants
- * K_LIST; a slot used numerically wants K_NUM.  Both at once, or neither
- * decidable -> K_BAD/K_NUM default (analysis or guards sort it out; a
- * runtime mismatch just bails back to the interpreter).  MOVE propagates
- * both ways so `create m = param; m[i]` still types the parameter. */
+/* Prescan param/result kinds; ambiguous defaults bail to interpreter. */
 static void prescan_kinds(Ana *a){
     Proto *p=a->p;
     unsigned char *asbase=a->asbase, *asnum=a->asnum, *askey=a->askey;
@@ -1219,12 +1087,7 @@ static void prescan_kinds(Ana *a){
                 if(C<a->nregs&&!asnum[C]){ asnum[C]=1; changed=1; }
                 break;
             case OP_MOVE:
-                /* Forward only (B->A). Backward (A->B) is unsound here:
-                   the compiler reuses dest slots as table temps later,
-                   which would poison a numeric source (e.g. the repeat
-                   bound N) into K_LIST and kill the whole function.
-                   Aliased table params (`m = A; m[i]`) then default to
-                   K_NUM and bail at the guard -- correct, just un-JITed. */
+                /* Forward B->A only; backward poisons numeric temps to K_LIST. */
                 if(B<a->nregs && A<a->nregs){
                     if(asbase[B]&&!asbase[A]){ asbase[A]=1; changed=1; }
                     if(asnum[B]&&!asnum[A]){ asnum[A]=1; changed=1; }
@@ -1240,11 +1103,7 @@ static void prescan_kinds(Ana *a){
                 if(A<a->nregs&&!asnum[A]){ asnum[A]=1; changed=1; }
                 break;
             case OP_FORPREP: case OP_FORLOOP:
-                /* NOTE: do NOT force asnum here. The compiler reuses
-                   loop-reg slots for table temps elsewhere; forcing makes
-                   them ambiguous and kills the whole function. Genuine
-                   list-into-loop-state is still rejected by the
-                   FORPREP/FORLOOP numeric checks in ana_region. */
+                /* Keep loop regs unforced; numeric checks stay in ana_region. */
                 break;
             default: break;
         }
@@ -1265,10 +1124,7 @@ static void prescan_kinds(Ana *a){
     }
 }
 
-/* Loop depth per pc from backward branches, and a use weight per register
- * that is exponential in that depth: the homes go to whatever the inner
- * loops touch most, so a maxstack=23 proto still runs its inner loop out
- * of XMM registers ("mixed-pin") while cold registers stay in the frame. */
+/* Homes go to hot inner-loop regs (mixed-pin); cold stay in frame. */
 static void assign_homes(Ana *a){
     Proto *p=a->p;
     for(int pc=0;pc<p->ncode;pc++){
@@ -1294,8 +1150,7 @@ static void assign_homes(Ana *a){
         if(op==OP_FORPREP||op==OP_FORLOOP)
             for(int k=0;k<4;k++) if(A+k<a->nregs) w[A+k]+=wt;
     }
-    /* XMM5 is volatile: only hand it out when the proto emits no CALL
-       (MOD/POW helpers are the only ones this backend ever calls). */
+    /* XMM5 volatile: only if no CALL (MOD/POW helpers). */
     int base=hasmp?6:5, navail=16-base;
     for(int x=0;x<16;x++) a->savoff[x]=-1;
     for(int k=0;k<navail;k++){
@@ -1316,10 +1171,7 @@ static void assign_homes(Ana *a){
     free(w);
 }
 
-/* Translate one Proto to machine code.  Returns a malloc'd byte image in
- * *out / *outlen (caller copies it into executable memory or a PE section).
- * pic=1 forbids absolute host addresses so the image can be embedded in a
- * standalone executable.  err[] receives a reason on failure. */
+/* Translate Proto; pic=1 bans absolute addrs for embedding. */
 static int translate_proto(Proto *p,int pic,unsigned char **out,int *outlen,
                            char *err,size_t errcap)
 {
@@ -1371,16 +1223,16 @@ static int translate_proto(Proto *p,int pic,unsigned char **out,int *outlen,
     for(int r=0;r<a.nregs;r++) if(a.needdsc[r]) a.dsc[r]=a.ndsc++;
     assign_homes(&a);
 
-    /* frame: shadow | XMM saves | slot homes | list descriptors */
+    /* frame: shadow|XMM saves|slot homes|list descs */
     a.slotoff = 32+16*a.nsave;
     a.dscoff  = a.slotoff+8*a.nslots;
     {   int s=a.dscoff+DSCSZ*a.ndsc;
         s=(s+15)&~15;
-        a.framesz=s+8;                 /* keeps RSP 16-aligned at CALLs */
+        a.framesz=s+8;                 /* keep RSP aligned at CALLs */
     }
 
     g.a=&a;
-    buf_init(&g.b,65536);                 /* 64 KB, doubles on demand */
+    buf_init(&g.b,65536);                 /* 64KB, grows as needed */
     if(g.b.bad){ if(err) snprintf(err,errcap,"out of memory"); goto done; }
     if(!gen_prologue(&g)||!gen_body(&g)||!gen_finish(&g)){
         if(err) snprintf(err,errcap,"code emission failed");
@@ -1407,9 +1259,7 @@ done:
     return okresult;
 }
 
-/* ===================================================================== */
-/* 6. JIT: executable memory + per-Proto cache                            */
-/* ===================================================================== */
+/* 6. JIT cache */
 
 typedef int (*JitFn)(const Value *args,int nargs,Value *out);
 
@@ -1445,7 +1295,7 @@ static void *jit_map(const unsigned char *code,int len,size_t *sz){
     return m;
 }
 
-/* Compile (once) and return the native entry for p, or NULL. */
+/* Compile once, return native entry or NULL. */
 static JitFn jit_get(Proto *p){
     JitEnt *e=jit_find(p);
     if(e){ return e->failed? NULL : e->fn; }
@@ -1464,7 +1314,7 @@ static JitFn jit_get(Proto *p){
     free(img);
     if(!mem){ e->failed=1; return NULL; }
     e->mem=mem; e->memsz=sz;
-    memcpy(&e->fn,&mem,sizeof e->fn);       /* no function-pointer cast UB */
+    memcpy(&e->fn,&mem,sizeof e->fn);       /* avoid fn-ptr cast UB */
     return e->fn;
 }
 
@@ -1473,11 +1323,7 @@ void luc_jit_shutdown(void){
     free(g_jit); g_jit=NULL; g_jitn=g_jitcap=0;
 }
 
-/* Hook for vm_call: run L->stack[func] natively if we can.
- * Mirrors vm_call's LT_FUNC contract exactly: results land at
- * L->stack[func..], missing results are padded with nil when nres>=0,
- * L->top is left at func+n, and n is returned.  LUC_JIT_FALLBACK means
- * "nothing happened, interpret it". */
+/* vm_call hook: same LT_FUNC contract; FALLBACK means interpret. */
 int luc_jit_call(LucState *L,int func,int nargs,int nres){
     if(!L||func<0) return LUC_JIT_FALLBACK;
     Value f=L->stack[func];
@@ -1489,20 +1335,17 @@ int luc_jit_call(LucState *L,int func,int nargs,int nres){
     Value out[2];
     out[0]=NIL; out[1]=NIL;
     int n=fn(&L->stack[func+1],nargs,out);
-    if(n<0) return LUC_JIT_FALLBACK;       /* guard failed, nothing written */
+    if(n<0) return LUC_JIT_FALLBACK;       /* guard failed */
 
     int want = nres>=0? nres : n;
-    ensure_stack(L,func+want+8);           /* may realloc; native part is done */
+    ensure_stack(L,func+want+8);           /* native part done */
     for(int i=0;i<n && i<want;i++) L->stack[func+i]=out[i];
     for(int i=n;i<want;i++) L->stack[func+i]=NIL;
     L->top=func+want;
     return want;
 }
 
-/* Run one top-level closure natively.  The main chunk of a real script
- * almost always touches globals or calls functions, so this normally
- * reports LUC_JIT_FALLBACK and the caller interprets it; the win is in
- * luc_jit_call() on numeric leaf functions. */
+/* Top-level run; main chunk usually falls back (globals/calls). */
 int luc_jit_run(Closure *cl){
     if(!cl||!cl->p) return LUC_JIT_FALLBACK;
     JitFn fn=jit_get(cl->p);
@@ -1514,9 +1357,7 @@ int luc_jit_run(Closure *cl){
     return 0;
 }
 
-/* ===================================================================== */
-/* 7. PE32+ writer                                                        */
-/* ===================================================================== */
+/* 7. PE32+ writer */
 
 #define PE_IMAGEBASE   0x140000000ULL
 #define PE_SECALIGN    0x1000
@@ -1524,13 +1365,13 @@ int luc_jit_run(Closure *cl){
 
 static unsigned pe_align(unsigned v,unsigned a){ return (v+a-1)&~(a-1); }
 
-/* imported kernel32 entries, in IAT order */
+/* kernel32 imports, IAT order */
 static const char *const PE_IMPORTS[3]={ "ExitProcess", "WriteFile", "GetStdHandle" };
 #define IMP_EXITPROCESS  0
 #define IMP_WRITEFILE    1
 #define IMP_GETSTDHANDLE 2
 
-/* .rdata layout (offsets from the section's RVA) */
+/* .rdata layout (section RVA offsets) */
 #define RD_DESC   0                  /* 2 x IMAGE_IMPORT_DESCRIPTOR (40) */
 #define RD_ILT    40                 /* 4 qwords */
 #define RD_IAT    72                 /* 4 qwords */
@@ -1576,9 +1417,7 @@ static void emit_lea_rip(Buf *b,int reg,unsigned code_rva,unsigned target_rva){
     e4(b,(unsigned)((int)target_rva-(int)here));
 }
 
-/* Write a standalone console PE32+ whose .text is `native` (a translated
- * proto in PIC form) plus an entry stub that runs it and exits with the
- * program's numeric result. */
+/* Standalone PE32+: native PIC + stub runs it, exits with number. */
 static int pe_write_exe(const char *path,const unsigned char *native,int nativelen,
                         char *err,size_t errcap)
 {
@@ -1593,14 +1432,11 @@ static int pe_write_exe(const char *path,const unsigned char *native,int nativel
     buf_init(&text,4096); buf_init(&rdata,1024); buf_init(&data,1024);
     if(text.bad||rdata.bad||data.bad){ snprintf(err,errcap,"out of memory"); goto out; }
 
-    /* --- sizes must all be known before a single byte is written --- */
-    /* stub size is fixed by construction; emit twice: once to measure with
-       provisional RVAs, once for real.  Both passes emit identical lengths
-       because every field is a fixed-width rel32/imm32. */
+    /* sizes first; stub measured in pass 0 (fixed-width rel32/imm32). */
     for(int pass=0;pass<2;pass++){
         text.n=0; rdata.n=0; data.n=0;
 
-        /* .data: out Value, bytes-written scratch, message */
+        /* .data: out Value, scratch, message */
         unsigned d_out=0, d_nw=16, d_msg=24;
         datasz = d_msg + (unsigned)sizeof msg;
         (void)d_out; (void)d_nw;
@@ -1610,10 +1446,10 @@ static int pe_write_exe(const char *path,const unsigned char *native,int nativel
             memcpy(data.p+d_msg,msg,sizeof msg);
         }
 
-        /* entry stub goes first in .text, then the native image */
+        /* entry stub first, then native image */
         unsigned stub_rva = text_rva;
         unsigned nat_rva;
-        /* stub length is deterministic: measure it in pass 0 */
+        /* stub len fixed; measured in pass 0 */
         static int stublen=0;
         if(pass==0) nat_rva = stub_rva+256; else nat_rva = stub_rva+(unsigned)stublen;
 
@@ -1770,15 +1606,11 @@ out:
     return rc;
 }
 
-/* ===================================================================== */
-/* 8. AOT                                                                 */
-/* ===================================================================== */
+/* 8. AOT */
 
-#define AOT_MAGIC "LUCAOT1"          /* 8 bytes including the NUL */
+#define AOT_MAGIC "LUCAOT1"          /* 8 bytes with NUL */
 
-/* Self-contained executable without a linker: clone the already-linked
- * host image and append the script.  Works for every program, because the
- * clone contains the whole runtime. */
+/* Self-clone host image + append script (has full runtime). */
 static int aot_selfclone(const char *outpath,const char *src,int srclen,char *err,size_t errcap){
     char self[MAX_PATH];
     DWORD n=GetModuleFileNameA(NULL,self,MAX_PATH);
@@ -1789,7 +1621,7 @@ static int aot_selfclone(const char *outpath,const char *src,int srclen,char *er
     long total=ftell(in);
     if(total<=0){ fclose(in); snprintf(err,errcap,"cannot size '%s'",self); return 0; }
 
-    /* if the host itself carries a payload, drop it so payloads never nest */
+    /* drop old payload (no nesting) */
     long keep=total;
     if(total>12){
         char tr[12];
@@ -1819,7 +1651,7 @@ static int aot_selfclone(const char *outpath,const char *src,int srclen,char *er
     return 1;
 }
 
-/* Recover an appended script from our own image (called at startup). */
+/* Recover appended script at startup. */
 int luc_aot_embedded(char **psrc,int *plen){
     char self[MAX_PATH];
     DWORD n=GetModuleFileNameA(NULL,self,MAX_PATH);
@@ -1847,8 +1679,7 @@ int luc_aot_embedded(char **psrc,int *plen){
     return ok;
 }
 
-/* Compile src under a protected call so a syntax error is reported instead
- * of longjmp-ing out of the builder. */
+/* Protected compile; syntax error reports instead of longjmp. */
 static Closure *aot_compile(const char *src,int srclen,const char *name,char *err,size_t errcap){
     ErrJmp ej; ej.prev=V.errjmp; V.errjmp=&ej;
     Closure *cl=NULL;
@@ -1896,7 +1727,7 @@ int luc_aot_build(const char *src,int srclen,const char *outpath){
     return 0;
 }
 
-#else /* !_WIN32 : keep the tree building; everything asks to be interpreted */
+#else /* !_WIN32: no native; always interpret */
 
 int  luc_jit_run(Closure *cl){ (void)cl; return LUC_JIT_FALLBACK; }
 int  luc_jit_call(LucState *L,int func,int nargs,int nres){

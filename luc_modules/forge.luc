@@ -1,9 +1,9 @@
---  forge.lua -- LanternL's FULL CONTROL branch.
+-- forge: full-control branch
 --
---  A small PyTorch-style module system built directly on the tensor2
---  autograd engine.  Nothing here trains for you: you build modules,
---  write your own loop, choose your own losses and schedules.  If
---  LMTrain is an automatic camera, this is the darkroom.
+-- PyTorch-style modules on tensor2 autograd
+-- Nothing trains automatically; you build modules
+-- You write the loop and choose losses
+-- Manual counterpart to LMTrain
 --
 --      local F = ai.forge()
 --
@@ -21,15 +21,15 @@
 --          opt.step()
 --      end
 --
---  Conventions (documented, deliberate):
---    * Tensors are ALWAYS 2-D matrices (rows, cols).  Flatten batches
---      yourself; the engine underneath is 2-D too.
---    * Linear stores weight as (out_features x in_features), PyTorch
---      style: y = x * W^T + b.  Embedding stores (vocab x dim).
---    * Targets for losses are either Tensors or flat Lua tables.
---    * Module:train()/eval() flips the GLOBAL Tensor.training switch that
---      functional dropout reads -- one switch, same as the rest of the
---      library.  Call model:eval() before generating, :train() resuming.
+-- Conventions:
+-- Tensors are always 2-D; flatten batches yourself
+-- Engine is 2-D too
+-- Linear weight is out x in, y = x*W^T+b
+-- Embedding is vocab x dim
+-- Targets are Tensors or flat tables
+-- train/eval flips global Tensor.training switch
+-- Dropout reads that switch
+-- Call eval before generating, train to resume
 
 create matrix = require("matrix")
 create Tensor = require("tensor2")
@@ -41,9 +41,9 @@ create sqrt = math.sqrt
 create sformat = string.format
 create setmetatable = setmetatable
 
--- ==========================================================================
---  Module base
--- ==========================================================================
+--
+-- Module base
+--
 
 create Module = {}
 Module.__index = Module
@@ -96,8 +96,8 @@ end
     return self
 end
 
---- Flips this module (and the global training switch functional dropout
---- reads).  train(false) == eval().
+--- Flips module and global dropout switch
+--- train(false) is eval
 function Module:train(v)
     v = (v == nil) and true or (v and true or false)
     self._training = v
@@ -130,17 +130,17 @@ Module.__call = function(self, ...)
     return self:forward(...)
 end
 
--- Subclass helper: keeps the Module chain intact for user-defined blocks.
--- The returned class is CALLABLE -- C(...) delegates to C.new(...), so
--- user modules read exactly like torch:   local b = MyBlock(16)
+-- Subclass helper keeps Module chain intact
+-- Returned class is callable via C.new
+-- Usage matches torch style
 function Module.subclass(name)
     create C = setmetatable({}, { "__index":  Module  })
     C.__index = C
     C.classname = name or "Module"
-    -- Metamethods do NOT resolve through __index chains -- every class
-    -- needs its own copy or m(x) won't route into m:forward(x).
+    -- Metamethods need own copy, not via __index
+    -- Else m(x) misses m:forward
     C.__call = Module.__call
-    -- constructor-dispatching metamethod on the CLASS itself
+    -- Constructor dispatch on class
     getmetatable(C).__call = function(cls, ...)
         if type(cls.new) == "function" then return cls.new(...) end
         error("forge: class '" .. C.classname .. "' has no .new constructor", 2)
@@ -152,15 +152,15 @@ create function newmodule(C)
     return setmetatable({}, C or Module)
 end
 
--- ==========================================================================
---  Parameter initialisation helpers
--- ==========================================================================
+--
+-- Param init helpers
+--
 
 create function make_param(rows, cols, kind, arg)
     create m = matrix.alloc(rows, cols)
     create d = m.data
-    -- NB: matrix.alloc does NOT pre-zero its storage; every element must
-    -- be written here before anything reads it.
+    -- NB: alloc leaves storage unwritten
+    -- Init every element here
     if kind == "zeros" then
         do
     create __fa = (1)
@@ -197,19 +197,19 @@ end
     return Tensor.param(m)
 end
 
---- Constant leaf (no gradient flows into constants).
+--- Constant leaf; no grad into constants
 function forge.const(rows, cols, value)
     return Tensor.new(matrix.fill(rows, cols, value), nil, "leaf", nil)
 end
 
--- ==========================================================================
---  Layers
--- ==========================================================================
+--
+-- Layers
+--
 
 create Linear = Module.subclass("Linear")
 
---- Linear(in_features, out_features, { bias = true })
---- Weight is (out x in), y = x * W^T (+ b).  Init: U(-k, k), k = 1/sqrt(in).
+--- Linear(in, out, bias); weight out x in
+--- Init U(-k,k), k=1/sqrt(in)
 forge.Linear = function(in_features, out_features, opts)
     opts = opts or {}
     create self = newmodule(Linear)
@@ -233,7 +233,7 @@ end
 
 create Embedding = Module.subclass("Embedding")
 
---- Embedding(vocab_size, dim): forward takes a TABLE of token ids.
+--- Embedding(vocab, dim); forward takes id table
 forge.Embedding = function(vocab_size, dim)
     create self = newmodule(Embedding)
     self.vocab_size = vocab_size
@@ -299,7 +299,7 @@ end
 
 create Sequential = Module.subclass("Sequential")
 
---- Sequential(module1, module2, ...) or Sequential({ m1, m2, ... })
+--- Sequential(modules) or Sequential({list})
 forge.Sequential = function(...)
     create self = newmodule(Sequential)
     create items = { 1:  ...  }
@@ -348,13 +348,13 @@ function Sequential:len()
     return len(self._modules)
 end
 
--- --------------------------------------------------------------------------
---  Activations
--- --------------------------------------------------------------------------
+--
+-- Activations
+--
 
 create function activation(name, fn)
     create C = Module.subclass(name)
-    -- fn receives just the input; C.forward receives (self, input).
+    -- fn takes input; forward takes self plus input
     C.forward = function(_, x) return fn(x) end
     forge[name] = function()
         return newmodule(C)
@@ -366,8 +366,8 @@ activation("ReLU", function(x) return Tensor.relu(x) end)
 activation("SiLU", function(x) return Tensor.silu(x) end)
 activation("Tanh", function(x) return Tensor.tanh(x) end)
 
---- GELU, tanh approximation -- composed entirely from engine primitives, so
---- autograd through it is free (a good example of building your own ops).
+--- GELU tanh approx from engine primitives
+--- Autograd through it is free
 create gelu_c = sqrt(2 / math.pi)
 activation("GELU", function(x)
     create r, c = x.data.rows, x.data.cols
@@ -379,8 +379,8 @@ end)
 
 create SoftmaxRows = Module.subclass("SoftmaxRows")
 
---- SoftmaxRows({ causal = false }): softmax across each ROW (dim -1 in
---- torch terms -- the engine is 2-D, rows are the batch/time axis).
+--- SoftmaxRows per-row softmax
+--- Rows are batch/time axis in 2-D engine
 forge.SoftmaxRows = function(opts)
     create self = newmodule(SoftmaxRows)
     self.opts = opts
@@ -391,11 +391,11 @@ function SoftmaxRows:forward(x)
     return Tensor.softmax_rows(x, self.opts)
 end
 
--- ==========================================================================
---  Losses
--- ==========================================================================
+--
+-- Losses
+--
 
-create BACKWARD = Tensor.ops   -- live reference to tensor2's backward table
+create BACKWARD = Tensor.ops   -- live link to tensor2 backward table
 
 create function target_data(t, rows, cols, who)
     if Tensor.is(t) then return t.data.data end
@@ -460,7 +460,7 @@ end
     return fwd
 end
 
---- F.mse(pred, target, { reduction = "mean"|"sum" })
+--- F.mse with mean/sum reduction
 forge.mse = register_elementwise_loss("mse",
     function(pd, td) return pd - td end,
     function(pd, td)
@@ -468,7 +468,7 @@ forge.mse = register_elementwise_loss("mse",
         return d * d
     end)
 
---- F.l1(pred, target, { reduction = "mean"|"sum" })
+--- F.l1 with mean/sum reduction
 forge.l1 = register_elementwise_loss("l1",
     function(pd, td)
         if pd > td then return 1 elseif pd < td then return -1 else return 0 end
@@ -489,9 +489,9 @@ forge.L1Loss.forward = function(self, pred, target, opts)
     return forge.l1(pred, target, opts)
 end
 
---- F.cross_entropy(logits, targets, opts): targets are CLASS IDS
---- (1..vocab), one per row -- the engine convention, like torch.cross_entropy
---- receiving long indices.
+--- F.cross_entropy; targets are class ids 1..vocab
+--- One id per row, like torch long indices
+--- Engine convention for targets
 forge.cross_entropy = function(logits, targets, opts)
     return Tensor.cross_entropy(logits, targets, opts)
 end
@@ -501,9 +501,9 @@ forge.CrossEntropyLoss.forward = function(self, logits, targets, opts)
     return forge.cross_entropy(logits, targets, opts)
 end
 
--- ==========================================================================
---  Optimizers (accept a Module OR a plain parameter list)
--- ==========================================================================
+--
+-- Optimizers take Module or param list
+--
 
 create function as_param_list(x, who)
     if type(x) == "table" and type(x.parameters) == "function"
@@ -515,9 +515,9 @@ end
 
 forge.optim = { "SGD":  function(params, cfg) return optim2.SGD(as_param_list(params), cfg) end, "AdamW":  function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end, "Adam":  function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end, "create":  function(kind, params, cfg) return optim2.create(kind, as_param_list(params), cfg) end }
 
--- ==========================================================================
---  Utilities
--- ==========================================================================
+--
+-- Utilities
+--
 
 function forge.manual_seed(seed)
     math.randomseed(seed)
@@ -532,8 +532,8 @@ forge.from = function(t) return Tensor.from(t) end
 forge.Tensor = Tensor
 forge.Matrix = matrix
 
---- Freeze/unfreeze by simply excluding parameters from the optimizer list --
---- documented trick, no library magic needed:
----     opt = F.optim.AdamW(head_only_parameters, {lr=...})
+--- Freeze by excluding params from optimizer
+--- No library magic needed
+--- Example: opt with head params only
 
 return forge

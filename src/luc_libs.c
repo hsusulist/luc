@@ -1,14 +1,13 @@
-/* luc_libs.c - all standard libraries merged into one translation unit */
-/* update 2026-09-01: comment cleanup */
+/* all standard libs in one unit */
+/* cleanup 2026-09-01 */
 #if defined(_WIN32) && !defined(WIN32_LEAN_AND_MEAN)
-#define WIN32_LEAN_AND_MEAN      /* keep windows.h lean: no winsock.h v1, so
-                                    luc_lib_net can include winsock2 below */
+#define WIN32_LEAN_AND_MEAN      /* lean windows.h (net uses winsock2) */
 #endif
 #include "luc.h"
 
 
 /* luc_lib_base.c */
-/* luc_lib_base.c -- base library: print, tostring, pcall, require, xpcall... */
+/* base lib: print, tostring, pcall, require, xpcall */
 /* base */
 
 LFN(f_print){ UNUSED_SELF;
@@ -130,9 +129,7 @@ LFN(f_rawset){ UNUSED_SELF; tab_set(checktab(L,base,nargs,0,"rawset"),AR(1),AR(2
 LFN(f_rawequal){ UNUSED_SELF; RET(0,mkbool(val_rawequal(AR(0),AR(1)))); return 1; }
 LFN(f_collectgarbage){ UNUSED_SELF; gc_collect(); RET(0,mknum((double)V.nalloc)); return 1; }
 
-/* require loads third-party modules from disk (script dir, cwd, luc_modules, LUC_PATH).
-   The built-in system libraries (window, ai, json) are NOT served here:
-   require("window") always picks up the user's own window module, never the system one. */
+/* require loads third-party modules; system libs use import. */
 LFN(f_require){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"require");
     Value key=mkobj(LT_STR,name);
@@ -157,24 +154,17 @@ LFN(f_require){ UNUSED_SELF;
     tab_set(V.loaded,key,res);
     RET(0,res); return 1;
 }
-/* import loads the system libraries that ship with LUC itself:
-     import window        import ai        import json        import net
-     import discord       import libs
-   plus the short-name form:  import window("w")
-   `import libs` also unlocks the user-library syntax for the rest of the
-   chunk: make / get / pack / command / import-from.
-   Third-party modules never go through import - they use require:
-     create mywin = require("mywin")                                     */
-static Value libs_module(void);   /* defined with the other libs helpers below */
+/* import system libs; third-party use require. */
+static Value libs_module(void);   /* libs helper below */
 LFN(f_import){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"import");
     char keybuf[512]; snprintf(keybuf,sizeof keybuf,"system:%s",name->s);
-    Value key=cstrv(keybuf);            /* separate cache slot from require() */
+    Value key=cstrv(keybuf);            /* own slot (not require) */
     Value cached=tab_get(V.loaded,key);
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
     Value m=NIL;
     if(strcmp(name->s,"window")==0){
-        m=lucL_window_module();         /* throws when built without SDL2 */
+        m=lucL_window_module();         /* fails without SDL2 */
     }else if(strcmp(name->s,"json")==0){
         m=lucL_json_module();
     }else if(strcmp(name->s,"net")==0){
@@ -213,11 +203,9 @@ LFN(f_import){ UNUSED_SELF;
     tab_set(V.loaded,key,m);
     RET(0,m); return 1;
 }
-/* libs (make/get/pack/import-from) runtime.
-   `make <name>` marks a chunk as a lib part, and the compiler makes such a
-   chunk return its export table. These three functions load and bundle parts. */
+/* libs (make/get/pack/import-from) runtime. */
 
-/* compile src and run it for exactly 1 result (mirrors f_require) */
+/* run src for 1 result (like f_require) */
 static Value libs_run1(LucState *L,int base,int nargs,const char *src,int len,const char *found){
     int scratch=base+nargs+2;
     ensure_stack(L,scratch+16);
@@ -227,7 +215,7 @@ static Value libs_run1(LucState *L,int base,int nargs,const char *src,int len,co
     return L->stack[scratch];
 }
 
-/* __get("part"): load a lib part by MAKE name (script dir, cwd, luc_modules, LUC_PATH) */
+/* __get("part"): load lib part by MAKE name */
 LFN(f_get){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"get");
     int len=0; char found[1024];
@@ -254,7 +242,7 @@ LFN(f_get){ UNUSED_SELF;
     RET(0,res); return 1;
 }
 
-/* __pack("lib", {"a","b",...}): bundle part sources into <lib>.luic */
+/* __pack: bundle part sources into <lib>.luic */
 LFN(f_pack){ UNUSED_SELF;
     Str *lib=checkstr(L,base,nargs,0,"pack");
     Table *parts=checktab(L,base,nargs,1,"pack");
@@ -314,7 +302,7 @@ LFN(f_pack){ UNUSED_SELF;
 typedef struct { char *name; const char *src; int len; } PackPart;
 static void pack_abort(PackPart *pp,int n,const char *fmt,const char *a);
 
-/* parse a .luic buffer into parts (sources point into the buffer) */
+/* parse .luic buffer (sources point inside) */
 static int pack_parse(const char *lib,char *src,int len,PackPart **out,int *nout){
     const char *p=src,*end=src+len;
     char line[512];
@@ -349,14 +337,13 @@ static int pack_parse(const char *lib,char *src,int len,PackPart **out,int *nout
 
 static void pack_parts_free(PackPart *pp,int n){ for(int i=0;i<n;i++) free(pp[i].name); free(pp); }
 
-/* like pack_parts_free, then throw (pack_parse error paths) */
+/* free parts, then throw (pack_parse errors) */
 static void pack_abort(PackPart *pp,int n,const char *fmt,const char *a){
     pack_parts_free(pp,n);
     luc_error(fmt,a);
 }
 
-/* __import_from("lib","sym"): part table when sym is a part, else the symbol
- * found in exactly one part's table (pack first, then a lone <lib>.luc file) */
+/* __import_from: part table or symbol. */
 LFN(f_import_from){ UNUSED_SELF;
     Str *lib=checkstr(L,base,nargs,0,"import-from");
     Str *sym=checkstr(L,base,nargs,1,"import-from");
@@ -365,7 +352,7 @@ LFN(f_import_from){ UNUSED_SELF;
     if(psrc){
         PackPart *pp=NULL; int np=0;
         pack_parse(lib->s,psrc,plen,&pp,&np);
-        /* phase 1: sym names a part -> its whole table */
+        /* phase 1: sym is a part name */
         for(int i=0;i<np;i++) if(!strcmp(pp[i].name,sym->s)){
             char keybuf[1408]; snprintf(keybuf,sizeof keybuf,"packpart:%s#%s",pfound,pp[i].name);
             Value key=cstrv(keybuf);
@@ -379,7 +366,7 @@ LFN(f_import_from){ UNUSED_SELF;
             pack_parts_free(pp,np); free(psrc);
             RET(0,cached); return 1;
         }
-        /* phase 2: sym lives inside exactly one part's table */
+        /* phase 2: sym inside one part table */
         int hits=0, hitat=-1; Value hitv=NIL;
         for(int i=0;i<np;i++){
             char keybuf[1408]; snprintf(keybuf,sizeof keybuf,"packpart:%s#%s",pfound,pp[i].name);
@@ -400,7 +387,7 @@ LFN(f_import_from){ UNUSED_SELF;
         if(hits>1) luc_error("lib '%s': '%s' is ambiguous (in %d parts) - import the part and index it",lib->s,sym->s,hits);
         { char parts[512]; parts[0]=0; luc_error("lib '%s' has no '%s'",lib->s,sym->s); (void)hitat; }
     }
-    /* lone file lib: <lib>.luc */
+    /* lone <lib>.luc file */
     {
         int len=0; char found[1024];
         char *src=find_module(lib->s,&len,found,sizeof found);
@@ -429,9 +416,7 @@ LFN(f_import_from){ UNUSED_SELF;
     }
     RET(0,NIL); return 1;
 }
-/* libs system module: toolkit for user libraries.
-   `import libs` returns this table AND (parser-side) unlocks the
-   make/get/pack/command/import-from syntax for the rest of the chunk. */
+/* libs module: user-lib toolkit. */
 static void lib_basename(const char *found,char *out,size_t cap){
     const char *b=found+strlen(found);
     while(b>found&&b[-1]!='/'&&b[-1]!='\\') b--;
@@ -439,7 +424,7 @@ static void lib_basename(const char *found,char *out,size_t cap){
     if(n>=cap) n=cap-1; memcpy(out,b,n); out[n]=0;
 }
 
-/* libs.info("lib") -> {name, kind ("pack"/"part"/"file"), path, parts={...}} */
+/* libs.info("lib") -> {name, kind, path, parts} */
 LFN(f_libs_info){ UNUSED_SELF;
     Str *lib=checkstr(L,base,nargs,0,"info");
     Table *t=tab_new(0);
@@ -468,7 +453,7 @@ LFN(f_libs_info){ UNUSED_SELF;
     RET(0,mkobj(LT_TABLE,t)); return 1;
 }
 
-/* libs.has("lib","sym"): part/symbol lookup WITHOUT running any code */
+/* libs.has: lookup without running code */
 LFN(f_libs_has){ UNUSED_SELF;
     Str *lib=checkstr(L,base,nargs,0,"has");
     Str *sym=checkstr(L,base,nargs,1,"has");
@@ -492,7 +477,7 @@ LFN(f_libs_has){ UNUSED_SELF;
     RET(0,mkbool(hit)); return 1;
 }
 
-/* libs.reload("part"): forget cached module tables so the next get/reload re-runs the file */
+/* libs.reload: drop cache so next get re-runs file */
 LFN(f_libs_reload){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"reload");
     int len=0; char found[1024];
@@ -591,7 +576,7 @@ void lucL_open_base(void){
 
 
 /* luc_lib_buffer.c */
-/* luc_lib_buffer.c -- buffer library (binary data) */
+/* buffer lib (binary data) */
 /* buffer */
 static void bufrange(Buffer *b,int off,int n){
     if(off<0||n<0||off>b->len-n)
@@ -719,7 +704,7 @@ void lucL_open_buffer(void){
 
 
 /* luc_lib_coro.c */
-/* luc_lib_coro.c -- coroutine library + task library */
+/* coro + task lib */
 /* coroutine */
 LFN(f_co_create){ UNUSED_SELF;
     Value f=AR(0);
@@ -735,7 +720,7 @@ LFN(f_co_yield){ UNUSED_SELF;
     L->yieldbase=base; L->nyield=nargs;
     L->status=CO_SUSPENDED;
     longjmp(g_yp->jb,1);
-    return 0;                      /* not reached */
+    return 0;                      /* unreachable */
 }
 LFN(f_co_resume){ UNUSED_SELF;
     Value cv=AR(0);
@@ -786,7 +771,7 @@ LFN(f_co_isyieldable){ UNUSED_SELF; (void)nargs;
 }
 
 /* task */
-/* trampoline: up[0]=function, up[1..] = captured arguments */
+/* trampoline: up[0]=fn, up[1..]=args */
 LFN(f_task_trampoline){
     int n=self->nup-1;
     ensure_stack(L,base+n+8);
@@ -812,8 +797,7 @@ LFN(f_task_wait){ UNUSED_SELF;
     double n = nargs>=1? checknum(L,base,nargs,0,"wait") : 0;
     if(n<0) n=0;
     if(!g_yp || g_yp->co!=L){
-        /* main thread: sleep in slices, pumping due tasks so spawned
-         * tasks keep running while main waits (servers/bots need this) */
+        /* main thread: slice-sleep + pump tasks (servers need this) */
         double t0=luc_now(), end=t0+n;
         for(;;){
             sched_poll();
@@ -834,7 +818,7 @@ LFN(f_task_wait){ UNUSED_SELF;
 LFN(f_task_spawn){ UNUSED_SELF;
     LucState *co=make_task(L,base,nargs,0);
     Value cv=mkobj(LT_CORO,co);
-    RET(0,cv);                                  /* root before resuming */
+    RET(0,cv);                                  /* root before resume */
     Value res[32]; int nres=0;
     if(co_resume(co,NULL,0,res,&nres)){
         Str *s=tostr(V.errval);
@@ -885,7 +869,7 @@ void lucL_open_coro(void){
 
 
 /* luc_lib_io.c */
-/* luc_lib_io.c -- io library + file methods (io.popen moved here) */
+/* io lib + file methods */
 /* io */
 static FileH *checkfile(LucState *L,int base,int nargs,int i,const char *fn){
     Value v=AR(i);
@@ -922,7 +906,7 @@ static Str *read_count_str(FILE *f,int count){
     if(n==0){ free(b); return NULL; }
     Str *s=str_new(b,(int)n); free(b); return s;
 }
-/* read according to format arguments starting at argument index `first` */
+/* read by formats from arg `first` */
 static int io_read_aux(LucState *L,int base,int nargs,FILE *f,int first){
     int out=0;
     if(first>=nargs){
@@ -964,11 +948,11 @@ LFN(f_io_write){ UNUSED_SELF;
         Str *s=tostr(v);
         fwrite(s->s,1,(size_t)s->len,stdout);
     }
-    fflush(stdout);              /* so '\r' progress lines show up at once */
+    fflush(stdout);              /* flush for progress lines */
     return 0;
 }
 LFN(f_io_replace){ UNUSED_SELF;
-    fputs("\r\033[2K",stdout);    /* return home and erase the current line */
+    fputs("\r\033[2K",stdout);    /* home + erase line */
     for(int i=0;i<nargs;i++){
         Value v=L->stack[base+i];
         if(v.t!=LT_STR && v.t!=LT_NUM)
@@ -985,12 +969,12 @@ LFN(f_io_clearline){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
     return 0;
 }
 LFN(f_io_eraseline){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
-    fputs("\033[1A\r\033[2K",stdout); /* move up, return home, erase */
+    fputs("\033[1A\r\033[2K",stdout); /* up+home+erase */
     fflush(stdout);
     return 0;
 }
 LFN(f_io_clear){ UNUSED_SELF; (void)L; (void)base; (void)nargs;
-    fputs("\033[2J\033[H",stdout); /* erase screen and move cursor home */
+    fputs("\033[2J\033[H",stdout); /* clear screen+home */
     fflush(stdout);
     return 0;
 }
@@ -1101,7 +1085,7 @@ void lucL_open_io(void){
 
 
 /* luc_lib_json.c */
-/* luc_lib_json.c -- JSON module (loaded with require "json") */
+/* JSON module (require "json") */
 /* JSON */
 typedef struct { char *b; size_t len,cap; } SBuf;
 static void sb_init(SBuf *s){ s->cap=256; s->len=0; s->b=(char*)lmalloc(s->cap); }
@@ -1308,7 +1292,7 @@ Value lucL_json_module(void){
 
 
 /* luc_lib_list.c */
-/* luc_lib_list.c -- list methods + table library (they share sort/concat) */
+/* list + table lib (share sort/concat) */
 /* list methods */
 LFN(f_list_append){ UNUSED_SELF;
     Table *t=checktab(L,base,nargs,0,"append");
@@ -1374,7 +1358,7 @@ LFN(f_list_sort){ UNUSED_SELF;
     Value cmp=AR(1);
     int n=t->o.type==LT_LIST? t->alen : tab_len(t);
     int scratch=base+nargs+2;
-    for(int i=1;i<n;i++){                       /* insertion sort (stable) */
+    for(int i=1;i<n;i++){                       /* stable insertion sort */
         Value key=t->arr[i]; int j=i-1;
         while(j>=0 && sort_less(L,scratch,cmp,key,t->arr[j])){ t->arr[j+1]=t->arr[j]; j--; }
         t->arr[j+1]=key;
@@ -1449,7 +1433,7 @@ LFN(f_tbl_move){ UNUSED_SELF;
 }
 
 void lucL_open_list(void){
-/* list methods double as the method table for [] values */
+/* list methods also serve [] values */
     Table *li=newlib("list"); V.listmeta=li;
     reg(li,"append",f_list_append);   reg(li,"pop",f_list_pop);
     reg(li,"insert",f_list_insert);   reg(li,"remove",f_list_remove);
@@ -1468,7 +1452,7 @@ void lucL_open_list(void){
 
 
 /* luc_lib_math.c */
-/* luc_lib_math.c -- math library + bit32 (+ RNG seeding, moved from luc_init) */
+/* math + bit32 lib */
 /* math */
 static uint64_t rngstate=0x2545F4914F6CDD1DULL;
 static double rnd(void){
@@ -1512,15 +1496,11 @@ LFN(f_m_random){ UNUSED_SELF;
 LFN(f_m_randomseed){ UNUSED_SELF;
     rngstate=(uint64_t)(int64_t)checknum(L,base,nargs,0,"randomseed")|1ULL; return 0; }
 
-/* ---- exact big-integer multiply (Karatsuba) ----
- * math.karatsuba(a,b,...): exact decimal multiply of integer strings
- * (or integral numbers). Small sizes use naive O(n^2); above
- * KARAT_LIMBS limbs Karatsuba takes over automatically. Returns the
- * exact decimal string (never a rounded double). */
+/* !karatsuba big-int *: naive vs Karatsuba. */
 #define KBASE 1000000000u
 #define KARAT_LIMBS 32
 
-typedef struct { uint32_t *d; int n; } Big;  /* little-endian base-1e9 limbs */
+typedef struct { uint32_t *d; int n; } Big;  /* base-1e9 limbs, LE */
 
 static void big_free(Big *b){ if(b->d) free(b->d); b->d=NULL; b->n=0; }
 static int big_is_zero(const Big *b){
@@ -1540,7 +1520,7 @@ static int big_is_intstr(const char *s,int len){
     return nd>0 && i==len;
 }
 
-/* significant decimal digits (sign/blanks/leading zeros skipped) */
+/* significant digits (skip sign/blanks/zeros) */
 static int big_sigdigits(const char *s,int len){
     int i=0;
     while(i<len && (s[i]==' '||s[i]=='\t')) i++;
@@ -1598,7 +1578,7 @@ static int big_add(Big *r,const Big *a,const Big *b){
     return 1;
 }
 
-/* requires a>=b (magnitudes) */
+/* needs a>=b */
 static int big_sub(Big *r,const Big *a,const Big *b){
     r->d=(uint32_t*)calloc((size_t)a->n,sizeof(uint32_t)); if(!r->d) return 0;
     int64_t c=0;
@@ -1641,7 +1621,7 @@ static int big_mul_naive(Big *r,const Big *a,const Big *b){
         }
         r->d[i+b->n]=(uint32_t)((uint64_t)r->d[i+b->n]+c);
     }
-    /* propagate leftover carries from the direct add above */
+    /* carry leftovers from direct add */
     for(int i=0;i+1<n;i++){
         if(r->d[i]>=KBASE){ r->d[i+1]+=(uint32_t)(r->d[i]/KBASE); r->d[i]%=KBASE; }
     }
@@ -1649,7 +1629,7 @@ static int big_mul_naive(Big *r,const Big *a,const Big *b){
     return 1;
 }
 
-/* split src at k limbs: lo gets [0,k), hi gets [k,n) (copies, either may be zero) */
+/* split at k limbs: lo=[0,k), hi=[k,n) */
 static int big_split(const Big *s,int k,Big *lo,Big *hi){
     int nl=s->n<k?s->n:k, nh=s->n-nl;
     lo->d=(uint32_t*)calloc((size_t)(nl>0?nl:1),sizeof(uint32_t));
@@ -1699,7 +1679,7 @@ static int big_kmul(Big *r,const Big *a,const Big *b){
 
 static int big_mul(Big *r,const Big *a,const Big *b){ return big_kmul(r,a,b); }
 
-/* decimal string (malloc'd, *slen set); neg applies unless zero */
+/* decimal string (malloc'd); neg unless zero */
 static int big_to_str(const Big *a,int neg,char **out,int *slen){
     char msd[16];
     int m=snprintf(msd,sizeof msd,"%u",a->n>0?a->d[a->n-1]:0);
@@ -1715,9 +1695,7 @@ static int big_to_str(const Big *a,int neg,char **out,int *slen){
     return 1;
 }
 
-/* exact big path for MUL when both sides are integer strings.
- * force!=0 takes any size (pragma); otherwise only sizes doubles
- * cannot hold exactly (>15 significant digits). Returns 1 + *out. */
+/* big MUL path for integer strings; force skips size check. */
 int luc_try_bigmul(Value x,Value y,int force,Value *out){
     if(x.t!=LT_STR||y.t!=LT_STR) return 0;
     Str *sa=AS_STR(x), *sb=AS_STR(y);
@@ -1838,7 +1816,7 @@ LFN(f_m_type){ UNUSED_SELF;
 }
 
 void lucL_open_math(void){
-    rngstate ^= (uint64_t)time(NULL)*2654435761u | 1ULL;   /* moved from luc_init */
+    rngstate ^= (uint64_t)time(NULL)*2654435761u | 1ULL;   /* seed once */
     Table *m=newlib("math");
     reg(m,"floor",f_m_floor); reg(m,"ceil",f_m_ceil);  reg(m,"sqrt",f_m_sqrt);
     reg(m,"abs",f_m_abs);     reg(m,"sin",f_m_sin);    reg(m,"cos",f_m_cos);
@@ -1863,7 +1841,7 @@ void lucL_open_math(void){
 
 
 /* luc_lib_os.c */
-/* luc_lib_os.c -- os library (os.execute moved here from the window section) */
+/* os lib */
 /* os */
 #if defined(_WIN32)
 #  include <windows.h>
@@ -1948,7 +1926,7 @@ void lucL_open_os(void){
 
 
 /* luc_lib_string.c */
-/* luc_lib_string.c -- string library + Lua-style pattern matching */
+/* string lib + patterns */
 /* string */
 static int posrelat(int pos,int len){
     if(pos>=0) return pos;
@@ -2004,7 +1982,7 @@ LFN(f_str_byte){ UNUSED_SELF;
     if(i<1)i=1;
     if(j>s->len)j=s->len;
     int n=0;
-    for(int x=i;x<=j;x++){ RET(n,mknum((double)(unsigned char)s->s[x-1])); n++; }  /* RET() expands its index twice ??? never pass n++ */
+    for(int x=i;x<=j;x++){ RET(n,mknum((double)(unsigned char)s->s[x-1])); n++; }  /* RET uses n twice */
     return n;
 }
 LFN(f_str_char){ UNUSED_SELF;
@@ -2079,7 +2057,7 @@ LFN(f_str_split){ UNUSED_SELF;
     Str *sep = nargs>=2? checkstr(L,base,nargs,1,"split") : NULL;
     Table *l=tab_new(1);
     Value lv=mkobj(LT_LIST,l);
-    RET(0,lv);                                   /* root it immediately */
+    RET(0,lv);                                   /* root now */
     if(!sep || sep->len==0){
         for(int i=0;i<s->len;i++) list_push(l,strv(s->s+i,1));
         return 1;
@@ -2134,7 +2112,7 @@ LFN(f_str_fromhex){ UNUSED_SELF;
     RET(0,strv(b,s->len/2)); free(b); return 1;
 }
 
-/* Lua-style pattern matching */
+/* pattern matching */
 #define L_ESC '%'
 #define MAXCAPT 32
 typedef struct MatchState {
@@ -2438,7 +2416,7 @@ void lucL_open_string(void){
 
 
 /* luc_lib_window.c */
-/* luc_lib_window.c -- SDL2 window module (loaded with require "window") build with -DLUC_WINDOW (see Makefile target luc-window) */
+/* window module (SDL2, -DLUC_WINDOW) */
 #ifdef LUC_WINDOW
 #  define SDL_MAIN_HANDLED
 #  include <SDL2/SDL.h>
@@ -2451,10 +2429,7 @@ void lucL_open_string(void){
 #  ifndef LUC_NO_MIXER
 #    include <SDL2/SDL_mixer.h>
 #  endif
-/* Satellite DLLs (SDL2_ttf / SDL2_image / SDL2_mixer) bind at RUNTIME via
-   LoadLibrary/GetProcAddress so the exe starts without them; missing DLLs
-   degrade gracefully (bitmap font, BMP-only, no sound) with clean errors.
-   dlopen fallback for non-Windows builds. */
+/* Satellite DLLs bind at runtime; missing ones degrade gracefully. */
 #ifdef _WIN32
 #  include <windows.h>
 #  define W_LIB_H  HMODULE
@@ -2565,7 +2540,7 @@ static struct {
     char textbuf[256]; int textlen;
     WImg img[W_IMGCACHE];
     WTxt txt[W_TXTCACHE];
-    int has_ttf, has_img, has_mix;   /* satellite DLLs present */
+    int has_ttf, has_img, has_mix;   /* optional DLLs present */
 #ifndef LUC_NO_MIXER
     int mix_ok;
     WSnd snd[W_SNDCACHE];
@@ -2579,7 +2554,7 @@ static struct {
 #endif
 } W;
 
-/* embedded 5x7 fallback font (ASCII 32..126, column major, LSB = top) */
+/* 5x7 fallback font (ASCII 32..126) */
 static const unsigned char W_FONT5x7[95][5] = {
 {0x00,0x00,0x00,0x00,0x00},{0x00,0x00,0x5F,0x00,0x00},{0x00,0x07,0x00,0x07,0x00},
 {0x14,0x7F,0x14,0x7F,0x14},{0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},
@@ -2761,7 +2736,7 @@ static int w_scancodes(const char *n,SDL_Scancode *out){
 /* fonts */
 #ifndef LUC_NO_TTF
 static const char *W_FONTPATHS[] = {
-    "DejaVuSans.ttf",       /* shipped next to luc.exe by the installer */
+    "DejaVuSans.ttf",       /* ships with installer */
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans.ttf",
@@ -2804,7 +2779,7 @@ static void w_drop_fonts(void){
 #endif
 
 /* texture caches */
-static void w_drop_sounds(void);   /* defined in the sound section below */
+static void w_drop_sounds(void);   /* sound section below */
 static void w_drop_text_cache(void){
     for(int i=0;i<W_TXTCACHE;i++){
         if(W.txt[i].tex) SDL_DestroyTexture(W.txt[i].tex);
@@ -2817,7 +2792,7 @@ static void w_drop_img_cache(void){
         W.img[i].tex=NULL; W.img[i].path[0]=0;
     }
 }
-/* AVIF/JPEG-XL decoder DLLs are not shipped with LUC (too heavy for beginners) */
+/* AVIF/JPEG-XL decoders not shipped (too heavy) */
 static int w_unshipped_format(const char *path){
     size_t pl=strlen(path);
     if(pl>4){
@@ -2841,7 +2816,7 @@ static SDL_Texture *w_image(const char *path,int *ow,int *oh){    for(int i=0;i<
         }
     SDL_Surface *s;
 #ifndef LUC_NO_IMAGE
-    if(w_unshipped_format(path)) return NULL;   /* fail cleanly, caller reports */
+    if(w_unshipped_format(path)) return NULL;   /* caller reports */
     if(W.has_img) s=pIMG_Load(path);
     else s=SDL_LoadBMP(path);                   /* degraded: BMP only */
 #else
@@ -3122,10 +3097,7 @@ LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
     return 0;
 }
 
-/* beginner game loop: go(title, w, h, draw_fn)
-   starts the window (unless already started), calls draw_fn(dt) every frame
-   at 60 fps, presents, and closes on exit.  The classic
-   while/running/update loop keeps working untouched. */
+/* go(title,w,h,draw): run 60fps loop until exit. */
 LFN(f_w_go){ UNUSED_SELF;
     const char *title = nargs>=1? checkstr(L,base,nargs,0,"go")->s : "LUC";
     int ww = nargs>=2? checkint(L,base,nargs,1,"go") : 800;
@@ -3288,7 +3260,7 @@ LFN(f_w_text_size){ UNUSED_SELF;
       RET(0,mknum(tw)); RET(1,mknum(th)); }
     return 2;
 }
-/* centered text for beginners: text_center(s, y [, color [, size]]) */
+/* centered text: text_center(s,y[,color[,size]]) */
 LFN(f_w_text_center){ UNUSED_SELF;
     w_need();
     Str *s=checkstr(L,base,nargs,0,"text_center");
@@ -3355,10 +3327,9 @@ LFN(f_w_image_size){ UNUSED_SELF;
     if(!w_image(p->s,&iw,&ih)){ RET(0,NIL); RET(1,cstrv("cannot load image")); return 2; }
     RET(0,mknum(iw)); RET(1,mknum(ih)); return 2;
 }
-/* beginner sprites: spr = window.sprite(path); window.draw(spr, x, y [, opts])
-   opts = { scale = 2, rotate = 45, flip = "x"/"y"/"xy", alpha = 128, center = true } */
+/* sprites: sprite(path); draw(spr,x,y[,opts]) */
 LFN(f_w_sprite){ UNUSED_SELF;
-    /* preload-friendly: no window needed yet, the texture loads on first draw */
+    /* no window yet; texture loads on first draw */
     Str *p=checkstr(L,base,nargs,0,"sprite");
     if(w_unshipped_format(p->s))
         luc_error("window.sprite: '%s' uses AVIF/JPEG-XL, which LUC does not ship - convert it to PNG or JPG",p->s);
@@ -3389,7 +3360,7 @@ LFN(f_w_draw){ UNUSED_SELF;
         luc_error("window.draw: cannot load '%s' (built without SDL2_image; only .bmp is supported)",AS_STR(pv)->s);
 #endif
     }
-    /* fill in sprite size on first draw (sprite() preloads without a window) */
+    /* fill size on first draw (preloaded w/o window) */
     tab_set(t,cstrv("w"),mknum((double)iw));
     tab_set(t,cstrv("h"),mknum((double)ih));
     double scale=1.0, angle=0.0; int alpha=255, flipm=0, centered=0;
@@ -3555,7 +3526,7 @@ LFN(f_w_screenshot){ UNUSED_SELF;
     RET(0,mkbool(1)); return 1;
 }
 
-/* sound + music (SDL_mixer): WAV always works, OGG/MP3/FLAC need the mixer DLLs */
+/* sound (SDL_mixer): WAV built-in, rest need DLLs */
 #ifndef LUC_NO_MIXER
 static void w_drop_sounds(void){
     for(int i=0;i<W_SNDCACHE;i++){
@@ -3586,7 +3557,7 @@ static Mix_Chunk *w_sound(const char *path){
 static void w_need_mix(const char *fn){
     if(!W.mix_ok){
 #ifndef LUC_NO_MIXER
-        w_audio_init();   /* reopen after a window close shut it down */
+        w_audio_init();   /* reopen after window close */
 #endif
     }
     if(!W.mix_ok)
@@ -3597,7 +3568,7 @@ static int w_opt_volume(Table *o){
     if(v.t==LT_NUM){ int p=(int)v.u.n; if(p<0)p=0; if(p>100)p=100; return p*128/100; }
     return -1;
 }
-/* loop opt: true/-1 = forever, N>=1 = N plays total, else once */
+/* loop: true/-1=forever, N=N plays, else once */
 static int w_opt_loops(Table *o){
     Value v=tab_get(o,cstrv("loop"));
     if(v.t==LT_BOOL) return v.u.b? -1 : 0;
@@ -3633,7 +3604,7 @@ LFN(f_w_sound){ UNUSED_SELF;
     if(!w_sound(p->s)) luc_error("window.sound: cannot load '%s' (%s)",p->s,SDL_GetError());
     RET(0,mkobj(LT_TABLE,w_sound_handle(p->s))); return 1;
 }
-/* play(snd [, opts]): opts = { loop = 2, volume = 80 }. returns true/false. */
+/* play(snd[,opts]) -> bool */
 LFN(f_w_play){ UNUSED_SELF;
     w_need_mix("play");
     Mix_Chunk *c=w_sound_arg(L,base,nargs,0,"play");
@@ -3673,13 +3644,13 @@ static const char *w_music_path(LucState *L,int base,int nargs,int i,const char 
 LFN(f_w_music){ UNUSED_SELF;
     w_need_mix("music");
     Str *p=checkstr(L,base,nargs,0,"music");
-    /* validate now so typos fail fast */
+    /* fail fast on typos */
     Mix_Music *m=pMix_LoadMUS(p->s);
     if(!m) luc_error("window.music: cannot load '%s' (%s)",p->s,SDL_GetError());
     pMix_FreeMusic(m);
     RET(0,mkobj(LT_TABLE,w_music_handle(p->s))); return 1;
 }
-/* play_music(m [, opts]): opts = { loop = -1 (default: forever), volume = 80 } */
+/* play_music(m[,opts]); loop=-1 forever */
 LFN(f_w_play_music){ UNUSED_SELF;
     w_need_mix("play_music");
     const char *path=w_music_path(L,base,nargs,0,"play_music");
@@ -3741,7 +3712,7 @@ LFN(f_w_sound_volume){ UNUSED_SELF;
 }
 #endif /* LUC_NO_MIXER */
 
-/* load satellite DLLs at runtime; missing ones degrade gracefully */
+/* load DLLs at runtime; missing degrade gracefully */
 static void w_load_satellites(void){
     static int done=0; if(done) return; done=1;
 #ifndef LUC_NO_TTF
@@ -3902,32 +3873,7 @@ Value lucL_window_module(void){
 
 
 /* luc_lib_net.c */
-/* luc_lib_net -- TCP + HTTP client/server (import net).
- *
- * Sockets are always non-blocking. The raw CFuncs (__recv_try /
- * __accept_try) attempt exactly once and never wait; the user-facing
- * recv / accept are LUC closures (built once at first import) that loop
- * the raw attempt with task.wait between tries. Because the retry lives in
- * ordinary LUC code, coroutine yield/resume works by construction and the
- * plain blocking-style API stays concurrent across task.spawn clients:
- *
- *   import net("n")
- *   create s = n.serve(8000)
- *   while true do
- *     create cli = s:accept()
- *     task.spawn(function()
- *       while true do
- *         create m = cli:recv()
- *         if m == nil then break end
- *         cli:send("echo:" .. m)
- *       end
- *     end)
- *   end
- *
- * Error contract: success returns the value; failure returns nil + message.
- * recv distinguishes empty (nil, no error: retry) from closed (nil +
- * "closed") from timeout (nil + "timeout"). Only http:// URLs (no TLS).
- * Windows needs ws2_32 at link time. */
+/* net lib: non-blocking TCP+HTTP with LUC retry. */
 #if defined(_WIN32)
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
@@ -3981,8 +3927,7 @@ static void sock_set_nonblock(sock_t fd){
     int f=fcntl(fd,F_GETFL,0); if(f>=0) fcntl(fd,F_SETFL,f|O_NONBLOCK);
 #endif
 }
-/* block-or-timeout helpers for one-shot operations (connect, HTTP):
- * single select(), no scheduler involvement (they complete fast). */
+/* one-shot helpers: single select(), no scheduler (fast ops). */
 static int sock_wait_writable(sock_t fd,double timeout){
     fd_set w; FD_ZERO(&w);
 #if defined(_WIN32)
@@ -4017,10 +3962,7 @@ static void sock_set_blocking(sock_t fd,int blocking){
 static void net_errmsg(char *buf,size_t sz,const char *what){
     snprintf(buf,sz,"%s (network error %d)",what,sock_errcode());
 }
-/* ---- TLS client via Schannel (Windows). POSIX builds: unavailable. ----
- * Used with BLOCKING sockets only (the HTTP path flips to blocking after
- * connect, with 30s timeouts as backstop). Certificate chain + hostname
- * are validated against the system store by default. */
+/* TLS via Schannel (Windows only), blocking+validated. */
 #if defined(_WIN32)
 #  ifndef SECURITY_WIN32
 #  define SECURITY_WIN32
@@ -4031,8 +3973,8 @@ typedef struct {
     CredHandle cred; CtxtHandle ctx;
     SecPkgContext_StreamSizes sizes;
     int cred_ok, ctx_ok;
-    char *enc;   size_t enclen, enccap;   /* undecrypted leftover bytes */
-    char *pend;  size_t pendlen, pendcap; /* decrypted, unread bytes    */
+    char *enc;   size_t enclen, enccap;   /* leftover encrypted bytes */
+    char *pend;  size_t pendlen, pendcap; /* decrypted unread bytes */
 } TLSSession;
 static void tls_free_session(TLSSession *s){
     if(!s) return;
@@ -4048,7 +3990,7 @@ static int tls_send_all(sock_t fd,const char *p,size_t n){
     }
     return 1;
 }
-/* full client handshake on a blocking socket. 0 ok, -1 error (err set). */
+/* blocking handshake; 0 ok, -1 error. */
 static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
                           char *err,size_t errcap){
     TLSSession *s=(TLSSession*)calloc(1,sizeof(TLSSession));
@@ -4080,12 +4022,7 @@ static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
             inb.cBuffers=2; inb.pBuffers=inbuf;
         }
         DWORD outf=0;
-        /* NOTE: this MinGW header declares InitializeSecurityContextA with
-         * 12 params including phNewContext (like AcceptSecurityContext).
-         * phNewContext MUST receive &s->ctx: it carries the partial/new
-         * context handle across calls. Passing NULL here "works" for the
-         * first call but every later call fails with SEC_E_QOP_NOT_SUPPORTED
-         * (0x80090301) because s->ctx was never filled in. */
+        /* MinGW needs phNewContext=&s->ctx or later calls fail SEC_E_QOP. */
         st=InitializeSecurityContextA(&s->cred,first?NULL:&s->ctx,
             (SEC_CHAR*)hostname,flags,0,0,first?NULL:&inb,0,&s->ctx,&outb,&outf,NULL);
         s->ctx_ok=1;
@@ -4143,7 +4080,7 @@ static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
     free(b);
     return 0;
 }
-/* returns >0 bytes out, 0 on orderly close, -1 on error */
+/* >0 bytes, 0 close, -1 error */
 static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
     if(s->pendlen>0){
         size_t k=s->pendlen>max?max:s->pendlen;
@@ -4177,7 +4114,7 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
             SecBufferDesc d;
             d.ulVersion=SECBUFFER_VERSION; d.cBuffers=4; d.pBuffers=bufs;
             SECURITY_STATUS st=DecryptMessage(&s->ctx,&d,0,NULL);
-            if(st==SEC_E_INCOMPLETE_MESSAGE) break;   /* recv more above */
+            if(st==SEC_E_INCOMPLETE_MESSAGE) break;   /* need more */
             if(st!=SEC_E_OK&&st!=SEC_I_RENEGOTIATE) return -1;
             {
                 char *data=NULL; size_t dlen=0, extralen=0;
@@ -4190,13 +4127,11 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
                         extra=(char*)bufs[i].pvBuffer; extralen=bufs[i].cbBuffer;
                     }
                 }
-                /* NOTE: data/extra both alias s->enc: copy data OUT first,
-                 * then compact EXTRA. (The old order moved EXTRA first and
-                 * clobbered data -> garbage frames on coalesced bursts.) */
+                /* data/extra alias enc: copy data first (else clobbers). */
                 if(dlen>0){
                     size_t k=dlen>max?max:dlen;
                     memcpy(out,data,k);
-                    if(dlen>k){   /* stash the rest decrypted */
+                    if(dlen>k){   /* stash rest */
                         if(s->pendlen+dlen-k>s->pendcap){
                             size_t nc=s->pendcap?s->pendcap*2:8192;
                             while(nc<s->pendlen+dlen-k) nc*=2;
@@ -4226,8 +4161,7 @@ void net_socket_close_fd(Socket *s){
     if(!s||s->closed) return;
     s->closed=1;
     if(s->isws && (sock_t)s->fd!=SOCK_INVALID){
-        /* best-effort closing handshake (ignored when it fails).
-         * Client frames MUST be masked: header + 4-byte mask + masked empty payload. */
+        /* best-effort masked close handshake. */
         unsigned char cf[6]={0x88,0x80,0x12,0x34,0x56,0x78};
         send((sock_t)s->fd,(const char*)cf,6,0);
     }
@@ -4253,7 +4187,7 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
     (void)s; (void)fd; (void)out; (void)max; return -1;
 }
 #endif
-/* blocking-style connect with timeout, scheduler-pumped. */
+/* scheduler-pumped connect with timeout. */
 static sock_t net_connect_to(const char *host,int port,double timeout,char *err,size_t errcap){
     char ports[16]; snprintf(ports,sizeof ports,"%d",port);
     struct addrinfo hints, *list=NULL, *ai;
@@ -4274,7 +4208,7 @@ static sock_t net_connect_to(const char *host,int port,double timeout,char *err,
 #else
         if(errno!=EINPROGRESS){ sock_closefd(fd); continue; }
 #endif
-        /* one-shot wait (connect completes fast; caller picks timeout) */
+        /* fast one-shot wait */
         int ok=0;
         if(sock_wait_writable(fd,timeout<0?5:timeout)){
             int e=0; socklen_t el=sizeof e;
@@ -4321,7 +4255,7 @@ LFN(f_net_serve){
     sock_set_nonblock(fd);
     RET(0,mkobj(LT_SOCKET,sock_wrap(fd,1))); return 1;
 }
-/* single non-blocking attempt: client socket, or nil (empty for now) */
+/* one non-blocking accept; nil if empty. */
 LFN(f_sock_accept_try){
     Socket *s=checksock(L,base,nargs,0,"accept");
     if(!s->isserver) luc_error("'accept' on a client socket (serve() first)");
@@ -4340,8 +4274,7 @@ LFN(f_sock_send){
     const char *p=d->s; size_t total=(size_t)d->len;
     char *frame=NULL; size_t framelen=0;
     if(s->isws){
-        /* flip to blocking around the frame write (single-threaded: atomic
-         * w.r.t. other tasks), backstop via the 30s timeouts below */
+        /* blocking write is atomic (single-threaded). */
         if(ws_build_frame(d->s,(size_t)d->len,&frame,&framelen)!=0){
             RET(0,NIL); RET(1,cstrv("message too large")); return 2;
         }
@@ -4352,7 +4285,7 @@ LFN(f_sock_send){
     double t0=luc_now();
     while((size_t)sent<total){
         if(s->tlsctx){
-            /* blocking socket here: all-or-nothing per call */
+            /* all-or-nothing here */
             if(tls_send((TLSSession*)s->tlsctx,(sock_t)s->fd,p+sent,total-(size_t)sent)!=0){
                 char e[96];
                 snprintf(e,sizeof e,"send: %s",luc_now()-t0>20?"timeout":"failed");
@@ -4380,8 +4313,7 @@ LFN(f_sock_send){
     if(s->isws) sock_set_blocking((sock_t)s->fd,0);
     RET(0,mknum((double)(d->len))); return 1;
 }
-/* single non-blocking attempt: data | nil,"closed" | nil (empty for now).
- * The user-facing recv is a LUC closure looping this with task.wait. */
+/* one non-blocking recv; LUC closure retries with task.wait. */
 LFN(f_sock_recv_try){
     if(getenv("LUC_RAWLOG")){
         fprintf(stderr,"RAW nargs=%d t0=%d t1=%d\n",nargs,
@@ -4420,9 +4352,9 @@ LFN(f_sock_close){
     net_socket_close_fd(AS_SOCK(v));
     RET(0,mkbool(1)); return 1;
 }
-/* ---- minimal HTTP/1.0 over the above (no TLS: https:// rejected) ---- */
+/* minimal HTTP/1.0 (no TLS) */
 static int http_has_chunked(const char *h,size_t n){
-    /* case-insensitive search for "transfer-encoding" containing "chunked" */
+    /* chunked transfer check */
     for(size_t i=0;i+17<n;i++){
         size_t k=0;
         const char *needle="transfer-encoding";
@@ -4450,7 +4382,7 @@ static int http_status(const char *h,size_t n){
     while(i<n && h[i]>='0' && h[i]<='9'){ code=code*10+(h[i]-'0'); i++; }
     return code;
 }
-/* decode chunked body in place; returns new length */
+/* chunked decode in place */
 static size_t http_dechunk(char *p,size_t n){
     size_t r=0, w=0;
     while(r<n){
@@ -4473,7 +4405,7 @@ static size_t http_dechunk(char *p,size_t n){
     }
     return w;
 }
-/* one transport for plain and TLS bytes inside net_http */
+/* plain/TLS transport for net_http */
 static int hsend(TLSSession *tls,sock_t fd,const char *p,size_t n,
                  char *err,size_t errcap){
     size_t off=0;
@@ -4526,7 +4458,7 @@ static int net_http(const char *url,const char *method,const char *body,int body
     if(rn<=0||rn>=(int)sizeof req-1){ snprintf(err,errcap,"url too long"); return 0; }
     sock_t fd=net_connect_to(host,port,10,err,errcap);
     if(fd==SOCK_INVALID) return 0;
-    /* HTTP is one-shot: flip to blocking with backstop timeouts */
+    /* one-shot HTTP: blocking with timeouts */
     sock_set_blocking(fd,1);
     sock_set_timeout(fd,1,30); sock_set_timeout(fd,0,30);
     TLSSession *tls=NULL;
@@ -4568,10 +4500,7 @@ static int net_http(const char *url,const char *method,const char *body,int body
     *out_body=out; *out_len=blen;
     return 1;
 }
-/* ---- WebSocket client (RFC 6455). Only the client role: we always mask.
- * Control frames: ping is auto-answered, pong ignored, close ends the
- * stream. Fragmented messages are reassembled. wire format knowledge stays
- * here; Socket carries rbuf (unparsed bytes) + frag (partial message). */
+/* WS client (RFC6455): masked, ping auto, frags reassembled. */
 static unsigned ws_rotl(unsigned x,int n){ return (x<<n)|(x>>(32-n)); }
 static void ws_sha1(const unsigned char *msg,size_t len,unsigned char out[20]){
     unsigned h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
@@ -4623,7 +4552,7 @@ static void ws_b64(const unsigned char *in,size_t n,char *out){
     }
     out[o]=0;
 }
-/* send one masked text frame over fd (+tls). Blocking, like HTTP. */
+/* send masked text frame (blocking). */
 static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
                          char *err,size_t errcap){
     unsigned char h[10]; size_t hl=2;
@@ -4634,7 +4563,7 @@ static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
     mask[2]=(unsigned char)(rnd>>8); mask[3]=(unsigned char)rnd;
     if(n<126){ h[1]=(unsigned char)(0x80|n); }
     else if(n<65536){ h[1]=0x80|126; h[2]=(unsigned char)(n>>8); h[3]=(unsigned char)(n&255); hl=4; }
-    else return 0;   /* messages bigger than 64K are split by callers */
+    else return 0;   /* >64K split by callers */
     char *frame=(char*)malloc(hl+4+n);
     if(!frame) return 0;
     memcpy(frame,h,hl); memcpy(frame+hl,mask,4);
@@ -4643,10 +4572,8 @@ static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
     free(frame);
     return ok;
 }
-/* try to extract one message from s->rbuf (non-blocking).
- * Returns: 1 message ready (*outp/*outn malloc'd), 0 need more data,
- * -1 fatal protocol error, -2 orderly close. Ping is auto-answered. */
-/* hexdump of the offending bytes when LUC_WSDEBUG is set */
+/* pull one message: 1 ready, 0 need data, -1 fatal, -2 close. */
+/* hexdump when LUC_WSDEBUG set */
 static void ws_debug_dump(Socket *s,const char *why){
     if(!getenv("LUC_WSDEBUG")) return;
     fprintf(stderr,"ws-debug [%s] rlen=%d head:",why,(int)s->rlen);
@@ -4677,9 +4604,9 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
         if(op>=0x8 && (!fin || pay>125)){
             snprintf(err,errcap,"ws: bad control frame"); ws_debug_dump(s,"badctl"); return -1;
         }
-        if((unsigned long long)(s->rlen-hlen)<pay) return 0;  /* partial: wait */
+        if((unsigned long long)(s->rlen-hlen)<pay) return 0;  /* partial */
         const char *payload=(const char*)(b+hlen);
-        if(op==0x8){   /* close: report code+reason, consume the frame */
+        if(op==0x8){   /* close frame */
             if(pay>=2){
                 int code=((unsigned char)payload[0]<<8)|(unsigned char)payload[1];
                 size_t rlen=(size_t)pay-2;
@@ -4691,7 +4618,7 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
             s->rlen-=hlen+(size_t)pay;
             return -2;
         }
-        if(op==0x9){   /* ping -> pong, then continue with next frame */
+        if(op==0x9){   /* ping->pong */
             unsigned char pong[130]; size_t pl=pay>125?125:(size_t)pay;
             pong[0]=0x8A; pong[1]=(unsigned char)(0x80|pl);
             unsigned char mk[4]={0x12,0x34,0x56,0x78};
@@ -4711,7 +4638,7 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
         if(op!=0x0 && op!=0x1 && op!=0x2){
             snprintf(err,errcap,"ws: bad opcode %d",op); ws_debug_dump(s,"badop"); return -1;
         }
-        /* text/binary/continuation: append to reassembly */
+        /* append fragment */
         if(s->fraglen+(size_t)pay>maxmsg){ snprintf(err,errcap,"ws: message too large"); return -1; }
         if(s->fraglen+(size_t)pay>s->fragcap){
             size_t nc=s->fragcap?s->fragcap*2:4096;
@@ -4731,7 +4658,7 @@ static int ws_pull_message(Socket *s,sock_t fd,void *tlsv,char **outp,size_t *ou
         }
     }
 }
-/* build one masked client text frame; caller frees *out. 0 ok. */
+/* build masked frame; caller frees. 0 ok. */
 static int ws_build_frame(const char *p,size_t n,char **out,size_t *outlen){
     if(n>65535) return -1;
     size_t hl=n<126?2:4;
@@ -4749,8 +4676,7 @@ static int ws_build_frame(const char *p,size_t n,char **out,size_t *outlen){
     *out=f; *outlen=hl+4+n;
     return 0;
 }
-/* read available bytes into rbuf once (non-blocking).
- * 1 = new data, 0 = none right now, -1 = dead/closed. */
+/* fill rbuf once: 1 data, 0 none, -1 dead. */
 static int ws_fill(Socket *s,sock_t fd,void *tlsv){
     if(s->rlen+4096>s->rcap){
         size_t nc=s->rcap?s->rcap*2:16384;
@@ -4896,9 +4822,7 @@ LFN(f_net_post){
     Value v=strv(rbody,rlen); free(rbody);
     RET(0,v); RET(1,mknum((double)code)); return 2;
 }
-/* The user-facing recv/accept retry in ordinary LUC (so task.wait yields
- * correctly and the call transparently retries). Raw attempts ride in as
- * factory parameters, becoming upvalues of the two methods. */
+/* LUC retry wraps raw tries (yields via task.wait). */
 static const char *net_methods_src =
 "return function(raw_recv, raw_accept)\n"
 "  create methods = {}\n"
@@ -4932,14 +4856,14 @@ static void net_build_methods(LucState *L){
     ensure_stack(L,sc+16);
     L->stack[sc]=mkobj(LT_FUNC,cl);
     L->top=sc+1;
-    vm_call(L,sc,0,1);             /* outer() -> inner factory at [sc] */
+    vm_call(L,sc,0,1);             /* outer->factory */
     L->stack[sc+1]=mkobj(LT_CFUNC,cfunc_new(f_sock_recv_try,"__recv_try",0));
     L->stack[sc+2]=mkobj(LT_CFUNC,cfunc_new(f_sock_accept_try,"__accept_try",0));
     L->top=sc+3;
-    vm_call(L,sc,2,1);             /* inner(raw1,raw2) -> methods at [sc] */
+    vm_call(L,sc,2,1);             /* inner->methods */
     Value methods=L->stack[sc];
     if(methods.t!=LT_TABLE) luc_error("net: internal error building methods");
-    L->top=sc+3;   /* keep everything rooted while interning below */
+    L->top=sc+3;   /* keep rooted */
     tab_set(V.socklib,cstrv("__recv_try"),L->stack[sc+1]);
     tab_set(V.socklib,cstrv("__accept_try"),L->stack[sc+2]);
     tab_set(V.socklib,cstrv("recv"),tab_get(AS_TAB(methods),cstrv("recv")));
