@@ -11,7 +11,6 @@ int  luc_aot_embedded(char **psrc,int *plen);
 #if defined(_WIN32)
 #  include <windows.h>
 #  include <winhttp.h>
-#  include <conio.h>
 #  include <process.h>
 #else
 #  include <sys/time.h>
@@ -4184,6 +4183,7 @@ static void print_help(void){
     "usage: luc [options] [script [args...]]\n\n"
     "  script.luc          run a LUC source file\n"
     "  -e \"chunk\"          execute LUC code from the command line\n"
+    "  --edit [path]       open the LC Code editor\n"
     "  install [pkg]       list or install a package  (window, ai, discord)\n"
     "  -v, --version       print version and exit\n"
     "  -h, --help          print this help and exit\n\n"
@@ -4574,6 +4574,11 @@ static const HelpTopic HELP_TOPICS[] = {
  "edit hello.luc opens lc code, the tiny built-in editor (.luc, .lua, .py).\n"
  "Type, arrows move, Enter splits, Ctrl+C copies the line, Ctrl+V pastes,\n"
  "Ctrl+S saves, ^R runs the .luc file, Esc quits."},
+{"lccode",
+ "lccode [path] opens lc code: files on the left, code on the right.\n"
+ "Tree: Enter expands, Left/Right collapse, click opens, wheel scrolls.\n"
+ "Files: N new, D folder, F2 rename, ^C/^V copy/paste, right-click menu.\n"
+ "Code gets colors. ^E switches panes, ^B hides the tree, ^R runs."},
 {"require",
  "create m = require(\"name\") loads a third-party file module.\n"
  "System libs use import instead."},
@@ -4621,16 +4626,54 @@ static void repl_help_loop(void){
 
 typedef struct { char *b; size_t len, cap; } EdLine;
 
+/* a parked open buffer (kept when switching files with unsaved changes) */
+typedef struct { EdLine *ln; size_t n, cap, cx, cy, top; int dirty; char path[1024]; } EdStash;
+
+typedef struct { const char *label; int id; } EdMenuItem;
+
 typedef struct {
     EdLine *ln; size_t n, cap;
     size_t cx, cy;            /* cursor: byte column, line */
     size_t top;               /* first visible line */
+    size_t dleft;             /* horizontal scroll (display cols) */
     int dirty, quit_arm;
     char *clip; size_t cliplen;
     char status[160];
-    const char *path;
+    char path[1024];
     int numw;                 /* gutter width for line numbers */
+    /* explorer (left pane) */
+    struct ExItem *ex; size_t exn, excap;
+    size_t exsel, extop;
+    char exdir[1024];
+    int focus;                /* 0 code, 1 files */
+    int show_ex;              /* explorer visible (Ctrl+B) */
+    int vw, vh;               /* last drawn size (mouse mapping) */
+    unsigned short surr_hi;   /* pending UTF-16 lead surrogate */
+    char **rsav; size_t rsavn, rsavcap;  /* collapse-all restore set */
+    int root_shut;            /* folder header toggled shut */
+    /* parked dirty buffers (switch files freely, nothing is lost) */
+    EdStash *stash; size_t nstash, scap;
+    /* popup menu (... button, right-click) */
+    int menu; EdMenuItem mitems[8]; int nitems, msel;
+    int click_eat;        /* swallow double-click second half after a pick */
+    /* inline naming (new file/folder, F2 rename): popup input */
+    int naming; /* 0 off, 1 new file, 2 new dir, 3 rename */
+    char namb[256]; size_t namlen, namcur;
+    char namdir[1024];   /* target dir (new) or parent dir (rename) */
+    char namold[1024];   /* rename source full path (mode 3) */
+    /* file clipboard (explorer copy/paste) */
+    char fcb[1024]; int fcb_dir, fcb_ok;
+    /* popup placement/title: right-click anchors the menu at the mouse */
+    int menu_anch, menu_ax, menu_ay;
+    char menutitle[320];
+    /* pending delete (confirmed through a small popup) */
+    char deltarget[1024]; int delisdir;
 } Editor;
+
+typedef struct ExItem { char *name; char *full; int isdir; int depth; int expanded; } ExItem;
+#define ED_EX_MAX 2000   /* visible tree cap */
+
+#define ED_EXW 28   /* explorer pane width */
 
 static void ed_line_reserve(EdLine *l,size_t extra){
     if(l->len+extra+1>l->cap){
@@ -4656,6 +4699,16 @@ static void ed_clamp(Editor *e){
     if(e->cx>e->ln[e->cy].len) e->cx=e->ln[e->cy].len;
 }
 
+/* keep scroll offsets inside the reachable range (wheel can overshoot) */
+static void ed_clamp_view(Editor *e,int H){
+    size_t rows=H>2?(size_t)(H-2):1;
+    size_t maxtop=e->n>rows?e->n-rows:0;
+    size_t erows=rows>2?rows-2:1;
+    size_t maxex=e->exn>erows?e->exn-erows:0;
+    if(e->top>maxtop) e->top=maxtop;
+    if(e->extop>maxex) e->extop=maxex;
+}
+
 static void ed_move_left(Editor *e){
     ed_clamp(e);
     if(e->cx>0){ do e->cx--; while(e->cx>0 && ed_is_cont((unsigned char)e->ln[e->cy].b[e->cx])); }
@@ -4667,12 +4720,35 @@ static void ed_move_right(Editor *e){
       if(e->cx<L){ do e->cx++; while(e->cx<L && ed_is_cont((unsigned char)e->ln[e->cy].b[e->cx])); } }
 }
 
-/* display column of the cursor (chars, not bytes) */
+/* display width of one byte at display column col (tabs expand, C0/DEL
+ * show as one placeholder, UTF-8 continuation bytes take no room) */
+static int ed_chw(unsigned char c,int col){
+    if(c=='\t') return 4-(col%4);
+    if(c<32||c==127) return 1;
+    if((c&0xC0)==0x80) return 0;
+    return 1;
+}
+
+/* printable form for display (binary files stay viewable, never execute) */
+static unsigned char ed_chshow(unsigned char c){
+    if(c=='\t'||c>=32&&c!=127) return c;
+    return '.';
+}
+
+/* display column of the cursor */
 static size_t ed_dcol(Editor *e){
     ed_clamp(e);
-    { size_t d=0,k=0; char *b=e->ln[e->cy].b;
-      while(k<e->cx){ if(!ed_is_cont((unsigned char)b[k])) d++; k++; }
+    { size_t d=0,col=0,k=0; char *b=e->ln[e->cy].b;
+      while(k<e->cx){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
       return d; }
+}
+
+/* byte offset holding display column dc (snaps forward over continuations) */
+static size_t ed_byte_at(char *b,size_t len,size_t dc){
+    size_t k=0,d=0,col=0;
+    while(k<len&&d<dc){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
+    while(k<len&&ed_is_cont((unsigned char)b[k])) k++;
+    return k;
 }
 
 static void ed_insert_bytes(Editor *e,const char *s,size_t m){
@@ -4725,14 +4801,110 @@ static void ed_copy_line(Editor *e){
       snprintf(e->status,sizeof e->status,"copied line %d",(int)e->cy+1); }
 }
 
-static int ed_save(Editor *e){
-    FILE *f=fopen(e->path,"wb");
+static void ed_load(Editor *e);
+static int ed_save_to(EdLine *ln,size_t n,const char *path){
+    FILE *f=fopen(path,"wb");
     size_t i;
-    if(!f){ snprintf(e->status,sizeof e->status,"cannot write '%s'",e->path); return 0; }
-    for(i=0;i<e->n;i++){ if(e->ln[i].len) fwrite(e->ln[i].b,1,e->ln[i].len,f); fputc('\n',f); }
-    fclose(f); e->dirty=0; e->quit_arm=0;
+    if(!f) return 0;
+    for(i=0;i<n;i++){ if(ln[i].len) fwrite(ln[i].b,1,ln[i].len,f); fputc('\n',f); }
+    fclose(f);
+    return 1;
+}
+
+static int ed_save(Editor *e){
+    if(!e->path[0]){ snprintf(e->status,sizeof e->status,"no file open"); return 0; }
+    if(!ed_save_to(e->ln,e->n,e->path)){ snprintf(e->status,sizeof e->status,"cannot write '%s'",e->path); return 0; }
+    e->dirty=0; e->quit_arm=0;
     snprintf(e->status,sizeof e->status,"saved %d line(s) to '%s'",(int)e->n,e->path);
     return 1;
+}
+
+/* anything worth keeping when switching away? (named, or non-empty) */
+static int ed_cur_worth(Editor *e){
+    return e->path[0] || e->n>1 || (e->n==1 && e->ln[0].len>0);
+}
+
+static void ed_stash_current(Editor *e){
+    EdStash *s;
+    if(!ed_cur_worth(e)) return;
+    if(e->nstash==e->scap){ e->scap=e->scap?e->scap*2:4;
+        e->stash=(EdStash*)lrealloc(e->stash,sizeof(EdStash)*e->scap); }
+    s=&e->stash[e->nstash++];
+    s->ln=e->ln; s->n=e->n; s->cap=e->cap; s->cx=e->cx; s->cy=e->cy; s->top=e->top;
+    s->dirty=e->dirty;
+    snprintf(s->path,sizeof s->path,"%s",e->path);
+    e->ln=NULL; e->n=0; e->cap=0; e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0;
+}
+
+static int ed_unstash(Editor *e,const char *path){
+    size_t i;
+    for(i=0;i<e->nstash;i++) if(!strcmp(e->stash[i].path,path)){
+        e->ln=e->stash[i].ln; e->n=e->stash[i].n; e->cap=e->stash[i].cap;
+        e->cx=e->stash[i].cx; e->cy=e->stash[i].cy; e->top=e->stash[i].top;
+        e->dirty=e->stash[i].dirty;
+        snprintf(e->path,sizeof e->path,"%s",path);
+        memmove(&e->stash[i],&e->stash[i+1],(e->nstash-i-1)*sizeof(EdStash));
+        e->nstash--;
+        return 1;
+    }
+    return 0;
+}
+
+/* open path: keep it if already open, restore parked copy, else load fresh */
+static void ed_open_path(Editor *e,const char *full){
+    if(e->path[0] && !strcmp(e->path,full)){ e->focus=0; return; }
+    ed_stash_current(e);
+    if(ed_unstash(e,full)){ e->focus=0; e->quit_arm=0; return; }
+    snprintf(e->path,sizeof e->path,"%s",full);
+    e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0; e->quit_arm=0;
+    ed_load(e);
+    e->focus=0;
+}
+
+static int ed_unsaved_count(Editor *e){
+    size_t i; int c=(e->dirty&&e->path[0])?1:0;
+    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty) c++;
+    return c;
+}
+
+static void ed_save_all(Editor *e){
+    size_t i; int done=0, unnamed=0;
+    if(e->dirty){
+        if(e->path[0] && ed_save_to(e->ln,e->n,e->path)){ e->dirty=0; done++; }
+        else unnamed++;
+    }
+    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty){
+        if(ed_save_to(e->stash[i].ln,e->stash[i].n,e->stash[i].path)){ e->stash[i].dirty=0; done++; }
+        else unnamed++;
+    }
+    e->quit_arm=0;
+    if(unnamed) snprintf(e->status,sizeof e->status,"saved %d, %d unnamed skipped",done,unnamed);
+    else snprintf(e->status,sizeof e->status,"saved %d file(s)",done);
+}
+
+static int ed_path_dirty(Editor *e,const char *full){
+    size_t i;
+    if(e->dirty && e->path[0] && !strcmp(e->path,full)) return 1;
+    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty && !strcmp(e->stash[i].path,full)) return 1;
+    return 0;
+}
+
+static int ed_dir_dirty(Editor *e,const char *full){
+    size_t i, n=strlen(full);
+    if(!n) return 0;
+    if(e->dirty && e->path[0] && !strncmp(e->path,full,n)
+       && (e->path[n]=='\\'||e->path[n]=='/')) return 1;
+    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty && !strncmp(e->stash[i].path,full,n)
+       && (e->stash[i].path[n]=='\\'||e->stash[i].path[n]=='/')) return 1;
+    return 0;
+}
+
+/* fix open buffer + parked paths after a rename */
+static void ed_rename_paths(Editor *e,const char *oldp,const char *newp){
+    size_t i;
+    if(e->path[0] && !strcmp(e->path,oldp)) snprintf(e->path,sizeof e->path,"%s",newp);
+    for(i=0;i<e->nstash;i++) if(!strcmp(e->stash[i].path,oldp))
+        snprintf(e->stash[i].path,sizeof e->stash[i].path,"%s",newp);
 }
 
 static void ed_load(Editor *e){
@@ -4766,6 +4938,199 @@ static void ed_free(Editor *e){
     free(e->ln); free(e->clip);
 }
 
+/* ---- lc code syntax colors (truecolor, VS Code Dark+-ish) ---- */
+#define EC_NONE 0
+#define EC_KEY 1     /* keywords: pink */
+#define EC_STR 2     /* strings: orange */
+#define EC_NUM 3     /* numbers: pale green */
+#define EC_COM 4     /* comments: green */
+#define EC_FN 5      /* calls: yellow */
+#define EC_DIR 6     /* directives: blue */
+static const char *EC_SEQ[]={ "",
+    "38;2;197;134;192", "38;2;206;145;120", "38;2;181;206;168",
+    "38;2;106;153;85", "38;2;220;220;170", "38;2;86;156;214" };
+
+static int ed_is_kw(const char *s,size_t n){
+    static const char *kw[]={
+        "and","break","do","else","elseif","end","for","function","command",
+        "if","in","not","or","repeat","return","then","until","while",
+        "run","make","get","pack","as","create","import",
+        "true","false","nil",NULL};
+    int i;
+    for(i=0;kw[i];i++){ size_t k=0; while(k<n&&kw[i][k]&&kw[i][k]==s[k]) k++;
+        if(k==n&&kw[i][k]==0) return 1; }
+    return 0;
+}
+
+#define EC_LINEBG "\x1b[48;2;42;45;46m"   /* cursor-line background */
+#define EC_CODEBG "\x1b[48;2;30;30;30m"   /* code pane background */
+#define EC_EXBG "\x1b[48;2;17;17;17m"     /* explorer pane background */
+#define EC_TOPBG "\x1b[48;2;22;22;22m"    /* top/bottom strip background */
+static int ed_hl_bg = 0;   /* 0 plain reset, 1 code bg, 2 cursor-line bg */
+static void ed_hl_emit(int code,int *cur){
+    if(code==*cur) return;
+    if(code) printf("\x1b[%sm",EC_SEQ[code]);
+    else if(ed_hl_bg==2) printf("\x1b[0m" EC_LINEBG);
+    else if(ed_hl_bg==1) printf("\x1b[0m" EC_CODEBG);
+    else printf("\x1b[0m");
+    *cur=code;
+}
+
+/* advance long-block state (comments/strings) through one line.
+ * cm/st: open level, or -1. Shared closer: ]=*lvl] . */
+static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
+    size_t k=0;
+    if(*cm>=0||*stt>=0){
+        int lvl=(*cm>=0)?*cm:*stt;
+        while(k<len){
+            if(b[k]==']'){ size_t j=k+1; int e=0;
+                while(j<len&&b[j]=='='&&e<lvl){e++;j++;}
+                if(e==lvl&&j<len&&b[j]==']'){ k=j+1; *cm=-1; *stt=-1; break; } }
+            k++;
+        }
+        if(*cm>=0||*stt>=0) return;
+    }
+    { int q=0;
+      while(k<len){
+          unsigned char c=(unsigned char)b[k];
+          if(q==1){ if(c=='\\'){k+=2;continue;} if(c=='"') q=0; k++; continue; }
+          if(q==2){ if(c=='\\'){k+=2;continue;} if(c=='\'') q=0; k++; continue; }
+          if(c=='"'){q=1;k++;continue;}
+          if(c=='\''){q=2;k++;continue;}
+          if(c=='-'&&k+1<len&&b[k+1]=='-'){
+              size_t j=k+2; int e=0;
+              if(j<len&&b[j]=='['){ j++; while(j<len&&b[j]=='='&&e<64){e++;j++;}
+                  if(j<len&&b[j]=='['){ *cm=e; return; } }
+              return;
+          }
+          if(c=='['){ size_t j=k+1; int e=0;
+              while(j<len&&b[j]=='='&&e<64){e++;j++;}
+              if(e>0&&j<len&&b[j]=='['){ *stt=e; return; } }
+          k++;
+      } }
+}
+
+/* render one code line with highlight. start = first visible byte (h-scroll),
+ * maxw = visible width. cm/stt carry an open long block from previous lines
+ * (cm = comment level+1, stt = string level+1, 0 = none). */
+static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int cm,int stt){
+    size_t k=0;
+    int w=0, col=0, cur=EC_NONE, done=0;
+    int st=0, lvl=0;   /* 0 code, 1 dqs, 2 sqs, 3 block */
+    if(cm>0){ st=3; lvl=cm-1; }
+    else if(stt>0){ st=4; lvl=stt-1; }
+    while(k<start){ col+=ed_chw((unsigned char)b[k],col); k++; }
+    /* block entry color */
+    if(st==3&&start==0) ed_hl_emit(EC_COM,&cur);
+    if(st==4&&start==0) ed_hl_emit(EC_STR,&cur);
+    while(k<len&&!done){
+        unsigned char c=(unsigned char)b[k];
+        if(st==3||st==4){
+            int want=(st==3)?EC_COM:EC_STR;
+            if(c==']'){ size_t j=k+1; int e=0;
+                while(j<len&&b[j]=='='&&e<lvl){e++;j++;}
+                if(e==lvl&&j<len&&b[j]==']'){
+                    size_t m;
+                    for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; } }
+                    k=j+1; st=0; continue;
+                } }
+            if(k>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(c,stdout); w++; }
+            else if(k>=start) done=1;
+            k++; continue;
+        }
+        if(st==1||st==2){
+            char q=st==1?'"':'\'';
+            if(k>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(c,stdout); w++; }
+            else if(k>=start) done=1;
+            if(c=='\\'&&k+1<len){ k++; if(k>=start&&w<maxw){ fputc(b[k],stdout); w++; } else if(k>=start) done=1; }
+            else if(c==q) st=0;
+            k++; continue;
+        }
+        /* code mode */
+        if(c=='-'&&k+1<len&&b[k+1]=='-'){
+            while(k<len){ if(k>=start&&w<maxw){ ed_hl_emit(EC_COM,&cur); fputc(b[k],stdout); w++; } else if(k>=start) { done=1; break; } k++; }
+            continue;
+        }
+        if((c=='"'||c=='\'')){
+            st=(c=='"')?1:2;
+            if(k>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(c,stdout); w++; }
+            else if(k>=start) done=1;
+            k++; continue;
+        }
+        if(is_luc&&c=='['){
+            size_t j=k+1; int e=0;
+            while(j<len&&b[j]=='='&&e<64){e++;j++;}
+            if(e>0&&j<len&&b[j]=='['){
+                size_t m;
+                for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(b[m],stdout); w++; } }
+                k=j+1; st=4; lvl=e; continue;
+            }
+        }
+        if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||c=='_'||c>=128){
+            size_t j=k;
+            while(j<len){ unsigned char d=(unsigned char)b[j];
+                if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||(d>='0'&&d<='9')||d=='_'||d>=128) j++; else break; }
+            { int iskw=is_luc&&ed_is_kw(b+k,j-k);
+              int iscall=0;
+              if(!iskw){ size_t m=j; while(m<len&&(b[m]==' '||b[m]=='\t')) m++;
+                  if(m<len&&b[m]=='(') iscall=1; }
+              { size_t m;
+                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(iskw?EC_KEY:(iscall?EC_FN:EC_NONE),&cur); fputc(b[m],stdout); w++; } }
+                if(j>k&&j-1>=start&&w>=maxw) done=1; }
+              k=j; continue; }
+        }
+        if(c>='0'&&c<='9'&&(k==0||!(((b[k-1]>='A')&&(b[k-1]<='Z'))||((b[k-1]>='a')&&(b[k-1]<='z'))||((b[k-1]>='0')&&(b[k-1]<='9'))||b[k-1]=='_'))){
+            size_t j=k;
+            if(c=='0'&&j+1<len&&(b[j+1]=='x'||b[j+1]=='X')){ j+=2; while(j<len){ unsigned char d=(unsigned char)b[j];
+                if((d>='0'&&d<='9')||(d>='a'&&d<='f')||(d>='A'&&d<='F')) j++; else break; } }
+            else { while(j<len&&((b[j]>='0'&&b[j]<='9')||b[j]=='.')) j++; }
+            { size_t m;
+              for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_NUM,&cur); fputc(b[m],stdout); w++; } }
+              if(j>k&&j-1>=start&&w>=maxw) done=1; }
+            k=j; continue;
+        }
+        /* directives: !word at first token */
+        if(c=='!'&&is_luc){
+            size_t m=k; int lead=1, p;
+            for(p=(int)k-1;p>=0;p--){ if(b[p]!=' '&&b[p]!='\t'){lead=0;break;} }
+            if(lead){ m++; while(m<len){ unsigned char d=(unsigned char)b[m];
+                if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||d=='_') m++; else break; }
+                if(m>k+1){ size_t q;
+                    for(q=k;q<m;q++){ if(q>=start&&w<maxw){ ed_hl_emit(EC_DIR,&cur); fputc(b[q],stdout); w++; } }
+                    k=m; continue; } }
+        }
+        /* plain char (tabs expand, controls placeholder) */
+        if(k>=start&&w<maxw){
+            ed_hl_emit(EC_NONE,&cur);
+            if(c=='\t'){ int tw=4-(col%4), q; for(q=0;q<tw&&w<maxw;q++){ fputc(' ',stdout); w++; col++; } }
+            else { fputc(ed_chshow(c),stdout); w+=ed_chw(c,col); col+=ed_chw(c,col); }
+        } else if(k>=start) done=1;
+        else if(c=='\t'){ int tw=4-(col%4); col+=tw; }
+        else col+=ed_chw(c,col);
+        k++;
+    }
+    if(cur!=EC_NONE) printf("\x1b[0m");
+}
+
+static int ed_ex_color(const char *nm,int isdir){
+    if(isdir) return 36;
+    { const char *d=strrchr(nm,'.');
+      if(!d||d==nm) return 0;
+      d++;
+      { char e[8]; size_t k;
+        for(k=0;k<7&&d[k];k++){ char c=d[k]; e[k]=(c>='A'&&c<='Z')?(char)(c+32):c; }
+        e[k]=0;
+        if(!strcmp(e,"luc")) return 32;
+        if(!strcmp(e,"lua")) return 34;
+        if(!strcmp(e,"py")) return 33;
+        if(!strcmp(e,"zip")||!strcmp(e,"exe")||!strcmp(e,"dll")||!strcmp(e,"so")) return 31; }
+      return 0; }
+}
+
+static void ed_popup_draw(Editor *e,int W,int H);
+static void ed_menu_open(Editor *e,int kind);
+static void ed_naming_start(Editor *e,int mode);
+
 static void ed_draw(Editor *e){
     int W=80,H=24,r;
     int digits=1;
@@ -4776,53 +5141,737 @@ static void ed_draw(Editor *e){
         W=bi.srWindow.Right-bi.srWindow.Left+1;
         H=bi.srWindow.Bottom-bi.srWindow.Top+1;
     }
-    if(H<5) H=5; if(W<30) W=30;
+    if(H<6) H=6; if(W<40) W=40;
     { size_t t=e->n>0?e->n:1; while(t>=10){ digits++; t/=10; } if(digits<2) digits=2; }
-    e->numw=digits+3;               /* " 12 | " */
-    CW=(size_t)W-e->numw;
+    e->numw=digits+4;               /* " 12    " (space gap, no bar) */
+    int EXW=e->show_ex?ED_EXW:0;
+    CW=(size_t)(W-EXW)-e->numw;
+    if((int)CW<8) CW=8;
+    e->vw=W; e->vh=H;
     ed_clamp(e);
+    ed_clamp_view(e,H);
     if(e->cy<e->top) e->top=e->cy;
     if(e->cy>=e->top+(size_t)(H-2)) e->top=e->cy-(H-3);
+    if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
+    if(e->exsel<e->extop) e->extop=e->exsel;
+    if(e->exsel>=e->extop+(size_t)(H-2) && H-2>0) e->extop=e->exsel-(H-3);
     { size_t dc=ed_dcol(e);
-      size_t k=0,d=0; char *b=e->ln[e->cy].b; size_t L=e->ln[e->cy].len;
-      size_t lo=0, left=0;
-      if(dc>=(size_t)(CW-1)) lo=dc-(CW-2);
-      k=0; d=0;
-      while(k<L&&d<lo){ if(!ed_is_cont((unsigned char)b[k])) d++; k++; }
-      while(k<L&&ed_is_cont((unsigned char)b[k])) k++;
-      left=k;
+      if(dc<e->dleft) e->dleft=dc;
+      if(dc>=e->dleft+CW-1) e->dleft=dc-(CW-2);
       printf("\x1b[?25l\x1b[H");
       { char title[256];
-        snprintf(title,sizeof title,"lc code - %s%s",e->path,e->dirty?" *":"");
-        title[W-1]=0;
-        printf("\x1b[7m%-*s\x1b[0m\n",W-1,title); }
-      for(r=0;r<H-2;r++){
+        const char *b1=strrchr(e->path,'/'), *b2=strrchr(e->path,'\\');
+        const char *b=b1; if(b2&&(!b||b2>b)) b=b2;
+        if(e->path[0]&&b) snprintf(title,sizeof title,"%s - lcode",b+1);
+        else if(e->path[0]) snprintf(title,sizeof title,"%s - lcode",e->path);
+        else snprintf(title,sizeof title,"lcode");
+        title[W-4]=0;
+        printf(EC_TOPBG "\x1b[97m  %s",title);
+        printf("\x1b[K\x1b[0m\n"); }
+      /* .luc files get full highlight, others generic strings/comments */
+      { int is_luc=0;
+        const char *dd=strrchr(e->path,'.');
+        if(dd&&(!strcmp(dd,".luc")||!strcmp(dd,".LUC"))) is_luc=1;
+        /* block state carried from line 0 to the visible window */
+        int pcm=-1, pst=-1;
+        { size_t pre; for(pre=0;pre<e->top&&pre<e->n;pre++)
+            ed_scan_state(e->ln[pre].b,e->ln[pre].len,&pcm,&pst); }
+        for(r=0;r<H-2;r++){
           size_t li=e->top+r;
           printf("\x1b[K");
-          if(li<e->n){
+          /* explorer cell: header rows, then tree entries */
+          if(EXW){
+          printf(EC_EXBG);
+          if(r==0){
+              printf("\x1b[90mEXPLORER");
+              { int kk; for(kk=8;kk<EXW-3;kk++) fputc(' ',stdout); }
+              printf("...");
+              printf("\x1b[0m");
+          } else if(r==1){
+              const char *dd=e->exdir;
+              const char *bb=dd;
+              { const char *p=dd; while(*p){ if(*p=='\\'||*p=='/') bb=p+1; p++; } }
+              if(!*bb) bb=dd;
+              printf(e->root_shut?"\xe2\x96\xb8":"\xe2\x96\xbe");
+              fputc(' ',stdout);
+              printf(e->root_shut?"\xf0\x9f\x93\x81":"\xf0\x9f\x93\x82");
+              fputc(' ',stdout);
+              { int cw=4, kk=0;
+                while(bb[kk]&&cw<EXW){ fputc(bb[kk],stdout); cw++; kk++; }
+                while(cw<EXW){ fputc(' ',stdout); cw++; } }
+              printf("\x1b[0m");
+          } else {
+          { size_t ei=e->extop+(r-2);
+            if(ei<e->exn){
+                const char *nm=e->ex[ei].name;
+                int cw=0, kk=0, i, isd=e->ex[ei].isdir;
+                int dep=e->ex[ei].depth; if(dep>4) dep=4;
+                /* VSCode-like: dirty names glow yellow (files and their
+                 * folders); files keep their extension color otherwise */
+                int col=isd ? (ed_dir_dirty(e,e->ex[ei].full)?33:0)
+                            : (ed_path_dirty(e,e->ex[ei].full)?33:ed_ex_color(nm,isd));
+                int sel=(e->focus==1&&ei==e->exsel);
+                if(sel) printf("\x1b[7m");
+                else if(col) printf("\x1b[%dm",col);
+                for(i=0;i<dep*2&&cw<EXW-6;i++){ fputc(' ',stdout); cw++; }
+                if(isd){ fputs(e->ex[ei].expanded?"\xe2\x96\xbe":"\xe2\x96\xb8",stdout); cw++; }
+                else { fputc(' ',stdout); cw++; }
+                fputc(' ',stdout); cw++;
+                if(isd){ fputs(e->ex[ei].expanded?"\xf0\x9f\x93\x82":"\xf0\x9f\x93\x81",stdout); cw+=2; }
+                else { fputc(' ',stdout); fputc(' ',stdout); cw+=2; }
+                fputc(' ',stdout); cw++;
+                while(nm[kk]&&cw<EXW){ fputc(nm[kk],stdout); cw++; kk++; }
+                while(cw<EXW){ fputc(' ',stdout); cw++; }
+                printf("\x1b[0m");
+            } else {
+                int kk; for(kk=0;kk<EXW;kk++) fputc(' ',stdout);
+                printf("\x1b[0m");
+            } } }
+          }
+          if(e->path[0] && li<e->n){
               char *lb=e->ln[li].b; size_t LL=e->ln[li].len, kk=0;
-              int w=0;
-              printf("%*d | ",digits,(int)li+1);
-              if(li==e->cy) kk=left;
-              while(kk<LL&&w<(int)CW){ fputc(lb[kk],stdout); if(!ed_is_cont((unsigned char)lb[kk])) w++; kk++; }
-          } else fputc('~',stdout);
-          printf("\n");
+              int col=0;
+              size_t dd=0;
+              int iscur=(li==e->cy && e->focus==0);
+              printf(iscur?EC_LINEBG:EC_CODEBG);
+              if(iscur) printf("\x1b[97m%*d    ",digits,(int)li+1);
+              else printf("\x1b[90m%*d    ",digits,(int)li+1);
+              while(kk<LL&&dd<e->dleft){ int w0=ed_chw((unsigned char)lb[kk],col); dd+=(size_t)w0; col+=w0; kk++; }
+              while(kk<LL&&ed_is_cont((unsigned char)lb[kk])) kk++;
+              ed_hl_bg=iscur?2:1;
+              ed_hl_line(lb,LL,kk,(int)CW,is_luc,pcm+1,pst+1);
+              ed_hl_bg=0;
+              ed_scan_state(lb,LL,&pcm,&pst);
+              printf(iscur?EC_LINEBG:EC_CODEBG);
+              printf("\x1b[K\x1b[0m");
+          } else { printf(EC_CODEBG "\x1b[K\x1b[0m"); }
+          { int total=(int)e->n, rows=H-2, isthumb=0;
+            if(total>rows){ int a=(int)((long long)r*total/rows), b=(int)((long long)(r+1)*total/rows);
+              int v0=(int)e->top, v1=(int)(e->top+rows); if(v1>total) v1=total;
+              if(a<v1&&b>v0) isthumb=1; }
+            printf("\x1b[%d;%dH",r+2,W);
+            if(isthumb) printf("\x1b[97;7m \x1b[0m"); else printf("\x1b[90m|\x1b[0m");
+            printf("\x1b[%d;1H",r+3); }
       }
-      { char bar[256];
-        if(e->status[0])
-            snprintf(bar,sizeof bar,"Ln %d, Col %d | %s",
-                (int)e->cy+1,(int)ed_dcol(e)+1,e->status);
-        else
-            snprintf(bar,sizeof bar,"Ln %d, Col %d | ^S save ^C copy ^V paste ^R run | Esc quit",
-                (int)e->cy+1,(int)ed_dcol(e)+1);
-        bar[W-1]=0;
-        printf("\x1b[7m%-*s\x1b[0m",W-1,bar); }
-      /* cursor */
+      { /* bottom strip: message, else unsaved count, else empty */
+        int u=0;
+        if(e->status[0]){
+            char msg[256];
+            snprintf(msg,sizeof msg,"  %s",e->status);
+            msg[W-1]=0;
+            printf(EC_TOPBG "\x1b[97m%s",msg);
+        } else if((u=ed_unsaved_count(e))>0){
+            char ub[64];
+            snprintf(ub,sizeof ub,"  \xe2\x97\x8f %d unsaved",u);
+            printf(EC_TOPBG "\x1b[97m%s",ub);
+        } else {
+            printf(EC_TOPBG "  ");
+        }
+        printf("\x1b[K\x1b[0m"); }
+      /* popup overlay (menu or naming input) draws last, owns the cursor */
+      if(e->menu||e->naming) ed_popup_draw(e,W,H);
+      /* cursor (hidden entirely with no file open, or while a menu is up) */
       { size_t dc2=ed_dcol(e);
-        size_t lo2=0;
-        if(dc2>=(size_t)(CW-1)) lo2=dc2-(CW-2);
-        printf("\x1b[%d;%dH\x1b[?25h",(int)(e->cy-e->top+2),(int)(e->numw+dc2-lo2+1)); }
-      fflush(stdout); }
+        if(e->menu) { /* hidden */ }
+        else if(e->naming) { /* positioned by ed_popup_draw */ }
+        else if(e->focus==1)
+            printf("\x1b[%d;%dH\x1b[?25h",(int)(e->exsel-e->extop+4),2);
+        else if(e->path[0])
+            printf("\x1b[%d;%dH\x1b[?25h",(int)(e->cy-e->top+2),(int)(EXW+e->numw+dc2-e->dleft+1)); }
+      fflush(stdout); } }
+}
+
+static void ex_free(Editor *e){
+    size_t i;
+    for(i=0;i<e->exn;i++){ free(e->ex[i].name); free(e->ex[i].full); }
+    free(e->ex); e->ex=NULL; e->exn=0; e->excap=0;
+    for(i=0;i<e->rsavn;i++) free(e->rsav[i]);
+    free(e->rsav); e->rsav=NULL; e->rsavn=0; e->rsavcap=0;
+}
+
+static int ex_cmp(const void *a,const void *b){
+    const ExItem *x=(const ExItem*)a, *y=(const ExItem*)b;
+    if(x->isdir!=y->isdir) return y->isdir-x->isdir;
+    return _stricmp(x->name,y->name);
+}
+
+static void ex_refresh(Editor *e){
+    char pat[1088];
+    WIN32_FIND_DATAA fd;
+    HANDLE fh;
+    ex_free(e);
+    snprintf(pat,sizeof pat,"%s\\*",e->exdir[0]?e->exdir:".");
+    fh=FindFirstFileA(pat,&fd);
+    if(fh==INVALID_HANDLE_VALUE){ e->exsel=0; e->extop=0; return; }
+    do{
+        if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
+        if(e->exn==e->excap){ e->excap=e->excap?e->excap*2:32;
+            e->ex=(ExItem*)lrealloc(e->ex,sizeof(ExItem)*e->excap); }
+        e->ex[e->exn].name=(char*)lmalloc(strlen(fd.cFileName)+1);
+        memcpy(e->ex[e->exn].name,fd.cFileName,strlen(fd.cFileName)+1);
+        { char fb[1088]; snprintf(fb,sizeof fb,"%s\\%s",e->exdir[0]?e->exdir:".",fd.cFileName);
+          e->ex[e->exn].full=(char*)lmalloc(strlen(fb)+1); memcpy(e->ex[e->exn].full,fb,strlen(fb)+1); }
+        e->ex[e->exn].isdir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        e->ex[e->exn].depth=0; e->ex[e->exn].expanded=0;
+        e->exn++;
+    }while(FindNextFileA(fh,&fd));
+    FindClose(fh);
+    qsort(e->ex,e->exn,sizeof(ExItem),ex_cmp);
+    if(e->exsel>=e->exn && e->exn>0) e->exsel=e->exn-1;
+}
+
+/* exdir = exdir/name (.. goes up) */
+static void ex_join(Editor *e,const char *name){
+    if(!strcmp(name,"..")){
+        char *d=e->exdir; size_t n=strlen(d), k;
+        while(n>1 && (d[n-1]=='\\'||d[n-1]=='/')){ d[--n]=0; }
+        if(n==2 && d[1]==':'){ ex_refresh(e); return; }
+        for(k=n;k>0;k--) if(d[k-1]=='\\'||d[k-1]=='/') break;
+        if(k==0){ snprintf(e->exdir,sizeof e->exdir,"."); }
+        else if(k==1){ d[1]=0; }
+        else d[k-1]=0;
+    } else {
+        size_t n=strlen(e->exdir);
+        if(n+1+strlen(name)+1>=sizeof e->exdir) return;
+        if(n>0 && e->exdir[n-1]!='\\' && e->exdir[n-1]!='/') e->exdir[n++]='\\';
+        memcpy(e->exdir+n,name,strlen(name)+1);
+    }
+    e->exsel=0; e->extop=0;
+    ex_refresh(e);
+}
+
+static void ex_full(Editor *e,const char *name,char *out,size_t cap){
+    size_t n=strlen(e->exdir);
+    if(n+1+strlen(name)+1>cap){ out[0]=0; return; }
+    memcpy(out,e->exdir,n);
+    if(n>0 && out[n-1]!='\\' && out[n-1]!='/') out[n++]='\\';
+    memcpy(out+n,name,strlen(name)+1);
+}
+
+/* expand a collapsed dir node: insert its sorted children after it */
+static void ex_expand(Editor *e,size_t idx){
+    char pat[1120];
+    WIN32_FIND_DATAA fd;
+    HANDLE fh;
+    ExItem tmp[512]; size_t tn=0, i;
+    if(idx>=e->exn || !e->ex[idx].isdir || e->ex[idx].expanded) return;
+    snprintf(pat,sizeof pat,"%s\\*",e->ex[idx].full);
+    fh=FindFirstFileA(pat,&fd);
+    if(fh==INVALID_HANDLE_VALUE) return;
+    do{
+        if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
+        if(tn>=512) break;
+        tmp[tn].name=(char*)lmalloc(strlen(fd.cFileName)+1);
+        memcpy(tmp[tn].name,fd.cFileName,strlen(fd.cFileName)+1);
+        { char fb[1120]; snprintf(fb,sizeof fb,"%s\\%s",e->ex[idx].full,fd.cFileName);
+          tmp[tn].full=(char*)lmalloc(strlen(fb)+1); memcpy(tmp[tn].full,fb,strlen(fb)+1); }
+        tmp[tn].isdir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+        tmp[tn].depth=e->ex[idx].depth+1;
+        tmp[tn].expanded=0;
+        tn++;
+    }while(FindNextFileA(fh,&fd));
+    FindClose(fh);
+    qsort(tmp,tn,sizeof(ExItem),ex_cmp);
+    if(e->exn+tn>ED_EX_MAX){
+        for(i=0;i<tn;i++){ free(tmp[i].name); free(tmp[i].full); }
+        snprintf(e->status,sizeof e->status,"too many files (showing %d)",(int)e->exn);
+        return;
+    }
+    if(e->exn+tn>e->excap){ while(e->excap<e->exn+tn) e->excap=e->excap?e->excap*2:32;
+        e->ex=(ExItem*)lrealloc(e->ex,sizeof(ExItem)*e->excap); }
+    memmove(&e->ex[idx+1+tn],&e->ex[idx+1],(e->exn-idx-1)*sizeof(ExItem));
+    memcpy(&e->ex[idx+1],tmp,tn*sizeof(ExItem));
+    e->exn+=tn;
+    e->ex[idx].expanded=1;
+    e->root_shut=0;
+}
+
+static void ex_collapse(Editor *e,size_t idx){
+    size_t j, d;
+    if(idx>=e->exn || !e->ex[idx].isdir || !e->ex[idx].expanded) return;
+    d=(size_t)e->ex[idx].depth;
+    j=idx+1;
+    while(j<e->exn && e->ex[j].depth>d){ free(e->ex[j].name); free(e->ex[j].full); j++; }
+    if(j>idx+1) memmove(&e->ex[idx+1],&e->ex[j],(e->exn-j)*sizeof(ExItem));
+    e->exn-=j-idx-1;
+    e->ex[idx].expanded=0;
+    if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
+}
+
+/* folder-header toggle: collapse everything (remembering the set) or
+ * restore the remembered expansion, like the dir rows below */
+static void ex_toggle_all(Editor *e){
+    size_t i;
+    if(!e->root_shut){
+        for(i=0;i<e->rsavn;i++) free(e->rsav[i]);
+        e->rsavn=0;
+        for(i=0;i<e->exn;i++) if(e->ex[i].isdir&&e->ex[i].expanded){
+            if(e->rsavn==e->rsavcap){ e->rsavcap=e->rsavcap?e->rsavcap*2:32;
+                e->rsav=(char**)lrealloc(e->rsav,sizeof(char*)*e->rsavcap); }
+            if(e->rsavn<256){ e->rsav[e->rsavn]=(char*)lmalloc(strlen(e->ex[i].full)+1);
+                memcpy(e->rsav[e->rsavn],e->ex[i].full,strlen(e->ex[i].full)+1); e->rsavn++; }
+        }
+        i=0;
+        while(i<e->exn){ if(e->ex[i].isdir&&e->ex[i].expanded) ex_collapse(e,i); else i++; }
+        e->root_shut=1;
+    } else {
+        for(i=0;i<e->rsavn;i++){
+            size_t j;
+            for(j=0;j<e->exn;j++) if(e->ex[j].isdir&&!e->ex[j].expanded&&!strcmp(e->ex[j].full,e->rsav[i])){ ex_expand(e,j); break; }
+        }
+        e->root_shut=0;
+    }
+    if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
+}
+
+/* open explorer entry: dir toggles, file loads (unsaved current parks aside) */
+static void ex_open_idx(Editor *e,size_t idx){
+    if(idx>=e->exn) return;
+    e->exsel=idx;
+    if(e->ex[idx].isdir){
+        if(e->ex[idx].expanded) ex_collapse(e,idx); else ex_expand(e,idx);
+        return;
+    }
+    ed_open_path(e,e->ex[idx].full);
+}
+
+/* ---- lc code popup menu + inline naming + file ops ---- */
+enum { MA_OPEN=1, MA_NEWFILE, MA_NEWDIR, MA_SAVEALL, MA_COPY, MA_RENAME, MA_PASTE,
+       MA_DELETE, MA_DELYES, MA_DELNO };
+
+/* target dir for new/paste: selected dir, parent of selected file, or root */
+static void ex_target_dir(Editor *e,char *out,size_t cap){
+    if(e->exsel<e->exn && e->ex[e->exsel].isdir){
+        snprintf(out,cap,"%s",e->ex[e->exsel].full);
+        return;
+    }
+    if(e->exsel<e->exn && !e->ex[e->exsel].isdir){
+        const char *f=e->ex[e->exsel].full, *b=NULL, *p;
+        for(p=f;*p;p++) if(*p=='\\'||*p=='/') b=p;
+        if(b){ size_t n=(size_t)(b-f);
+            if(n>=cap) n=cap-1; memcpy(out,f,n); out[n]=0;
+            if(!out[0]) snprintf(out,cap,".");
+            return; }
+    }
+    snprintf(out,cap,"%s",e->exdir[0]?e->exdir:".");
+}
+
+static void ed_menu_add(Editor *e,const char *label,int id){
+    if(e->nitems>=8) return;
+    e->mitems[e->nitems].label=label;
+    e->mitems[e->nitems].id=id;
+    e->nitems++;
+}
+
+/* kind 0 = ... button (root), 1 = context on exsel */
+static void ed_menu_open(Editor *e,int kind){
+    char dir[1024];
+    e->nitems=0; e->msel=0; e->menu=1; e->naming=0;
+    e->menu_anch=0; e->menutitle[0]=0;
+    if(kind==0){
+        ex_target_dir(e,dir,sizeof dir);
+        ed_menu_add(e,"new file",MA_NEWFILE);
+        ed_menu_add(e,"new folder",MA_NEWDIR);
+        if(e->fcb_ok) ed_menu_add(e,"paste here",MA_PASTE);
+        ed_menu_add(e,"save all files",MA_SAVEALL);
+        return;
+    }
+    if(e->exsel>=e->exn){ e->menu=0; return; }
+    snprintf(e->menutitle,sizeof e->menutitle,"%s",e->ex[e->exsel].name);
+    if(e->ex[e->exsel].isdir){
+        ed_menu_add(e,"open",MA_OPEN);
+        ed_menu_add(e,"new file",MA_NEWFILE);
+        ed_menu_add(e,"new folder",MA_NEWDIR);
+        ed_menu_add(e,"copy",MA_COPY);
+        ed_menu_add(e,"rename",MA_RENAME);
+        if(e->fcb_ok) ed_menu_add(e,"paste here",MA_PASTE);
+        ed_menu_add(e,"delete",MA_DELETE);
+    } else {
+        ed_menu_add(e,"open",MA_OPEN);
+        ed_menu_add(e,"copy",MA_COPY);
+        ed_menu_add(e,"rename",MA_RENAME);
+        ed_menu_add(e,"delete",MA_DELETE);
+    }
+    if(e->nitems==0) e->menu=0;
+}
+
+/* expand chain to parent of full, then select full */
+static void ex_reveal(Editor *e,const char *full){
+    char dir[1024], comp[1024];
+    size_t dl, pos;
+    snprintf(dir,sizeof dir,"%s",full);
+    { char *b=NULL, *p;
+      for(p=dir;*p;p++) if(*p=='\\'||*p=='/') b=p;
+      if(b) *b=0; else snprintf(dir,sizeof dir,"."); }
+    ex_refresh(e);
+    /* walk components under exdir */
+    dl=strlen(e->exdir);
+    if(strncmp(full,e->exdir,dl)!=0) return;
+    pos=dl;
+    while(full[pos]=='\\'||full[pos]=='/') pos++;
+    while(full[pos]){
+        size_t q=pos;
+        while(full[q]&&full[q]!='\\'&&full[q]!='/') q++;
+        { size_t n=q-pos; if(n>=sizeof comp) n=sizeof comp-1;
+          memcpy(comp,full+pos,n); comp[n]=0; }
+        { size_t j; int found=0;
+          for(j=0;j<e->exn;j++) if(e->ex[j].isdir){
+              const char *bn=e->ex[j].full+strlen(e->ex[j].full);
+              while(bn>e->ex[j].full&&bn[-1]!='\\'&&bn[-1]!='/') bn--;
+              if(!strcmp(bn,comp)){ ex_expand(e,j); found=1; break; } }
+          if(!found) break; }
+        pos=q;
+        while(full[pos]=='\\'||full[pos]=='/') pos++;
+    }
+    { size_t j; for(j=0;j<e->exn;j++) if(!strcmp(e->ex[j].full,full)){ e->exsel=j; break; } }
+    e->focus=1;
+}
+
+/* recursive copy (file or dir tree) */
+static int ed_copy_tree(const char *src,const char *dst,int depth){
+    DWORD a=GetFileAttributesA(src);
+    size_t i;
+    if(a==INVALID_FILE_ATTRIBUTES) return 0;
+    if(!(a&FILE_ATTRIBUTE_DIRECTORY)){
+        return CopyFileA(src,dst,FALSE)!=0;
+    }
+    if(depth>32) return 0;
+    if(!CreateDirectoryA(dst,NULL) && GetLastError()!=ERROR_ALREADY_EXISTS) return 0;
+    { char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
+      snprintf(pat,sizeof pat,"%s\\*",src);
+      fh=FindFirstFileA(pat,&fd);
+      if(fh==INVALID_HANDLE_VALUE) return 1;
+      i=0;
+      do{
+          if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
+          { char s2[1120], d2[1120];
+            snprintf(s2,sizeof s2,"%s\\%s",src,fd.cFileName);
+            snprintf(d2,sizeof d2,"%s\\%s",dst,fd.cFileName);
+            if(!ed_copy_tree(s2,d2,depth+1)){ FindClose(fh); return 0; } }
+          if(++i>2000) break;
+      }while(FindNextFileA(fh,&fd));
+      FindClose(fh); }
+    return 1;
+}
+
+/* unique sibling name: "x - copy.ext", "x - copy (2).ext" ... */
+static void ed_unique(char *out,size_t cap,const char *dir,const char *name,int isdir){
+    char stem[256], ext[64]="", cand[512];
+    const char *d=strrchr(name,'.');
+    int k;
+    if(!isdir && d && d!=name){ size_t n=(size_t)(d-name); if(n>255) n=255;
+        memcpy(stem,name,n); stem[n]=0; snprintf(ext,sizeof ext,"%s",d); }
+    else { snprintf(stem,sizeof stem,"%s",name); }
+    for(k=0;k<1000;k++){
+        if(k==0) snprintf(cand,sizeof cand,"%s - copy%s",stem,ext);
+        else snprintf(cand,sizeof cand,"%s - copy (%d)%s",stem,k+1,ext);
+        { char full[1120]; snprintf(full,sizeof full,"%s\\%s",dir,cand);
+          if(GetFileAttributesA(full)==INVALID_FILE_ATTRIBUTES){
+              snprintf(out,cap,"%s",cand); return; } }
+    }
+    snprintf(out,cap,"%s",name);
+}
+
+/* ---- delete: permanent, so it always goes through a confirm popup ---- */
+
+/* is p the deleted path, or (for folders) anything below it? */
+static int ed_under(const char *p,const char *full,int isdir){
+    size_t n=strlen(full);
+    if(!strcmp(p,full)) return 1;
+    return isdir && !strncmp(p,full,n) && (p[n]=='\\'||p[n]=='/');
+}
+
+/* delete a file or a whole folder tree. Junctions/symlinks are unlinked,
+ * never walked into. Read-only flags are cleared first. */
+static int ed_delete_tree(const char *path,int depth){
+    DWORD a=GetFileAttributesA(path);
+    if(a==INVALID_FILE_ATTRIBUTES) return 0;
+    if(a&FILE_ATTRIBUTE_DIRECTORY){
+        if(!(a&FILE_ATTRIBUTE_REPARSE_POINT)){
+            char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
+            if(depth>32) return 0;
+            snprintf(pat,sizeof pat,"%s\\*",path);
+            fh=FindFirstFileA(pat,&fd);
+            if(fh!=INVALID_HANDLE_VALUE){
+                do{
+                    char sub[1120];
+                    if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
+                    snprintf(sub,sizeof sub,"%s\\%s",path,fd.cFileName);
+                    if(!ed_delete_tree(sub,depth+1)){ FindClose(fh); return 0; }
+                }while(FindNextFileA(fh,&fd));
+                FindClose(fh);
+            }
+        }
+        SetFileAttributesA(path,FILE_ATTRIBUTE_DIRECTORY);
+        return RemoveDirectoryA(path)!=0;
+    }
+    SetFileAttributesA(path,FILE_ATTRIBUTE_NORMAL);
+    return DeleteFileA(path)!=0;
+}
+
+/* drop open/parked buffers that belong to a deleted path */
+static void ed_forget_path(Editor *e,const char *full,int isdir){
+    size_t i, k;
+    if(e->path[0] && ed_under(e->path,full,isdir)){
+        for(k=0;k<e->n;k++) free(e->ln[k].b);
+        free(e->ln); e->ln=NULL; e->n=0; e->cap=0;
+        e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0; e->path[0]=0;
+    }
+    i=0;
+    while(i<e->nstash){
+        if(ed_under(e->stash[i].path,full,isdir)){
+            for(k=0;k<e->stash[i].n;k++) free(e->stash[i].ln[k].b);
+            free(e->stash[i].ln);
+            memmove(&e->stash[i],&e->stash[i+1],(e->nstash-i-1)*sizeof(EdStash));
+            e->nstash--;
+        } else i++;
+    }
+}
+
+/* remove one entry (and its expanded children) from the visible tree */
+static void ex_remove_by_path(Editor *e,const char *full){
+    size_t i;
+    for(i=0;i<e->exn;i++) if(!strcmp(e->ex[i].full,full)) break;
+    if(i>=e->exn) return;
+    if(e->ex[i].isdir&&e->ex[i].expanded) ex_collapse(e,i);
+    free(e->ex[i].name); free(e->ex[i].full);
+    memmove(&e->ex[i],&e->ex[i+1],(e->exn-i-1)*sizeof(ExItem));
+    e->exn--;
+    e->exsel=(i<e->exn)?i:(e->exn?e->exn-1:0);
+}
+
+/* ask "delete X?" (Cancel is preselected so a stray Enter is harmless) */
+static void ed_delete_confirm_open(Editor *e){
+    if(e->exsel>=e->exn) return;
+    snprintf(e->deltarget,sizeof e->deltarget,"%s",e->ex[e->exsel].full);
+    e->delisdir=e->ex[e->exsel].isdir;
+    e->nitems=0; e->msel=1; e->menu=1; e->naming=0; e->menu_anch=0;
+    if(e->delisdir) snprintf(e->menutitle,sizeof e->menutitle,"Delete folder '%s' and its contents?",e->ex[e->exsel].name);
+    else snprintf(e->menutitle,sizeof e->menutitle,"Delete file '%s'?",e->ex[e->exsel].name);
+    ed_menu_add(e,"Delete",MA_DELYES);
+    ed_menu_add(e,"Cancel",MA_DELNO);
+}
+
+static void ed_delete_do(Editor *e){
+    char name[256];
+    const char *b=e->deltarget, *p, *l=NULL;
+    for(p=b;*p;p++) if(*p=='\\'||*p=='/') l=p;
+    snprintf(name,sizeof name,"%s",l?l+1:b);
+    if(ed_delete_tree(e->deltarget,0)){
+        ed_forget_path(e,e->deltarget,e->delisdir);
+        ex_remove_by_path(e,e->deltarget);
+        snprintf(e->status,sizeof e->status,"deleted '%s'",name);
+    } else {
+        if(e->delisdir) ex_refresh(e);   /* may be partly deleted: resync the tree */
+        snprintf(e->status,sizeof e->status,"cannot delete '%s' (in use?)",name);
+    }
+    e->focus=1;
+}
+
+static void ed_naming_start(Editor *e,int mode){
+    e->naming=mode; e->namlen=0; e->namcur=0; e->namb[0]=0;
+    e->namold[0]=0;
+    if(mode==3){
+        /* F2 rename selected */
+        if(e->exsel>=e->exn){ e->naming=0; return; }
+        { const char *f=e->ex[e->exsel].full, *b=NULL, *p;
+          for(p=f;*p;p++) if(*p=='\\'||*p=='/') b=p;
+          snprintf(e->namold,sizeof e->namold,"%s",f);
+          if(b){ size_t n=(size_t)(b-f); if(n>=sizeof e->namdir) n=sizeof e->namdir-1;
+              memcpy(e->namdir,f,n); e->namdir[n]=0; if(!e->namdir[0]) snprintf(e->namdir,sizeof e->namdir,"."); b++; }
+          else { snprintf(e->namdir,sizeof e->namdir,"%s",e->exdir); b=f; }
+          snprintf(e->namb,sizeof e->namb,"%s",b);
+          e->namlen=strlen(e->namb); e->namcur=e->namlen; }
+    } else {
+        ex_target_dir(e,e->namdir,sizeof e->namdir);
+    }
+    e->menu=0;
+}
+
+static void ed_naming_cancel(Editor *e){ e->naming=0; e->namlen=0; }
+
+static void ed_naming_confirm(Editor *e){
+    size_t a=0, b=e->namlen;
+    char name[256], dest[1120];
+    while(a<b && (e->namb[a]==' '||e->namb[a]=='\t')) a++;
+    while(b>a && (e->namb[b-1]==' '||e->namb[b-1]=='\t')) b--;
+    if(b-a==0 || b-a>=sizeof name){ snprintf(e->status,sizeof e->status,"bad name"); e->naming=0; return; }
+    memcpy(name,e->namb+a,b-a); name[b-a]=0;
+    { size_t k; for(k=0;name[k];k++) if(name[k]=='/'||name[k]=='\\'){ snprintf(e->status,sizeof e->status,"bad name"); e->naming=0; return; }
+      if(!strcmp(name,".")||!strcmp(name,"..")){ snprintf(e->status,sizeof e->status,"bad name"); e->naming=0; return; } }
+    snprintf(dest,sizeof dest,"%s\\%s",e->namdir,name);
+    if(e->naming==1){
+        FILE *f=fopen(dest,"wb");
+        if(!f){ snprintf(e->status,sizeof e->status,"cannot create '%s'",dest); e->naming=0; return; }
+        fclose(f);
+        e->naming=0;
+        ex_reveal(e,dest);
+        ed_open_path(e,dest);
+        snprintf(e->status,sizeof e->status,"new file '%s'",name);
+    } else if(e->naming==2){
+        if(!CreateDirectoryA(dest,NULL)){ snprintf(e->status,sizeof e->status,"cannot create '%s'",dest); e->naming=0; return; }
+        e->naming=0;
+        ex_reveal(e,dest);
+        snprintf(e->status,sizeof e->status,"new folder '%s'",name);
+    } else {
+        if(!strcmp(e->namold,dest)){ e->naming=0; return; }
+        if(GetFileAttributesA(dest)!=INVALID_FILE_ATTRIBUTES){ snprintf(e->status,sizeof e->status,"'%s' exists",name); return; }
+        if(!MoveFileA(e->namold,dest)){ snprintf(e->status,sizeof e->status,"cannot rename"); e->naming=0; return; }
+        ed_rename_paths(e,e->namold,dest);
+        e->naming=0;
+        ex_reveal(e,dest);
+        snprintf(e->status,sizeof e->status,"renamed to '%s'",name);
+    }
+}
+
+/* popup geometry (shared by draw + click) */
+static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
+    int bw, bh, i, maxw=0;
+    if(e->naming){
+        const char *t=e->naming==1?"new file":e->naming==2?"new folder":"rename";
+        bw=46;
+        for(i=0;t[i];i++){}
+        if(bw>W-4) bw=W-4;
+        *x0=(W-bw)/2; *y0=H/2-2; *w=bw; *h=5;
+        return;
+    }
+    for(i=0;i<e->nitems;i++){ int L=(int)strlen(e->mitems[i].label); if(L>maxw) maxw=L; }
+    bw=maxw+6; if(bw>W-4) bw=W-4; if(bw<20) bw=20;
+    bh=e->nitems+2; if(bh>H-2) bh=H-2;
+    *x0=(W-bw)/2; *y0=(H-bh)/2; *w=bw; *h=bh;
+}
+
+static void ed_popup_draw(Editor *e,int W,int H){
+    int x0,y0,bw,bh,i;
+    ed_popup_geom(e,W,H,&x0,&y0,&bw,&bh);
+    if(e->naming){
+        const char *t=e->naming==1?"new file":e->naming==2?"new folder":"rename";
+        /* border */
+        printf("\x1b[%d;%dH+",y0+1,x0+1);
+        for(i=0;i<bw-2;i++) fputc('-',stdout);
+        fputc('+',stdout);
+        printf("\x1b[%d;%dH| %s",y0+2,x0+1,t);
+        printf("\x1b[%d;%dH| [",y0+3,x0+1);
+        { int fw=bw-6, k, off=0;
+          if((int)e->namcur>fw-1) off=(int)e->namcur-(fw-1);
+          for(k=0;k<fw;k++){ size_t q=(size_t)off+k; fputc(q<e->namlen?e->namb[q]:' ',stdout); }
+          fputc(']',stdout); }
+        printf("\x1b[%d;%dH+",y0+4,x0+1);
+        for(i=0;i<bw-2;i++) fputc('-',stdout);
+        fputc('+',stdout);
+        printf("\x1b[%d;%dH",y0+3,x0+4+(int)(e->namcur-((e->namcur>(size_t)(bw-6-1))?(e->namcur-(bw-6-1)):0)));
+        printf("\x1b[?25h");
+        return;
+    }
+    printf("\x1b[%d;%dH+",y0+1,x0+1);
+    for(i=0;i<bw-2;i++) fputc('-',stdout);
+    fputc('+',stdout);
+    for(i=0;i<e->nitems&&i<bh-2;i++){
+        printf("\x1b[%d;%dH| ",y0+2+i,x0+1);
+        if(i==e->msel) printf("\x1b[7m");
+        { int k, L=(int)strlen(e->mitems[i].label);
+          for(k=0;k<L&&k<bw-4;k++) fputc(e->mitems[i].label[k],stdout);
+          for(;k<bw-4;k++) fputc(' ',stdout); }
+        if(i==e->msel) printf("\x1b[0m");
+        fputc('|',stdout);
+    }
+    printf("\x1b[%d;%dH+",y0+1+bh-1,x0+1);
+    for(i=0;i<bw-2;i++) fputc('-',stdout);
+    fputc('+',stdout);
+}
+
+/* menu pick */
+static void ed_menu_pick(Editor *e,int id){
+    char dir[1024];
+    e->menu=0;
+    if(id==MA_OPEN){ if(e->exsel<e->exn) ex_open_idx(e,e->exsel); }
+    else if(id==MA_NEWFILE){ ex_target_dir(e,dir,sizeof dir); snprintf(e->namdir,sizeof e->namdir,"%s",dir); ed_naming_start(e,1); }
+    else if(id==MA_NEWDIR){ ex_target_dir(e,dir,sizeof dir); snprintf(e->namdir,sizeof e->namdir,"%s",dir); ed_naming_start(e,2); }
+    else if(id==MA_SAVEALL){ ed_save_all(e); }
+    else if(id==MA_COPY){
+        if(e->exsel>=e->exn) return;
+        snprintf(e->fcb,sizeof e->fcb,"%s",e->ex[e->exsel].full);
+        e->fcb_dir=e->ex[e->exsel].isdir; e->fcb_ok=1;
+        snprintf(e->status,sizeof e->status,"copied '%s'",e->ex[e->exsel].name);
+    }
+    else if(id==MA_RENAME){ ed_naming_start(e,3); }
+    else if(id==MA_DELETE){ ed_delete_confirm_open(e); }
+    else if(id==MA_DELYES){ ed_delete_do(e); }
+    /* MA_DELNO: just closes */
+    else if(id==MA_PASTE){
+        char cand[512], dest[1120], base[256];
+        const char *b;
+        if(!e->fcb_ok) return;
+        ex_target_dir(e,dir,sizeof dir);
+        b=e->fcb; { const char *p=b, *l=NULL; while(*p){ if(*p=='\\'||*p=='/') l=p; p++; } if(l) b=l+1; }
+        snprintf(base,sizeof base,"%s",b);
+        ed_unique(cand,sizeof cand,dir,base,e->fcb_dir);
+        snprintf(dest,sizeof dest,"%s\\%s",dir,cand);
+        if(ed_copy_tree(e->fcb,dest,0)){ ex_reveal(e,dest); snprintf(e->status,sizeof e->status,"pasted '%s'",cand); }
+        else snprintf(e->status,sizeof e->status,"paste failed");
+    }
+}
+
+/* popup input: Up/Dn/Enter/Esc/click/wheel. Returns 1 when consumed. */
+static int ed_popup_key(Editor *e,WORD vk,WCHAR ch){
+    int i;
+    if(e->naming){
+        if(ch==27){ ed_naming_cancel(e); return 1; }
+        if(ch==13){ ed_naming_confirm(e); return 1; }
+        if(ch==8){ if(e->namcur>0){ e->namcur--; memmove(&e->namb[e->namcur],&e->namb[e->namcur+1],e->namlen-e->namcur); if(e->namlen>0) e->namlen--; } return 1; }
+        if(ch==0){
+            if(vk==VK_LEFT&&e->namcur>0){ e->namcur--; return 1; }
+            if(vk==VK_RIGHT&&e->namcur<e->namlen){ e->namcur++; return 1; }
+            return 1;
+        }
+        if(ch>=32&&e->namlen+1<sizeof e->namb){
+            /* BMP -> UTF-8 (astral chars arrive as surrogate halves) */
+            unsigned long cp=ch;
+            char tmp[4]; int m=0, k;
+            if(cp<0x80) tmp[m++]=(char)cp;
+            else if(cp<0x800){ tmp[m++]=(char)(0xC0|(cp>>6)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+            else { tmp[m++]=(char)(0xE0|(cp>>12)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+            if(e->namlen+(size_t)m>=sizeof e->namb) return 1;
+            memmove(&e->namb[e->namcur+m],&e->namb[e->namcur],e->namlen-e->namcur);
+            for(k=0;k<m;k++) e->namb[e->namcur+k]=tmp[k];
+            e->namcur+=(size_t)m; e->namlen+=(size_t)m; e->namb[e->namlen]=0;
+            return 1;
+        }
+        return 1;
+    }
+    if(e->menu){
+        if(ch==27){ e->menu=0; return 1; }
+        if(ch==13){
+            if(e->msel<e->nitems) ed_menu_pick(e,e->mitems[e->msel].id);
+            else e->menu=0;
+            return 1;
+        }
+        if(ch==0){
+            if(vk==VK_UP&&e->msel>0){ e->msel--; return 1; }
+            if(vk==VK_DOWN&&e->msel+1<e->nitems){ e->msel++; return 1; }
+            return 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+static void ed_popup_click(Editor *e,int x,int y,int W,int H){
+    int x0,y0,bw,bh,i;
+    if(!e->menu&&!e->naming) return;
+    ed_popup_geom(e,W,H,&x0,&y0,&bw,&bh);
+    if(e->naming){ return; }   /* clicks elsewhere cancel (handled by caller) */
+    for(i=0;i<e->nitems&&i<bh-2;i++){
+        if(y==y0+1+i && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
+    }
+}
+
+/* wait for any key-down (used after run) */
+static void wait_key(HANDLE hin){    INPUT_RECORD ir; DWORD n=0;
+    for(;;){
+        if(!ReadConsoleInputW(hin,&ir,1,&n)) return;
+        if(ir.EventType==KEY_EVENT && ir.Event.KeyEvent.bKeyDown) return;
+    }
 }
 
 /* run the current file with luc (^R or ^`). Saves first, clears the
@@ -4836,78 +5885,319 @@ static void ed_run(Editor *e,HANDLE hin,DWORD oldmode){
     if(e->dirty && !ed_save(e)) return;
     if(!g_exepath[0]){ snprintf(e->status,sizeof e->status,"cannot find luc"); return; }
     SetConsoleMode(hin,oldmode);
-    printf("\x1b[2J\x1b[H--- lc code run: %s ---\n",e->path);
+    printf("\x1b[?7h\x1b[2J\x1b[H--- lc code run: %s ---\n",e->path);
     fflush(stdout);
     { const char *av[3]; av[0]=g_exepath; av[1]=e->path; av[2]=NULL;
       intptr_t rc=_spawnv(_P_WAIT,g_exepath,av);
       printf("\n--- exit %d --- press any key\n",(int)rc); }
     fflush(stdout);
+    printf("\x1b[?7l");
+    fflush(stdout);
     SetConsoleMode(hin,oldmode & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT));
-    _getch();
+    wait_key(hin);
     e->status[0]=0;
 }
 
-static void ed_arrow(Editor *e,int k){
-    if(k==72){ if(e->cy>0){ e->cy--; e->status[0]=0; } }
-    else if(k==80){ if(e->cy+1<e->n){ e->cy++; e->status[0]=0; } }
-    else if(k==75){ ed_move_left(e); e->status[0]=0; }
-    else if(k==77){ ed_move_right(e); e->status[0]=0; }
+/* insert one Unicode codepoint as UTF-8 (surrogate pairs combined) */
+static void ed_insert_cp(Editor *e,unsigned long cp){
+    char tmp[4]; int m=0;
+    if(cp<0x80) tmp[m++]=(char)cp;
+    else if(cp<0x800){ tmp[m++]=(char)(0xC0|(cp>>6)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+    else if(cp<0x10000){ tmp[m++]=(char)(0xE0|(cp>>12)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+    else { tmp[m++]=(char)(0xF0|(cp>>18)); tmp[m++]=(char)(0x80|((cp>>12)&0x3F)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+    ed_insert_bytes(e,tmp,(size_t)m);
 }
 
-static void run_editor(const char *path){
+/* keyboard. Returns 1 when the editor should quit. */
+static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
+    int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
+    int alt=(ctl&(LEFT_ALT_PRESSED|RIGHT_ALT_PRESSED))!=0;
+    if(alt&&!ctrl) return 0;   /* menu compositions: ignore */
+    if(ch==2){ e->show_ex=!e->show_ex; return 0; }   /* ^B toggles explorer */
+    if(e->focus==1){
+        if(ch==27||ch==5){ e->focus=0; return 0; }        /* Esc/^E back to code */
+        if(ch==13){ ex_open_idx(e,e->exsel); return 0; }
+        if(ch==8){ ex_join(e,".."); return 0; }
+        if(!ctrl&&(ch=='n'||ch=='N')){ ex_target_dir(e,e->namdir,sizeof e->namdir); ed_naming_start(e,1); return 0; }
+        if(!ctrl&&(ch=='d'||ch=='D')){ ex_target_dir(e,e->namdir,sizeof e->namdir); ed_naming_start(e,2); return 0; }
+        if(ctrl&&ch==3){
+            if(e->exsel>=e->exn) return 0;
+            snprintf(e->fcb,sizeof e->fcb,"%s",e->ex[e->exsel].full);
+            e->fcb_dir=e->ex[e->exsel].isdir; e->fcb_ok=1;
+            snprintf(e->status,sizeof e->status,"copied '%s'",e->ex[e->exsel].name);
+            return 0;
+        }
+        if(ctrl&&ch==22){
+            if(!e->fcb_ok){ snprintf(e->status,sizeof e->status,"nothing to paste"); return 0; }
+            { char dir[1024], cand[512], dest[1120], base[256];
+              const char *b=e->fcb, *p, *l=NULL;
+              ex_target_dir(e,dir,sizeof dir);
+              for(p=b;*p;p++) if(*p=='\\'||*p=='/') l=p;
+              snprintf(base,sizeof base,"%s",l?l+1:b);
+              ed_unique(cand,sizeof cand,dir,base,e->fcb_dir);
+              snprintf(dest,sizeof dest,"%s\\%s",dir,cand);
+              if(ed_copy_tree(e->fcb,dest,0)){ ex_reveal(e,dest); snprintf(e->status,sizeof e->status,"pasted '%s'",cand); }
+              else snprintf(e->status,sizeof e->status,"paste failed"); }
+            return 0;
+        }
+        if(ch==0){
+            if(vk==VK_UP&&e->exsel>0){ e->exsel--; e->status[0]=0; }
+            else if(vk==VK_DOWN&&e->exsel+1<e->exn){ e->exsel++; e->status[0]=0; }
+            else if(vk==VK_F2&&e->exsel<e->exn){ ed_naming_start(e,3); }
+            else if(vk==VK_LEFT&&e->exsel<e->exn){
+                if(e->ex[e->exsel].isdir&&e->ex[e->exsel].expanded) ex_collapse(e,e->exsel);
+                else { size_t i=e->exsel, d=(size_t)e->ex[i].depth;
+                    while(i>0&&e->ex[i-1].depth>=(int)d) i--;
+                    e->exsel=i; }
+                e->status[0]=0;
+            }
+            else if(vk==VK_RIGHT&&e->exsel<e->exn){
+                if(e->ex[e->exsel].isdir&&!e->ex[e->exsel].expanded) ex_expand(e,e->exsel);
+                else ex_open_idx(e,e->exsel);
+                e->status[0]=0;
+            }
+        }
+        return 0;
+    }
+    if(ch==27){
+        int u=ed_unsaved_count(e);
+        if(u>0&&!e->quit_arm){ snprintf(e->status,sizeof e->status,"%d unsaved - Esc again quits (loses them)",u); e->quit_arm=1; return 0; }
+        return 1;
+    }
+    e->quit_arm=0;
+    if(!e->path[0] && (ch==13||ch==8||ch==9||ch>=32||(ctrl&&(ch==3||ch==22)))){
+        snprintf(e->status,sizeof e->status,"open a file from the left first");
+        return 0;
+    }
+    if(ch==0){
+        if(vk==VK_UP&&e->cy>0){ e->cy--; e->status[0]=0; }
+        else if(vk==VK_DOWN&&e->cy+1<e->n){ e->cy++; e->status[0]=0; }
+        else if(vk==VK_LEFT){ ed_move_left(e); e->status[0]=0; }
+        else if(vk==VK_RIGHT){ ed_move_right(e); e->status[0]=0; }
+        else if(vk==VK_OEM_3&&ctrl) ed_run(e,hin,old);   /* ^` runs */
+        return 0;
+    }
+    if(ch==13){ ed_newline(e); return 0; }
+    if(ch==8){ ed_backspace(e); return 0; }
+    if(ch==9){ ed_insert_bytes(e,"    ",4); return 0; }
+    if(ctrl){
+        if(ch==3){ ed_copy_line(e); return 0; }
+        if(ch==22){ if(e->clip) ed_insert_bytes(e,e->clip,e->cliplen);
+            else snprintf(e->status,sizeof e->status,"clipboard empty (^C copies the line)"); return 0; }
+        if(ch==19){ ed_save(e); return 0; }
+        if(ch==18){ ed_run(e,hin,old); return 0; }
+        if(ch==5){ e->focus=1; e->status[0]=0; return 0; }
+        return 0;
+    }
+    if(ch>=32){
+        if(ch>=0xD800&&ch<=0xDBFF){ e->surr_hi=ch; return 0; }
+        { unsigned long cp;
+          if(ch>=0xDC00&&ch<=0xDFFF&&e->surr_hi){ cp=0x10000UL+(((unsigned long)(e->surr_hi-0xD800))<<10)+(unsigned long)(ch-0xDC00); e->surr_hi=0; }
+          else { e->surr_hi=0; cp=(unsigned long)ch; }
+          ed_insert_cp(e,cp); }
+        return 0;
+    }
+    return 0;
+}
+
+/* click/wheel. Coordinates are console-buffer based; vw/vh map them. */
+static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO bi;
+    int wx=0,wy=0;
+    if(GetConsoleScreenBufferInfo(h,&bi)){ wx=bi.srWindow.Left; wy=bi.srWindow.Top; }
+    if(m->dwEventFlags==MOUSE_WHEELED){
+        int up=((short)(m->dwButtonState>>16))>0;
+        int x=(int)m->dwMousePosition.X-wx;
+        int H=e->vh>0?e->vh:24;
+        int EXW=e->show_ex?ED_EXW:0;
+        if(EXW&&x<EXW){
+            if(up){ if(e->extop>=3) e->extop-=3; else e->extop=0; }
+            else e->extop+=3;
+        } else {
+            if(up){ if(e->top>=3) e->top-=3; else e->top=0; }
+            else e->top+=3;
+        }
+        ed_clamp_view(e,H);
+        return;
+    }
+    if(m->dwEventFlags!=0 && m->dwEventFlags!=DOUBLE_CLICK) return;
+    { int x=(int)m->dwMousePosition.X-wx, y=(int)m->dwMousePosition.Y-wy;
+      int H=e->vh>0?e->vh:24, W=e->vw>0?e->vw:80;
+      int EXW=e->show_ex?ED_EXW:0;
+      size_t CW=(size_t)(W-EXW)-e->numw; if((int)CW<8) CW=8;
+      if(y<1||y>H-2||x<0) return;
+      if(m->dwButtonState&RIGHTMOST_BUTTON_PRESSED){
+          /* right-click: context menu (files) or nothing (code) */
+          if(EXW&&x<EXW){
+              int r=y-1;
+              e->focus=1;
+              if(r==1||(r>=2 && e->extop+(r-2)<e->exn)){
+                  if(r>=2) e->exsel=e->extop+(r-2);
+                  ed_menu_open(e,1);
+              } else ed_menu_open(e,0);
+          }
+          return;
+      }
+      if(!(m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)) return;
+      if(EXW&&x<EXW){
+          int r=y-1;
+          if(r==0){
+              e->focus=1;
+              if(x>=EXW-3) ed_menu_open(e,0);
+              return;
+          }
+          if(r==1){ e->focus=1; ex_toggle_all(e); return; }
+          size_t idx=e->extop+(r-2);
+          if(idx<e->exn){ e->focus=1; ex_open_idx(e,idx); }
+          return;
+      }
+      { size_t li=e->top+(y-1);
+        if(li>=e->n) return;
+        e->focus=0; e->status[0]=0;
+        e->cy=li; ed_clamp(e);
+        { size_t want=(x>=EXW+e->numw)?(size_t)(x-EXW-e->numw):0;
+          char *b=e->ln[li].b; size_t L=e->ln[li].len;
+          size_t k=0,d=0,col=0;
+          while(k<L&&d<e->dleft+want){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
+          while(k<L&&ed_is_cont((unsigned char)b[k])) k++;
+          e->cx=k; } } }
+}
+
+static int ed_isdir(const char *p){
+    DWORD a=GetFileAttributesA(p);
+    return a!=INVALID_FILE_ATTRIBUTES && (a&FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int ed_isfile(const char *p){
+    DWORD a=GetFileAttributesA(p);
+    return a!=INVALID_FILE_ATTRIBUTES && !(a&FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* lc code entry: start=NULL (cwd + no file), a file, or a directory */
+static void lc_code(const char *start){
     HANDLE hin=GetStdHandle(STD_INPUT_HANDLE);
     DWORD m=0, old=0;
     Editor e;
-    if(!hin||hin==INVALID_HANDLE_VALUE||!GetConsoleMode(hin,&m)){
-        printf("editor needs a console (stdin is redirected).\n");
+    if((!hin||hin==INVALID_HANDLE_VALUE||!GetConsoleMode(hin,&m)) && !getenv("LUC_TESTDRAW")){
+        printf("lc code needs a console (stdin is redirected).\n");
         return;
     }
     old=m;
-    SetConsoleMode(hin,old & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT));
-    memset(&e,0,sizeof e); e.path=path;
-    ed_load(&e);
+    SetConsoleMode(hin,(old|ENABLE_MOUSE_INPUT|ENABLE_EXTENDED_FLAGS)
+        & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT|ENABLE_QUICK_EDIT_MODE));
+    memset(&e,0,sizeof e);
+    e.show_ex=1;
+    if(start&&*start){
+        if(ed_isdir(start)){
+            snprintf(e.exdir,sizeof e.exdir,"%s",start);
+            e.focus=1;
+        } else {
+            snprintf(e.path,sizeof e.path,"%s",start);
+            { const char *b1=strrchr(start,'/'),*b2=strrchr(start,'\\');
+              const char *b=b1; if(b2&&(!b||b2>b)) b=b2;
+              if(b){ size_t n=(size_t)(b-start);
+                     if(n>=sizeof e.exdir) n=sizeof e.exdir-1;
+                     memcpy(e.exdir,start,n); e.exdir[n]=0;
+                     if(!e.exdir[0]) snprintf(e.exdir,sizeof e.exdir,"."); }
+              else if(!GetCurrentDirectoryA(sizeof e.exdir,e.exdir))
+                  snprintf(e.exdir,sizeof e.exdir,"."); }
+            e.focus=0;
+            ed_load(&e);
+        }
+    } else {
+        if(!GetCurrentDirectoryA(sizeof e.exdir,e.exdir))
+            snprintf(e.exdir,sizeof e.exdir,".");
+        e.focus=1;
+    }
+    ex_refresh(&e);
+    /* fullscreen TUI: alternate screen (user scrollback untouched),
+     * no autowrap (overlong rows truncate, never scroll the frame) */
+    printf("\x1b[?1049h\x1b[?7l");
+    fflush(stdout);
+    /* batch the whole frame into one write: many small writes flicker */
+    setvbuf(stdout,NULL,_IOFBF,65536);
     for(;;){
         ed_clamp(&e);
         ed_draw(&e);
-        { int c=_getch();
-          if(c!=27) e.quit_arm=0;
-          if(c==0){
-              /* ^` (NUL, nothing follows) runs; extended keys (arrows)
-               * always bring a second byte right away */
-              if(_kbhit()) ed_arrow(&e,_getch());
-              else ed_run(&e,hin,old);
-          }
-          else if(c==224) ed_arrow(&e,_getch());
-          else if(c==18) ed_run(&e,hin,old);   /* ^R runs too */
-          else if(c==13) ed_newline(&e);
-          else if(c==8) ed_backspace(&e);
-          else if(c==27){
-              if(e.dirty&&!e.quit_arm){ snprintf(e.status,sizeof e.status,"unsaved! ^S saves, Esc again quits"); e.quit_arm=1; }
-              else break;
-          }
-          else if(c==3) ed_copy_line(&e);
-          else if(c==22){
-              if(e.clip) ed_insert_bytes(&e,e.clip,e.cliplen);
-              else snprintf(e.status,sizeof e.status,"clipboard empty (^C copies the line)");
-          }
-          else if(c==19) ed_save(&e);
-          else if(c==9) ed_insert_bytes(&e,"    ",4);
-          else if(c>=32) ed_insert_bytes(&e,(char*)&c,1);
-          ed_clamp(&e); }
+        for(;;){
+            INPUT_RECORD ir; DWORD n=0;
+            if(!ReadConsoleInputW(hin,&ir,1,&n)) goto done;
+            if(e.menu||e.naming){
+                /* popup owns all input until dismissed */
+                if(ir.EventType==MOUSE_EVENT){
+                    WORD f=ir.Event.MouseEvent.dwEventFlags;
+                    if(f==MOUSE_MOVED) continue;
+                    if(f==0||f==DOUBLE_CLICK){
+                        DWORD bs=ir.Event.MouseEvent.dwButtonState;
+                        if(bs&FROM_LEFT_1ST_BUTTON_PRESSED){
+                            HANDLE hh=GetStdHandle(STD_OUTPUT_HANDLE);
+                            CONSOLE_SCREEN_BUFFER_INFO bb;
+                            int wx=0,wy=0;
+                            if(GetConsoleScreenBufferInfo(hh,&bb)){ wx=bb.srWindow.Left; wy=bb.srWindow.Top; }
+                            if(e.naming){
+                                int x0,y0,bw,bh;
+                                int W=e.vw>0?e.vw:80, H=e.vh>0?e.vh:24;
+                                int x=(int)ir.Event.MouseEvent.dwMousePosition.X-wx;
+                                int y=(int)ir.Event.MouseEvent.dwMousePosition.Y-wy;
+                                ed_popup_geom(&e,W,H,&x0,&y0,&bw,&bh);
+                                if(x<x0||x>=x0+bw||y<y0||y>=y0+bh){ e.naming=0; break; }
+                            } else {
+                                ed_popup_click(&e,
+                                    (int)ir.Event.MouseEvent.dwMousePosition.X-wx,
+                                    (int)ir.Event.MouseEvent.dwMousePosition.Y-wy,
+                                    e.vw>0?e.vw:80, e.vh>0?e.vh:24);
+                                if(!e.menu) e.click_eat=1;
+                                break;
+                            }
+                        }
+                        if(bs&RIGHTMOST_BUTTON_PRESSED){ e.menu=0; e.naming=0; break; }
+                    }
+                    continue;
+                }
+                if(ir.EventType==WINDOW_BUFFER_SIZE_EVENT) break;
+                if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
+                ed_popup_key(&e,ir.Event.KeyEvent.wVirtualKeyCode,
+                             ir.Event.KeyEvent.uChar.UnicodeChar);
+                break;
+            }
+            if(ir.EventType==MOUSE_EVENT){
+                WORD f=ir.Event.MouseEvent.dwEventFlags;
+                if(f==MOUSE_MOVED) continue;   /* hover redraws = flicker */
+                if((f==0||f==DOUBLE_CLICK)
+                   && (ir.Event.MouseEvent.dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)
+                   && e.click_eat){ e.click_eat=0; continue; }
+                e.click_eat=0;
+                ed_mouse(&e,&ir.Event.MouseEvent);
+                break;
+            }
+            if(ir.EventType==WINDOW_BUFFER_SIZE_EVENT) break;  /* resize */
+            if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
+            if(ed_key(&e,hin,old,ir.Event.KeyEvent.wVirtualKeyCode,
+                      ir.Event.KeyEvent.uChar.UnicodeChar,
+                      ir.Event.KeyEvent.dwControlKeyState)) goto done;
+            break;
+        }
+        ed_clamp(&e);
     }
+done:
     SetConsoleMode(hin,old);
+    ex_free(&e);
     ed_free(&e);
-    printf("\x1b[?25h\n");
+    { size_t si; for(si=0;si<e.nstash;si++){ size_t k; for(k=0;k<e.stash[si].n;k++) free(e.stash[si].ln[k].b); free(e.stash[si].ln); }
+      free(e.stash); e.stash=NULL; e.nstash=0; }
+    printf("\x1b[?25h\x1b[?7h\x1b[?1049l\n");
     fflush(stdout);
+    setvbuf(stdout,NULL,_IONBF,0);
 }
 #else
-static void run_editor(const char *path){
-    (void)path;
-    printf("the built-in editor needs a Windows console for now.\n");
+static void lc_code(const char *start){
+    (void)start;
+    printf("lc code needs a Windows console for now.\n");
 }
 #endif
 
-static void edit_cmd(const char *line);
+static void lccode_cmd(const char *line);
 
 static void interactive_shell(void){
     char buf[512], key[64];
@@ -4919,35 +6209,24 @@ static void interactive_shell(void){
         if(!strcmp(key,"help")){ repl_help_loop(); continue; }
         if(!strcmp(key,"credit")||!strcmp(key,"credits")){ printf("made by hsusulist\n"); continue; }
         if(!strcmp(key,"license")||!strcmp(key,"licence")){ printf("%s",LUC_LICENSE); continue; }
-        if(!strcmp(key,"edit")){ edit_cmd(buf); continue; }
-        printf("I know: help, edit, credit, license. (Type 'exit' to quit.)\n");
+        if(!strcmp(key,"lccode")){ lccode_cmd(buf); continue; }
+        printf("I know: help, lccode, credit, license. (Type 'exit' to quit.)\n");
     }
 }
 
-/* edit file.luc -- filename is everything after the word edit */
-static void edit_cmd(const char *line){
-    const char *p=line+4;
+/* lccode [path] -- open lc code on a file, a directory, or the cwd */
+static void lccode_cmd(const char *line){
+    const char *p=line+6;
     char path[1024];
     size_t n;
     while(*p==' '||*p=='\t') p++;
     n=strlen(p);
     while(n && (p[n-1]==' '||p[n-1]=='\t'||p[n-1]=='\r'||p[n-1]=='\n')) n--;
     if(n>=2 && ((p[0]=='"'&&p[n-1]=='"')||(p[0]=='\''&&p[n-1]=='\''))){ p++; n-=2; }
-    if(n==0||n>=sizeof path){ printf("usage: edit file.luc (.luc, .lua and .py files)\n"); return; }
+    if(n==0){ lc_code(NULL); return; }
+    if(n>=sizeof path){ printf("path too long.\n"); return; }
     memcpy(path,p,n); path[n]=0;
-    { const char *dot=strrchr(path,'.');
-      const char *slash=strrchr(path,'/');
-      const char *bs=strrchr(path,'\\');
-      const char *base=path;
-      if(slash&&slash+1>base) base=slash+1;
-      if(bs&&bs+1>base) base=bs+1;
-      if(!dot||dot<base){ printf("editor opens .luc, .lua and .py files only.\n"); return; }
-      { char ext[8]; size_t k;
-        for(k=0;k<7&&dot[1+k];k++){ char c=dot[1+k]; ext[k]=(c>='A'&&c<='Z')?(char)(c+32):c; }
-        ext[k]=0;
-        if(strcmp(ext,"luc")&&strcmp(ext,"lua")&&strcmp(ext,"py")){
-            printf("editor opens .luc, .lua and .py files only.\n"); return; } } }
-    run_editor(path);
+    lc_code(path);
 }
 
 int main(int argc,char **argv){
@@ -4979,6 +6258,10 @@ int main(int argc,char **argv){
     if(strcmp(argv[1],"-e")==0){
         if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
         return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);
+    }
+    if(strcmp(argv[1],"--edit")==0){
+        lc_code(argc>2?argv[2]:NULL);
+        return 0;
     }
 
     if(strcmp(argv[1],"build")==0){

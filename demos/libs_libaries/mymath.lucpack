@@ -1,0 +1,23 @@
+!lucpack1
+lib mymath
+parts 2
+==== add 199
+make add
+
+-- one file, one part: `make <name>` must be the first line.
+-- every top-level create/function/command is auto-exported.
+
+create function plus(a, b)
+    return a + b
+end
+
+create tag = "A"
+
+==== sub 59
+make sub
+
+create function minus(a, b)
+    return a - b
+end
+
+.luic
