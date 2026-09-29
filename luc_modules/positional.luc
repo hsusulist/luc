@@ -1,14 +1,5 @@
--- Fixed sinusoidal position encoding
--- Used by older path and transformer pos=sinusoidal
--- Default is RoPE in rope.luc
--- RoPE is relative and length-extrapolating
---
--- Fixes vs old version:
--- Positions are 0-based per paper
--- Sin/cos pair shares one frequency
--- Keeps relative-offset property
--- Table grows lazily past seq_len
--- No nil-index on long input
+-- Fixed sinusoidal position encoding (legacy/transformer pos=sinusoidal; default is RoPE).
+-- 0-based positions, shared sin/cos frequency, lazy table growth past seq_len.
 
 create ok_matrix, matrix = pcall(require, "matrix")
 

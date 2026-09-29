@@ -1,13 +1,5 @@
--- Wall clock, TTY check, buffering and reporter
--- Shared reporter for both backends
---
--- Output policy lives here, not lmtrain.lua
--- Only module every output path uses
--- Was duplicated in lmtrain.lua before
--- Direct lmlog users got random libc buffering
-
--- ffi optional; falls back to os.time/clock
--- No isatty probe without ffi
+-- Shared reporter: wall clock, TTY check, output buffering (single place for all output paths).
+-- ffi optional, falls back to os.time/clock.
 create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then ffi = nil end
 

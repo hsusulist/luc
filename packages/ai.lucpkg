@@ -1,6 +1,6 @@
 #=lucpkg:ai
 #=lucfile: ai.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -16,12 +16,12 @@ create function safe_require(name)
     return nil
 end
 
--- Order matters for some modules, but pcall makes it safe
+-- Load order matters; pcall keeps it safe
 create modules = { 1: 
     { 1: "Matrix", 2:  "matrix" }, 2: 
     { 1: "Tensor", 2:  "tensor" }, 3: 
     { 1: "Tensor2", 2:  "tensor2" }, 4: 
-    { 1: "LmLog", 2:  "lmlog" }, 5:            -- NEW: Logger utility
+    { 1: "LmLog", 2:  "lmlog" }, 5:            -- Logger
     { 1: "Tokenizer", 2:  "tokenizer" }, 6: 
     { 1: "Data", 2:  "data" }, 7: 
     { 1: "Embedding", 2:  "embedding" }, 8: 
@@ -29,16 +29,16 @@ create modules = { 1:
     { 1: "RoPE", 2:  "rope" }, 10: 
     { 1: "Transformer", 2:  "transformer" }, 11: 
     { 1: "NN", 2:  "nn" }, 12: 
-    { 1: "Forge", 2:  "forge" }, 13:        -- FULL CONTROL branch: PyTorch-style modules
+    { 1: "Forge", 2:  "forge" }, 13:        -- Full-control modules
     { 1: "Optim", 2:  "optim" }, 14: 
     { 1: "Optim2", 2:  "optim2" }, 15: 
     { 1: "Train", 2:  "train" }, 16: 
     { 1: "LMTrain", 2:  "lmtrain" }, 17: 
-    { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- NEW: GPU plugin for LMTrain
+    { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- GPU plugin
     { 1: "GPU", 2:  "gpu" }, 19: 
     { 1: "BLAS", 2:  "blas" }, 20: 
     { 1: "LuaTL", 2:  "luatl_adapter" }, 21: 
-    { 1: "GPUTransformer", 2:  "gpu_transformer" } -- NEW: GPU model architecture
+    { 1: "GPUTransformer", 2:  "gpu_transformer" } -- GPU model
  }
 
 do
@@ -53,25 +53,21 @@ do
         ai[upper_name] = lib
         ai[file_name]  = lib
     else
-        -- Silently fail, as some modules (like GPU) are optional
-        -- But print a warning so users know if a file is missing/broken
+        -- Optional modules fail silently
+        -- Disabled warning for missing/broken file
         -- print("[LanternL] Warning: Failed to load module '" .. file_name .. "'")
     end
 end
 end
 
---- ================================================================
----  FULL CONTROL BRANCH ("the forge")
+--- Forge
+--- Full-control branch ("the forge")
 ---
----  Two doors into lanternl:
----    EASY (default): ai.LMTrain{ data = ..., epochs = ... } handles
----    tokenizing, batching, scheduling, logging for you.
----    FULL CONTROL : ai.forge() hands you raw PyTorch-style modules
----    (Linear, Embedding, Sequential, GELU, losses, optimizers) on the
----    same autograd engine -- and NOTHING else is automatic.  You write
----    the training loop yourself, exactly like torch.
----
----  Returns the toolbox table; pass { "quiet": true } to skip the banner.
+--- Two doors:
+--- EASY: ai.LMTrain handles tokenizing and logging
+--- FULL CONTROL: ai.forge gives raw modules only
+--- Same autograd engine; you write the loop
+--- Returns toolbox; quiet skips banner
 function ai.forge(opts)
     opts = opts or {}
     if not ai.Forge then
@@ -101,7 +97,7 @@ function ai.forge(opts)
     return ai.Forge
 end
 
--- aliases for the same door
+-- Same door aliases
 ai.hardcoding = ai.forge
 ai.fullcontrol = ai.forge
 
@@ -129,20 +125,20 @@ function ai.benchmark()
     create matrix = ai.Matrix
     print("  LanternL CPU/GPU Benchmark")
     
-    -- 512x512 matrices (roughly 2MB each as f64)
+    -- 512x512 matrices (~2MB each, f64)
     create size = 512 
     print("Generating " .. size .. "x" .. size .. " matrices...")
     create A = matrix.random(size, size)
     create B = matrix.random(size, size)
     
-    -- 1. CPU Benchmark
+    -- CPU benchmark
     matrix.use("lua")
     create t0 = os.clock()
     create C_cpu = matrix.multiply(A, B)
     create cpu_time = os.clock() - t0
     print(string.format("  CPU (Pure LuaJIT) : %.4f sec", cpu_time))
     
-    -- 2. GPU Benchmark (if available)
+    -- GPU benchmark if available
     create gpu_time = "N/A"
     if ai.LuaTL and ai.LuaTL.available then
         matrix.use("luatl_adapter")
@@ -151,13 +147,13 @@ function ai.benchmark()
         gpu_time = os.clock() - t1
         print(string.format("  GPU (luaTL)       : %.4f sec", gpu_time))
         
-        -- Verify results match
+        -- Check CPU vs GPU match
         if matrix.equals(C_cpu, C_gpu, 0.1) then
             print("  Verification       : PASSED (CPU ~= GPU)")
         else
             print("  Verification       : MISMATCH (Check math)")
         end
-        matrix.use("auto") -- reset to auto
+        matrix.use("auto") -- reset
     else
         print("  GPU (luaTL)       : Not installed/available")
     end
@@ -294,14 +290,8 @@ ai.h = ai.help
 
 return ai
 #=lucfile: bench_gpu_transformer.luc
---  bench_gpu_transformer.lua — prove the resident path is real
---
---    luajit bench_gpu_transformer.lua              -- default config
---    luajit bench_gpu_transformer.lua 256 4 8 1024 8 64 5000
---                     dim layers heads ffn batch seq vocab
---
---  Reports achieved GFLOP/s for a FULL forward + backward + AdamW step,
---  the round-trip GEMM baseline, and the CPU-autograd wall time.
+-- GPU-resident benchmark: full forward + backward + AdamW step, GEMM baseline, CPU wall time.
+-- Usage: luajit bench_gpu_transformer.lua [dim layers heads ffn batch seq vocab]
 
 package.path = package.path .. ";./ai/core/?.lua;./ai/nn/?.lua;./ai/gpu/?.lua;./?.lua"
 
@@ -603,7 +593,7 @@ end
 
 return blas
 #=lucfile: data.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -649,15 +639,15 @@ create function print_progress(current, total)
     io.flush()
 end
 
--- Unique-per-process tag so two concurrent downloads (or a crashed run's
--- leftovers) can never clobber each other's staging files.  Mirrors the
--- approach used by lmio.lua for checkpoint temp names.
+-- Unique tag so concurrent downloads never clash
+-- Leftovers cannot clobber staging files
+-- Mirrors lmio.lua temp names
 create TMP_TAG = tostring(os.time()) .. "-" .. tostring(math.random(0, 999999))
     .. "-" .. tostring(math.floor((os.clock() % 1) * 1000000))
 
 create function sleep_ms(ms)
-    -- Best-effort backoff.  Pure Lua has no portable sleep; os.clock()
-    -- advances during a spin, which is all we need for short waits.
+    -- Best-effort backoff via spin wait
+    -- Pure Lua has no sleep; os.clock spin suffices
     create target = os.clock() + ms / 1000
     while os.clock() < target do end
 end
@@ -681,10 +671,10 @@ create function download_with_progress(url, local_file, max_bytes)
     create retries = 3
     create current_bytes = 0
 
-    -- Stream into a unique .part file and only move it into place when the
-    -- download is complete.  The old code wrote straight to local_file, so
-    -- an interrupted download left a truncated file behind -- which later
-    -- runs then happily treated as a valid cached copy ("Skipping ...").
+    -- Stage to unique .part file, then move in place
+    -- Old code left truncated cache on interrupt
+    -- Truncated file looked like valid cache
+    -- New path avoids that
     create part_file = local_file .. ".part-" .. TMP_TAG
     create f_out, open_err = io.open(part_file, "wb")
     if not f_out then
@@ -745,7 +735,7 @@ end
 
     create moved = os.rename(part_file, local_file)
     if not moved and package.config:sub(1, 1) == "\\" then
-        -- Windows rename() refuses to overwrite; clear the way and retry
+        -- Windows rename needs remove+retry
         os.remove(local_file)
         moved = os.rename(part_file, local_file)
     end
@@ -990,13 +980,13 @@ end
     return self
 end
 
---- REPLACES Data:config().
---- The old form was:
----     self.shuffle = opts.shuffle ~= nil and opts.shuffle or self.shuffle
---- With opts.shuffle == false that whole expression is falsy, so it fell
---- through to `or self.shuffle` and the assignment was a no-op:
---- Data:config{ shuffle = false } could not turn shuffling off.  Same bug on
---- `stream`.  Explicit nil checks instead.
+--- Data:config with explicit nil checks
+--- Old or-fallback ignored shuffle=false
+--- Same bug on stream flag
+--- False values now apply correctly
+--- Explicit checks fix it
+--- See config code below
+--- Nil means keep current
 function Data:config(opts)
     opts = opts or {}
     if opts.batch_size != nil then
@@ -1011,12 +1001,12 @@ function Data:config(opts)
     return self
 end
 
---- REPLACES the local read_all_lines(). Two fixes:
----  * the old version reported nothing on a path that does not exist, so a
----    typo'd filename silently produced an empty corpus and LMTrain then
----    failed far away with "data is empty";
----  * :batches() and :count() each called it, doubling full-corpus disk I/O
----    on a large dataset. Cached.
+--- Cached read_all_lines with two fixes
+--- Missing path now errors instead of empty corpus
+--- Typo no longer fails later in LMTrain
+--- Batches and count share cache
+--- Avoids double disk I/O
+--- Cache stored in self._lines
 create function read_all_lines(self)
     if self._lines then return self._lines end
     create files, lines, missing = self.files, {}, {}
@@ -1062,9 +1052,9 @@ end
     return lines
 end
 
---- REPLACES Data:batches().  `i` in the loop was unused; the tokenizer branch
---- also silently produced empty sequences for blank-ish lines, which LMTrain
---- then rejected one by one -- filtered here instead.
+--- Data:batches filters blank lines early
+--- Tokenizer skips short sequences here
+--- Avoids per-item LMTrain rejects
 function Data:batches()
     create src = read_all_lines(self)
     create lines = {}
@@ -1116,7 +1106,7 @@ end
     return batches
 end
 
---- REPLACES Data:count(). Also add an explicit cache reset for long sessions.
+--- Data:count uses cache; reload clears it
 function Data:count()
     return len(read_all_lines(self))
 end
@@ -1234,7 +1224,7 @@ end
 
 return Data
 #=lucfile: embedding.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -1341,38 +1331,11 @@ end
 
 return embedding
 #=lucfile: forge.luc
---  forge.lua -- LanternL's FULL CONTROL branch.
---
---  A small PyTorch-style module system built directly on the tensor2
---  autograd engine.  Nothing here trains for you: you build modules,
---  write your own loop, choose your own losses and schedules.  If
---  LMTrain is an automatic camera, this is the darkroom.
---
---      local F = ai.forge()
---
---      local model = F.Sequential(
---          F.Linear(2, 32), F.ReLU(),
---          F.Linear(32, 16), F.GELU(),
---          F.Linear(16, 1))
---      local opt = F.optim.AdamW(model:parameters(), { lr = 1e-3 })
---
---      for step = 1, 1000 do
---          local pred = model(x)                 -- __call -> :forward
---          local loss = F.mse(pred, y)
---          opt.zero_grad()
---          loss:backward()
---          opt.step()
---      end
---
---  Conventions (documented, deliberate):
---    * Tensors are ALWAYS 2-D matrices (rows, cols).  Flatten batches
---      yourself; the engine underneath is 2-D too.
---    * Linear stores weight as (out_features x in_features), PyTorch
---      style: y = x * W^T + b.  Embedding stores (vocab x dim).
---    * Targets for losses are either Tensors or flat Lua tables.
---    * Module:train()/eval() flips the GLOBAL Tensor.training switch that
---      functional dropout reads -- one switch, same as the rest of the
---      library.  Call model:eval() before generating, :train() resuming.
+-- forge: full-control branch (PyTorch-style modules on tensor2 autograd).
+-- You build modules, write the loop, choose losses; manual counterpart to LMTrain.
+-- Example: F = ai.forge(); m = F.Sequential(F.Linear(2,32), F.ReLU(), F.Linear(32,1)).
+-- Conventions: 2-D tensors; Linear weight out x in; targets are Tensors/flat tables.
+-- Call m:eval() before generating, m:train() to resume (Dropout follows the switch).
 
 create matrix = require("matrix")
 create Tensor = require("tensor2")
@@ -1384,9 +1347,9 @@ create sqrt = math.sqrt
 create sformat = string.format
 create setmetatable = setmetatable
 
--- ==========================================================================
---  Module base
--- ==========================================================================
+--
+-- Module base
+--
 
 create Module = {}
 Module.__index = Module
@@ -1439,8 +1402,8 @@ end
     return self
 end
 
---- Flips this module (and the global training switch functional dropout
---- reads).  train(false) == eval().
+--- Flips module and global dropout switch
+--- train(false) is eval
 function Module:train(v)
     v = (v == nil) and true or (v and true or false)
     self._training = v
@@ -1473,17 +1436,17 @@ Module.__call = function(self, ...)
     return self:forward(...)
 end
 
--- Subclass helper: keeps the Module chain intact for user-defined blocks.
--- The returned class is CALLABLE -- C(...) delegates to C.new(...), so
--- user modules read exactly like torch:   local b = MyBlock(16)
+-- Subclass helper keeps Module chain intact
+-- Returned class is callable via C.new
+-- Usage matches torch style
 function Module.subclass(name)
     create C = setmetatable({}, { "__index":  Module  })
     C.__index = C
     C.classname = name or "Module"
-    -- Metamethods do NOT resolve through __index chains -- every class
-    -- needs its own copy or m(x) won't route into m:forward(x).
+    -- Metamethods need own copy, not via __index
+    -- Else m(x) misses m:forward
     C.__call = Module.__call
-    -- constructor-dispatching metamethod on the CLASS itself
+    -- Constructor dispatch on class
     getmetatable(C).__call = function(cls, ...)
         if type(cls.new) == "function" then return cls.new(...) end
         error("forge: class '" .. C.classname .. "' has no .new constructor", 2)
@@ -1495,15 +1458,15 @@ create function newmodule(C)
     return setmetatable({}, C or Module)
 end
 
--- ==========================================================================
---  Parameter initialisation helpers
--- ==========================================================================
+--
+-- Param init helpers
+--
 
 create function make_param(rows, cols, kind, arg)
     create m = matrix.alloc(rows, cols)
     create d = m.data
-    -- NB: matrix.alloc does NOT pre-zero its storage; every element must
-    -- be written here before anything reads it.
+    -- NB: alloc leaves storage unwritten
+    -- Init every element here
     if kind == "zeros" then
         do
     create __fa = (1)
@@ -1540,19 +1503,19 @@ end
     return Tensor.param(m)
 end
 
---- Constant leaf (no gradient flows into constants).
+--- Constant leaf; no grad into constants
 function forge.const(rows, cols, value)
     return Tensor.new(matrix.fill(rows, cols, value), nil, "leaf", nil)
 end
 
--- ==========================================================================
---  Layers
--- ==========================================================================
+--
+-- Layers
+--
 
 create Linear = Module.subclass("Linear")
 
---- Linear(in_features, out_features, { bias = true })
---- Weight is (out x in), y = x * W^T (+ b).  Init: U(-k, k), k = 1/sqrt(in).
+--- Linear(in, out, bias); weight out x in
+--- Init U(-k,k), k=1/sqrt(in)
 forge.Linear = function(in_features, out_features, opts)
     opts = opts or {}
     create self = newmodule(Linear)
@@ -1576,7 +1539,7 @@ end
 
 create Embedding = Module.subclass("Embedding")
 
---- Embedding(vocab_size, dim): forward takes a TABLE of token ids.
+--- Embedding(vocab, dim); forward takes id table
 forge.Embedding = function(vocab_size, dim)
     create self = newmodule(Embedding)
     self.vocab_size = vocab_size
@@ -1642,7 +1605,7 @@ end
 
 create Sequential = Module.subclass("Sequential")
 
---- Sequential(module1, module2, ...) or Sequential({ m1, m2, ... })
+--- Sequential(modules) or Sequential({list})
 forge.Sequential = function(...)
     create self = newmodule(Sequential)
     create items = { 1:  ...  }
@@ -1691,13 +1654,13 @@ function Sequential:len()
     return len(self._modules)
 end
 
--- --------------------------------------------------------------------------
---  Activations
--- --------------------------------------------------------------------------
+--
+-- Activations
+--
 
 create function activation(name, fn)
     create C = Module.subclass(name)
-    -- fn receives just the input; C.forward receives (self, input).
+    -- fn takes input; forward takes self plus input
     C.forward = function(_, x) return fn(x) end
     forge[name] = function()
         return newmodule(C)
@@ -1709,8 +1672,8 @@ activation("ReLU", function(x) return Tensor.relu(x) end)
 activation("SiLU", function(x) return Tensor.silu(x) end)
 activation("Tanh", function(x) return Tensor.tanh(x) end)
 
---- GELU, tanh approximation -- composed entirely from engine primitives, so
---- autograd through it is free (a good example of building your own ops).
+--- GELU tanh approx from engine primitives
+--- Autograd through it is free
 create gelu_c = sqrt(2 / math.pi)
 activation("GELU", function(x)
     create r, c = x.data.rows, x.data.cols
@@ -1722,8 +1685,8 @@ end)
 
 create SoftmaxRows = Module.subclass("SoftmaxRows")
 
---- SoftmaxRows({ causal = false }): softmax across each ROW (dim -1 in
---- torch terms -- the engine is 2-D, rows are the batch/time axis).
+--- SoftmaxRows per-row softmax
+--- Rows are batch/time axis in 2-D engine
 forge.SoftmaxRows = function(opts)
     create self = newmodule(SoftmaxRows)
     self.opts = opts
@@ -1734,11 +1697,11 @@ function SoftmaxRows:forward(x)
     return Tensor.softmax_rows(x, self.opts)
 end
 
--- ==========================================================================
---  Losses
--- ==========================================================================
+--
+-- Losses
+--
 
-create BACKWARD = Tensor.ops   -- live reference to tensor2's backward table
+create BACKWARD = Tensor.ops   -- live link to tensor2 backward table
 
 create function target_data(t, rows, cols, who)
     if Tensor.is(t) then return t.data.data end
@@ -1803,7 +1766,7 @@ end
     return fwd
 end
 
---- F.mse(pred, target, { reduction = "mean"|"sum" })
+--- F.mse with mean/sum reduction
 forge.mse = register_elementwise_loss("mse",
     function(pd, td) return pd - td end,
     function(pd, td)
@@ -1811,7 +1774,7 @@ forge.mse = register_elementwise_loss("mse",
         return d * d
     end)
 
---- F.l1(pred, target, { reduction = "mean"|"sum" })
+--- F.l1 with mean/sum reduction
 forge.l1 = register_elementwise_loss("l1",
     function(pd, td)
         if pd > td then return 1 elseif pd < td then return -1 else return 0 end
@@ -1832,9 +1795,9 @@ forge.L1Loss.forward = function(self, pred, target, opts)
     return forge.l1(pred, target, opts)
 end
 
---- F.cross_entropy(logits, targets, opts): targets are CLASS IDS
---- (1..vocab), one per row -- the engine convention, like torch.cross_entropy
---- receiving long indices.
+--- F.cross_entropy; targets are class ids 1..vocab
+--- One id per row, like torch long indices
+--- Engine convention for targets
 forge.cross_entropy = function(logits, targets, opts)
     return Tensor.cross_entropy(logits, targets, opts)
 end
@@ -1844,9 +1807,9 @@ forge.CrossEntropyLoss.forward = function(self, logits, targets, opts)
     return forge.cross_entropy(logits, targets, opts)
 end
 
--- ==========================================================================
---  Optimizers (accept a Module OR a plain parameter list)
--- ==========================================================================
+--
+-- Optimizers take Module or param list
+--
 
 create function as_param_list(x, who)
     if type(x) == "table" and type(x.parameters) == "function"
@@ -1858,9 +1821,9 @@ end
 
 forge.optim = { "SGD":  function(params, cfg) return optim2.SGD(as_param_list(params), cfg) end, "AdamW":  function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end, "Adam":  function(params, cfg) return optim2.AdamW(as_param_list(params), cfg) end, "create":  function(kind, params, cfg) return optim2.create(kind, as_param_list(params), cfg) end }
 
--- ==========================================================================
---  Utilities
--- ==========================================================================
+--
+-- Utilities
+--
 
 function forge.manual_seed(seed)
     math.randomseed(seed)
@@ -1875,9 +1838,9 @@ forge.from = function(t) return Tensor.from(t) end
 forge.Tensor = Tensor
 forge.Matrix = matrix
 
---- Freeze/unfreeze by simply excluding parameters from the optimizer list --
---- documented trick, no library magic needed:
----     opt = F.optim.AdamW(head_only_parameters, {lr=...})
+--- Freeze by excluding params from optimizer
+--- No library magic needed
+--- Example: opt with head params only
 
 return forge
 #=lucfile: gpu.luc
@@ -1995,33 +1958,9 @@ end
 
 return gpu
 #=lucfile: gpu_transformer.luc
---  One training step  =  token ids in  ->  loss out  ->  weights updated
---  in place on the GPU.  The host boundary is crossed exactly twice:
---
---      1. upload  N int32 input ids + N int32 targets   (H2D, ~8 KB)
---      2. download 1 float loss  (+ N int32 argmax if accuracy is on)
---
---  Everything between those two points -- embedding lookup, RoPE, causal
---  multi-head attention, RMSNorm, SwiGLU FFN, tied/untied head, fused
---  cross-entropy, the entire backward pass, global gradient clipping and
---  the AdamW update -- is queued into luaTL.Program objects and executed
---  with a handful of FFI transitions (or ONE, with CUDA graph replay).
---
---  Layout
---    N  = B * T          rows; sequence b occupies rows b*T .. b*T+T-1
---    D  = dim, H = heads, hd = D/H, F = ffn hidden, V = vocab
---    qkv[l]    : [N, 3D]        Q = cols 0..D-1, K = D..2D-1, V = 2D..3D-1
---    scores[l] : [B*H*T, T]     row ((b*H+h)*T + t);  r % T == t  =>  the
---                               group-causal softmax masks correctly and
---                               sequences cannot see each other.
---
---  Padding contract
---    Shapes are STATIC.  A short window or a short final batch is padded
---    with id 0 and target -1.  luaTL_ce_kernel writes loss 0 AND
---    dlogits 0 for those rows, so their contribution to every gradient is
---    exactly zero.  grad_scale and the loss-sum scale are patched in the
---    command structs to 1/valid_tokens, so the reported loss and the
---    gradient magnitude are exact, not approximate.
+-- GPU-resident step: ids in, loss out, weights stay on device (2 host crossings/step).
+-- Layout: N=B*T rows; qkv N x 3D; scores B*H*T x T with causal + group masks.
+-- Padding: static shapes, pad id 0 / target -1 gives zero loss/grad; scales use 1/valid_tokens.
 
 create ffi = require("ffi")
 
@@ -2038,8 +1977,8 @@ create sqrt, log, cos, sin, pi = math.sqrt, math.log, math.cos, math.sin, math.p
 create floor, min, max, huge = math.floor, math.min, math.max, math.huge
 create sformat = string.format
 
---  Bindings (resolved lazily so that requiring this file on a CPU-only
---  box does not explode; construction is what fails loudly).
+-- Lazy bindings; CPU-only require stays safe
+-- Construction fails loudly without backend
 create luaTL, C, F32
 
 create function bind()
@@ -2060,20 +1999,20 @@ end
 GT.available = adapter.available
 GT.adapter   = adapter
 
---  Small helpers
+-- Helpers
 
---- Byte-offset pointer into a tensor's storage, in ELEMENTS (f32).
+--- Element offset pointer into f32 storage
 create function poff(t, elems)
     return ffi.cast("char*", t.data) + elems * 4
 end
 
---- Stride view: the six numbers gemm_ex needs, plus a batch stride.
+--- Stride view for gemm_ex plus batch
 create function sv(ptr, rows, cols, rs, cs, bs)
     return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  F32  }
 end
 
---- Grab the command struct that was just queued, so we can patch scalars
---- (grad_scale, lr, step) later without re-queueing the whole program.
+--- Last queued op for scalar patching
+--- Patch grad_scale, lr, step in place
 create function last_op(p)
     return p.h.ops[p.h.count - 1]
 end
@@ -2093,7 +2032,7 @@ create function normal_fill(t, std)
     t:upload(buf, n)
 end
 
---  Construction
+-- Construction
 
 create function need(cfg, key)
     create v = cfg[key]
@@ -2170,21 +2109,21 @@ function GT.new(cfg)
     return self
 end
 
---  Allocation.  Every tensor below lives for the lifetime of the model.
---  Handles (adapter.alloc / adapter.pin) own the storage and anchor it
---  against the GC; `self._keep` anchors the non-owning wrap views.
+-- Allocation; tensors live with model
+-- Handles own storage against GC
+-- _keep anchors non-owning views
 function Model:_alloc()
     create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
     create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
     create D3, F2         = 3 * D, 2 * F
     create keep           = self._keep
 
-    create function A(rows, cols)                 -- zeroed activation buffer
+    create function A(rows, cols)                 -- zeroed buffer
         create h = adapter.alloc(rows, cols)
         keep[len(keep) + 1] = h
         return h.t
     end
-    create function W(ptr, rows, cols)            -- non-owning column view
+    create function W(ptr, rows, cols)            -- non-owning view
         create t = luaTL.wrap(ptr, rows, cols, F32)
         keep[len(keep) + 1] = t
         return t
@@ -2202,10 +2141,10 @@ function Model:_alloc()
         return p
     end
 
-    -- ---- parameters ----
-    -- GPT-2 style init: 0.02 everywhere, residual-output projections
-    -- scaled by 1/sqrt(2L) so the residual stream does not blow up with
-    -- depth.  No weight decay on 1-D norm gains.
+    -- params
+    -- GPT-2 init 0.02; residual scaled
+    -- Scale 1/sqrt(2L) stops blowup with depth
+    -- No decay on norm gains
     create std  = 0.02
     create rstd = std / sqrt(2 * L)
 
@@ -2234,8 +2173,8 @@ end
         self.wout = param("head", D, V, std, true)
     end
 
-    -- ---- index buffers ----
-    self.ids = A(N, 1)     -- int32 storage in an f32-sized tensor
+    -- Index buffers
+    self.ids = A(N, 1)     -- int32 in f32 tensor
     self.tgt = A(N, 1)
     self.pos = A(N, 1)
 
@@ -2254,9 +2193,9 @@ end
 end
     luaTL.check(C.luaTL_upload_i32(self.pos.data, self.h_pos, N), "pos.upload")
 
-    -- ---- residual stream + per-layer saved activations ---
-    self.res  = { (0):  A(N, D)  }      -- res[l]  : output of layer l
-    self.mid  = {}                     -- mid[l]  : after attention residual
+    -- Residual stream and saved activations
+    self.res  = { (0):  A(N, D)  }      -- res is layer output
+    self.mid  = {}                     -- mid after attention
     self.h1, self.qkv, self.sc, self.attn = {}, {}, {}, {}
     self.h2, self.h13, self.hs            = {}, {}, {}
     self.qv, self.kv, self.h13a, self.h13b = {}, {}, {}, {}
@@ -2278,23 +2217,23 @@ end
         self.h2[l]   = A(N, D)
         self.h13[l]  = A(N, F2)
         self.hs[l]   = A(N, F)
-        -- RoPE operates in place on the Q and K column slices
+        -- RoPE in place on Q and K slices
         self.qv[l]   = W(poff(self.qkv[l], 0), N, D)
         self.kv[l]   = W(poff(self.qkv[l], D), N, D)
-        -- SwiGLU gate/up halves of the fused [N, 2F] projection
+        -- SwiGLU halves of fused projection
         self.h13a[l] = W(poff(self.h13[l], 0), N, F)
         self.h13b[l] = W(poff(self.h13[l], F), N, F)
     end
 end
 
     self.hf     = A(N, D)
-    self.logits = A(N, V)          -- dlogits aliases this (saves N*V floats)
+    self.logits = A(N, V)          -- dlogits reuses logits, saves memory
     self.losses = A(N, 1)
     self.pred   = A(N, 1)
     self.lossacc= A(1, 1)
     self.nsq    = A(1, 1)
 
-    -- ---- backward scratch (reused across layers) ----
+    -- Backward scratch reused per layer
     self.dres   = A(N, D)
     self.dbr    = A(N, D)
     self.dhf    = A(N, D)
@@ -2313,11 +2252,11 @@ end
     self.f1 = ffi.new("float[1]")
 end
 
---  Program construction
+-- Program build
 
---- Forward pass.  `grad` selects whether cross-entropy also writes
---- dlogits (in place over the logits) or leaves the logits intact so
---- that :generate() can read them.
+--- Forward; grad selects dlogits write or not
+--- No write keeps logits for generate
+--- Generate reads intact logits
 function Model:_queue_forward(p, grad)
     create B, T, D, H, hd = self.B, self.T, self.dim, self.heads, self.hd
     create F, V, L, N     = self.ffn, self.vocab, self.layers, self.N
@@ -2343,7 +2282,7 @@ function Model:_queue_forward(p, grad)
         create xout = self.res[l]
         create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
-        -- pre-attention norm + fused QKV projection
+        -- Pre-attention norm plus QKV
         p:rmsnorm(xin, ly.ln1.w.t, self.h1[l], eps)
         p:gemm(self.h1[l], ly.wqkv.w.t, qkv)
 
@@ -2353,7 +2292,7 @@ function Model:_queue_forward(p, grad)
             p:rope(self.kv[l], ro)
         end
 
-        -- S = Q Kt   (batched over heads, looped over sequences)
+        -- Scores QKt batched per head
         do
     create __fa = (0)
     create __fb = (B - 1 )
@@ -2370,10 +2309,10 @@ function Model:_queue_forward(p, grad)
         end
 end
 
-        -- one launch masks + softmaxes every (sequence, head) row block
+        -- One launch masks all head rows
         p:softmax(sc, sc, { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
-        -- ctx = P V
+        -- Context P times V
         do
     create __fa = (0)
     create __fb = (B - 1 )
@@ -2390,11 +2329,11 @@ end
         end
 end
 
-        -- residual: mid = xin + ctx @ Wo   (add fused into the epilogue)
+        -- Residual add with fused epilogue
         p:copy(xin, mid)
         p:gemm(at, ly.wo.w.t, mid, { "beta":  1.0  })
 
-        -- SwiGLU feed-forward
+        -- SwiGLU FFN
         p:rmsnorm(mid, ly.ln2.w.t, self.h2[l], eps)
         p:gemm(self.h2[l], ly.w13.w.t, self.h13[l])
         p:swiglu(self.h13a[l], self.h13b[l], self.hs[l],
@@ -2404,7 +2343,7 @@ end
     end
 end
 
-    -- final norm + output head
+    -- Final norm and head
     p:rmsnorm(self.res[L], self.lnf.w.t, self.hf, eps)
     if self.tie then
         p:gemm(self.hf, self.emb.w.t:t(), self.logits)   -- [N,D] @ [D,V]
@@ -2412,7 +2351,7 @@ end
         p:gemm(self.hf, self.wout.w.t, self.logits)
     end
 
-    -- argmax BEFORE cross-entropy, because dlogits aliases logits
+    -- Argmax first; dlogits reuses logits
     if self.want_acc then p:argmax(self.logits, self.pred) end
 
     p:cross_entropy(self.logits, self.tgt, self.losses,
@@ -2431,13 +2370,13 @@ function Model:_queue_backward(p)
     create eps            = self.eps
     create TT             = T * T
     create HTT            = H * TT
-    create dl             = self.logits          -- dlogits, written in place
+    create dl             = self.logits          -- dlogits in place
 
-    -- ---- output head ----
+    -- Output head
     if self.tie then
-        -- d(tok_emb) += dlogits^T @ hf     ([V,N] @ [N,D] -> [V,D])
+        -- grad emb from dlogits and hf
         p:gemm(dl:t(), self.hf, self.emb.g.t, { "beta":  1.0  })
-        -- dhf = dlogits @ tok_emb          ([N,V] @ [V,D] -> [N,D])
+        -- grad hf from dlogits and emb
         p:gemm(dl, self.emb.w.t, self.dhf)
     else
         p:dw(self.hf, dl, self.wout.g.t)
@@ -2446,7 +2385,7 @@ function Model:_queue_backward(p)
     p:rmsnorm_bwd(self.res[L], self.lnf.w.t, self.dhf, self.dres,
                   self.lnf.g.t, eps)
 
-    -- ---- layers, top down ----
+    -- Layers top down
     do
     create __fa = (L)
     create __fb = (1)
@@ -2460,18 +2399,18 @@ function Model:_queue_backward(p)
         create mid = self.mid[l]
         create qkv, sc, at = self.qkv[l], self.sc[l], self.attn[l]
 
-        -- ---- feed-forward ----
-        p:dx(self.dres, ly.w2.w.t, self.dhs)          -- dhs  = dres @ W2^T
-        p:dw(self.hs[l], self.dres, ly.w2.g.t)        -- dW2 += hs^T @ dres
+        -- Feed-forward
+        p:dx(self.dres, ly.w2.w.t, self.dhs)          -- dhs from dres
+        p:dw(self.hs[l], self.dres, ly.w2.g.t)        -- dW2 accumulates
         p:swiglu_bwd(self.h13a[l], self.h13b[l], self.dhs,
                      self.dh13a, self.dh13b,
                      { "lda":  F2, "ldb":  F2, "ldo":  F  })
         p:dw(self.h2[l], self.dh13, ly.w13.g.t)
         p:dx(self.dh13, ly.w13.w.t, self.dh2)
         p:rmsnorm_bwd(mid, ly.ln2.w.t, self.dh2, self.dbr, ly.ln2.g.t, eps)
-        p:axpy(self.dres, self.dbr, 1.0)              -- residual join
+        p:axpy(self.dres, self.dbr, 1.0)              -- join residual
 
-        -- ---- attention ----
+        -- Attention
         p:dx(self.dres, ly.wo.w.t, self.dattn)
         p:dw(at, self.dres, ly.wo.g.t)
 
@@ -2485,7 +2424,7 @@ function Model:_queue_backward(p)
 
             create qb = b * T * D3
             create dA = sv(poff(self.dattn, b * T * D), T, hd, D, 1, hd)
-            -- dP = dctx @ V^T
+            -- dP from dctx and V
             p:gemm(dA,
                    sv(poff(qkv, qb + 2 * D), hd, T, 1, D3, hd),
                    sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),
@@ -3108,7 +3047,7 @@ end
 
 return GT
 #=lucfile: lmio.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -3116,49 +3055,49 @@ create function __at(L, i)
     return L[i]
 end
 
---  lmio.lua -- checkpoint persistence + crash-safe auto-save.
+-- lmio: checkpoint persistence and crash-safe auto-save
 --
---  Installed onto LMTrain by lmtrain.lua:  lmio(LMTrain).
+-- Installed on LMTrain by lmtrain.lua
 --
---  ============================ FORMATS ==================================
---  v3 bin  (default when ffi is available)
---      lanternl-checkpoint 3\n
---      format=bin dtype=f32 endian=le vocab=.. dim=.. ... nparams=..\n
---      per parameter:  "<rows> <cols>\n"  then rows*cols raw LE floats
---  v3 text / v2 text
---      ... format=text ...
---      per parameter:  "<rows> <cols>|v,v,v,...\n"
---  v1 legacy: no tag line, no "r c|" prefix.  Still readable.
+-- Formats
+-- v3 bin default with ffi
+-- tag line lanternl-checkpoint 3
+-- header with format, dtype, arch, nparams
+-- per param rows cols plus raw LE floats
+-- v3/v2 text uses rows cols plus CSV
+-- text per param is rows cols with values
+-- v1 legacy has no tag; still readable
 --
---  ======================== WHY BINARY IS THE DEFAULT ====================
---  The old text writer built one Lua string per element and table.concat'd
---  the whole tensor.  For a 134M-parameter model that is >130M transient
---  interned strings and a ~3.2 GB file at %.17g, taking minutes per write.
---  Auto-saving every epoch with that writer would have OOM'd or dominated
---  the run.  The binary path streams through a fixed 1M-element FFI buffer:
---  constant memory, ~4 bytes/param, one write(2) per chunk.
+-- Why binary is default
+-- Old text built one string per element
+-- 134M params made 130M strings and 3.2GB file
+-- Text writes took minutes each
+-- Auto-save with text would OOM or stall run
+-- Binary streams via 1M-element FFI buffer
+-- Constant memory, ~4 bytes per param, one write per chunk
 --
---  ======================== CRASH SAFETY =================================
---  Every write goes to "<path>.tmpNNNN" IN THE SAME DIRECTORY (a temp dir
---  would make rename(2) cross-device and fail with EXDEV -- Colab users
---  save to /content/drive constantly), is fully written and closed with
---  every write() and the close() result checked, and only then rotated
---  into place with os.rename(), which is atomic on POSIX.
+-- Crash safety
+-- Write to tmp in same dir, not temp dir
+-- Same dir avoids cross-device EXDEV rename fail
+-- Colab Drive paths need this
+-- Check every write and close result
+-- Then rotate via atomic POSIX rename
 --
---  With keep_last = K > 1 the rotation is oldest-first:
---      rm path.(K-1); path.(K-2)->path.(K-1); ... ; path.1->path.2;
---      path->path.1; tmp->path
---  There is a sub-millisecond window between the last two renames where
---  `path` does not exist -- but a COMPLETE, VALID checkpoint exists at
---  path.1 for the whole window, so the invariant "the only copy on disk is
---  never corrupt" holds.  LMTrain.latest_checkpoint() probes that window
---  away for the caller.
+-- keep_last K rotates oldest-first
+-- rm oldest, shift others, move current, install tmp
+-- Follows ordered rotation chain
+-- Sub-ms gap where path misses exists
+-- Valid checkpoint stays at path.1 in gap
+-- Disk never holds only corrupt copy
+-- latest_checkpoint probes that gap
+-- Caller always finds resume copy
 --
---  Durability note, stated honestly: rename(2) gives atomic *visibility*.
---  True power-loss durability needs fsync, which pure Lua cannot issue.
---  This protects fully against the reported failure modes (process crash,
---  SIGKILL, OOM-killer, notebook disconnect, forgotten :save()).  A kernel
---  panic mid-write is a weaker guarantee, mitigated by keep_last > 1.
+-- Durability note: rename gives atomic visibility
+-- Power-loss durability needs fsync, unavailable in Lua
+-- Covers crash, kill, OOM and disconnect
+-- Also covers forgotten save
+-- Kernel panic mid-write is weaker
+-- Mitigate with keep_last greater than 1
 
 create sformat = string.format
 create huge = math.huge
@@ -3215,9 +3154,9 @@ create function file_exists(path)
     return true
 end
 
---- Unique-per-process temp suffix.  Deterministic within a run so a crash
---- leaves at most ONE stale tmp file, and distinct across concurrent runs
---- so two processes sharing a path cannot shred each other's partial write.
+--- Unique temp suffix per process
+--- One stale tmp max per crashed run
+--- Concurrent runs cannot clash
 create TMP_SUFFIX
 do
     create seed = tostring(os.time()) .. tostring(math.random(0, 999999))
@@ -3231,9 +3170,9 @@ do
     TMP_SUFFIX = ".tmp" .. seed
 end
 
---- os.rename() is atomic replace on POSIX.  Windows' MSVCRT rename() fails
---- if the destination exists, so fall back to remove+rename there -- non
---- atomic, and we say so rather than pretending otherwise.
+--- POSIX rename is atomic replace
+--- Windows needs remove plus rename
+--- Windows path is non-atomic
 create function rename_over(src, dst)
     create ok, err = os.rename(src, dst)
     if ok then return true end
@@ -3262,9 +3201,9 @@ end
     os.rename(path, path .. ".1")
 end
 
---- Atomic byte-for-byte copy (used when the "latest" and "best" files are
---- both due in the same tick: serialize once, copy on disk, so there is
---- never more than one D2H pass over the parameters per save point).
+--- Atomic copy for latest plus best in one tick
+--- Serialize once, copy on disk
+--- One D2H pass per save point
 create function copy_file_atomic(src, dst)
     create fi, e1 = io.open(src, "rb")
     if not fi then return nil, tostring(e1) end
@@ -3287,7 +3226,7 @@ create function copy_file_atomic(src, dst)
     return true
 end
 
---- "5" -> 5 epochs ; "30s"/"5m"/"2h" -> wall-clock seconds.
+--- Interval: 5 is epochs; 30s/5m/2h is seconds
 create function parse_interval(v)
     if v == nil then return 1, nil end
     if type(v) == "number" then return v, nil end
@@ -3313,19 +3252,18 @@ return function(LMTrain)
     LMTrain.FORMAT_TAG     = FORMAT_TAG
     LMTrain.FORMAT_VERSION = FORMAT_VERSION
 
-    -- ================================================================
-    --  Parameter access hooks.
+    -- Param hooks
     --
-    --  These exist so lmio never has to know which backend it is talking
-    --  to, and -- critically -- so the GPU path can stream straight out of
-    --  VRAM in fixed-size chunks instead of materialising a 134M-entry Lua
-    --  table via _gpu_pull().  lmtrain_gpu.lua overrides all three.
-    -- ================================================================
+    -- Backend-agnostic access for lmio
+    -- GPU streams from VRAM in chunks
+    -- Avoids 134M-entry Lua table via _gpu_pull
+    -- lmtrain_gpu.lua overrides them
+    --
 
     function LMTrain:_param_dtype() return "f64" end
 
-    --- Copy elements [from, from+count-1] (1-indexed) of parameter i into
-    --- the 0-indexed FFI buffer `dst`.
+    --- Copy param slice into 0-indexed FFI dst
+    --- 1-indexed source range
     function LMTrain:_param_get(i, from, count, dst)
         create d = self.params[i].data.data
         do
@@ -3339,7 +3277,7 @@ return function(LMTrain)
 end
     end
 
-    --- Inverse of _param_get.
+    --- Inverse of _param_get
     function LMTrain:_param_set(i, from, count, src)
         create d = self.params[i].data.data
         do
@@ -3358,13 +3296,12 @@ end
     end
     create function esize(dtype) return dtype == "f32" and 4 or 8 end
 
-    -- ================================================================
-    --  Serialisation
-    -- ================================================================
+    -- Serialisation
+    --
 
     create function default_precision(dtype)
-        -- 9 significant digits round-trip an IEEE binary32 exactly; %.17g
-        -- on fp32 data writes 8 bytes per value of pure noise.
+        -- 9 digits round-trip fp32 exactly
+        -- %.17g on fp32 writes noise bytes
         return dtype == "f32" and "%.9g" or "%.17g"
     end
 
@@ -3381,11 +3318,11 @@ end
             sformat("ffn=%d", self.ffn), 9: 
             sformat("pos=%s", tostring(self.pos or "rope")), 10: 
             sformat("causal=%d", (self.causal != false) and 1 or 0), 11: 
-            -- tie changes the PARAMETER COUNT (untied adds a head matrix) and
-            -- max_seq / rope_base change behaviour.  None of the three were
-            -- recorded in v2, so a tie mismatch surfaced as a baffling
-            -- "N tensors vs M tensors" error and a max_seq mismatch was
-            -- silently wrong.  Recorded now.
+            -- tie changes param count; max_seq alters behavior
+            -- v2 omitted them, causing confusing mismatch
+            -- tie mismatch looked like tensor count error
+            -- max_seq mismatch stayed silent
+            -- Recorded now
             sformat("tie=%d", (self.tie != false) and 1 or 0), 12: 
             sformat("max_seq=%d", self.max_seq or 128), 13: 
             sformat("rope_base=%g", self.rope_base or 10000), 14: 
@@ -3450,7 +3387,7 @@ end
  strs[j + 1] = fmt_num(buf[j], prec) end
 end
                     else
-                        -- no ffi: read the flat store directly (CPU only)
+                        -- No ffi: read flat store on CPU
                         create d = m.data
                         do
     create __fa = (0)
@@ -3485,9 +3422,9 @@ end
         return true
     end
 
-    --- Serialise the whole model to `path` atomically.  Returns ok, err.
-    --- Never raises: callers on the training hot path must not die because
-    --- a disk filled up.
+    --- Atomic model write; returns ok, err
+    --- Never raises on hot path
+    --- Disk-full must not kill training
     function LMTrain:_write_checkpoint(path, opts)
         opts = opts or {}
         if self.params == nil or len(self.params) == 0 then
@@ -3524,8 +3461,8 @@ end
             return nil, tostring(werr)
         end
 
-        -- f:close() flushes.  Its result is the last chance to notice ENOSPC;
-        -- the old code discarded it and happily printed "Saved to ...".
+        -- close flushes; checks ENOSPC last chance
+        -- Old code ignored close result
         create okc, cerr = f:close()
         if okc == false then
             os.remove(tmp)
@@ -3541,9 +3478,8 @@ end
         return true
     end
 
-    -- ================================================================
-    --  Public :save / :load
-    -- ================================================================
+    -- Public save/load
+    --
 
     function LMTrain:save(path, opts)
         if type(path) != "string" or path == "" then
@@ -3560,9 +3496,9 @@ end
         return self
     end
 
-    --- Probe `path`, then its rotations, then the best file, and return the
-    --- first one whose header parses.  Closes the sub-millisecond rotation
-    --- window: after any crash there is always something here to resume from.
+    --- Probe path, rotations, then best file
+    --- Return first with valid header
+    --- Covers rotation gap after crash
     function LMTrain.latest_checkpoint(path, keep)
         if type(path) != "string" then return nil end
         create cands = { 1:  path  }
@@ -3608,17 +3544,17 @@ end
             error("LMTrain:load: " .. path .. " is empty", 2)
         end
 
-        -- ------------------------------------------------------------
-        --  CRITICAL FIX.  This used to be:
-        --      string.find(line, "^" .. FORMAT_TAG)
-        --  FORMAT_TAG is "lanternl-checkpoint", and '-' is a Lua pattern
-        --  QUANTIFIER (lazy zero-or-more).  The pattern therefore meant
-        --  "lantern" .. (zero or more 'l') .. "checkpoint", which can never
-        --  match the literal tag.  Every v2 file fell through to the legacy
-        --  branch, tried to parse the tag line as the header, and died with
-        --  "unrecognised header" -- i.e. NOTHING :save() ever wrote could be
-        --  loaded back.  Plain-text find, anchored explicitly.
-        -- ------------------------------------------------------------
+        -- Tag match fix
+        -- Old pattern treated - as quantifier
+        -- Pattern could never match literal tag
+        -- v2 files fell to legacy branch
+        -- Legacy parse failed with bad header
+        -- Saved files could not load back
+        -- Use plain-text find instead
+        -- Anchored at start
+        -- See load code below
+        -- Keeps v2 readable
+        --
         create legacy = true
         create version = 1
         create header = line
@@ -3670,8 +3606,8 @@ end
             create ep = string.match(header, "epoch=(%d+)")
             if ep then self.loaded_epoch = tonumber(ep) end
         end
-        -- Legacy checkpoints predate RoPE, but RoPE adds no parameters, so
-        -- the weight layout is identical and the file still loads cleanly.
+        -- Legacy predates RoPE but layout matches
+        -- RoPE adds no params, loads cleanly
 
         if fmt == "bin" then
             if not HAVE_FFI then
@@ -3690,8 +3626,8 @@ end
 
         create expected = tonumber(string.match(header, "nparams=(%d+)") or "")
         if expected and expected != len(self.params) then
-            -- Architecture drift (e.g. checkpoints written before fused QKV).
-            -- Give the model one chance to rebuild itself in the file's layout.
+            -- Arch drift, e.g. pre-fused QKV file
+            -- Rebuild once in file layout
             create adapted = false
             if type(self._relayout_for_checkpoint) == "function" then
                 adapted = self:_relayout_for_checkpoint(expected) or false
@@ -3827,21 +3763,19 @@ end
         return self
     end
 
-    -- ================================================================
-    --  AUTO-SAVE  (PROBLEM 3)
+    -- AUTO-SAVE, PROBLEM 3
     --
-    --  Lives here, not in the two run loops, so `run()` and `_run_gpu()`
-    --  call literally the same three methods and cannot drift apart.
+    -- Lives here so run and _run_gpu share methods
+    -- Both loops cannot drift apart
     --
-    --  Relationship to keep_best -- deliberately orthogonal:
-    --    keep_best  : in-memory (host RAM on CPU, GPU-to-GPU on the GPU
-    --                 path), fast, volatile, restored at end of run.
-    --    auto_save  : on-disk, survives SIGKILL/OOM/disconnect.
-    --  Auto-save NEVER calls :snapshot()/:restore().  When `is_best` fires
-    --  the live weights already ARE the best, so the .best file is written
-    --  straight from them -- no extra GPU-to-GPU copy, no window where the
-    --  live model holds stale weights.
-    -- ================================================================
+    -- keep_best is in-memory and volatile
+    -- keep_best restores at end of run
+    -- auto_save is on-disk and survives crashes
+    -- Auto-save never calls snapshot/restore
+    -- Live weights already are best on is_best
+    -- Best file writes straight from live weights
+    -- No extra copy, no stale window
+    --
 
     function LMTrain:_autosave_begin()
         self._as = nil
@@ -3865,10 +3799,10 @@ end
         create keep = self.keep_last or 1
         create st = { "path":  path, "best_path":  (self.save_best != false) and (path .. ".best") or nil, "epochs":  ep, "seconds":  sec, "keep":  keep, "last_save":  (ok_lmlog and lmlog.now() or os.time()), "last_epoch":  0, "writes":  0, "fails":  0 }
 
-        -- Fail fast.  Discovering a read-only Drive mount or a typo'd
-        -- directory at epoch 300 is the same lost run we are trying to
-        -- prevent.  Probe uses the per-process suffix so concurrent runs
-        -- sharing a path cannot delete each other's probe.
+        -- Fail fast on unwritable path
+        -- Late failure would lose long run
+        -- Probe uses per-process suffix
+        -- Concurrent runs cannot clash
         create probe = path .. TMP_SUFFIX .. ".probe"
         create pf, perr2 = io.open(probe, "wb")
         if not pf then
@@ -3920,7 +3854,7 @@ end
         return self
     end
 
-    --- kind: "batch" | "epoch" | "final"
+    --- kind is batch, epoch or final
     function LMTrain:_autosave_tick(kind)
         create st = self._as
         if not st then return false end
@@ -3942,8 +3876,8 @@ end
             if self.save_at_end == false then
                 want_latest = false
             elseif self.stopped == "diverged" then
-                -- Writing NaN-poisoned weights over the last good checkpoint
-                -- is exactly the loss this feature exists to prevent.
+                -- Skip write on diverged run
+                -- Protects last good checkpoint
                 want_latest = false
                 say(self, sformat("[LMTrain] auto_save: run diverged, NOT overwriting %s. "
                     .. "Recover from %s", st.path,
@@ -3954,9 +3888,9 @@ end
             end
         end
 
-        -- Best file only on the epoch the improvement actually happened, and
-        -- only when the monitor was genuinely computed this epoch (see the
-        -- eval_every staleness fix in the run loops).
+        -- Best file only on real improvement epoch
+        -- Needs fresh monitor this epoch
+        -- See eval_every fix in run loops
         create want_best = (kind == "epoch") and st.best_path
                           and self.is_best and self._monitor_valid
                           and (st.best_epoch != self.epoch)
@@ -3972,8 +3906,8 @@ end
                 st.writes = st.writes + 1
                 st.fails = 0
                 if want_best then
-                    -- One serialisation per tick: copy the bytes we just
-                    -- wrote rather than re-reading every parameter again.
+                    -- Copy bytes just written
+                    -- Avoids rereading params
                     create okc, ec = copy_file_atomic(st.path, st.best_path)
                     if okc then st.best_epoch = self.epoch
                     else say(self, "[LMTrain] auto_save: best copy failed: " .. tostring(ec)) end
@@ -3987,9 +3921,9 @@ end
         if not ok then
             st.fails = st.fails + 1
             self.save_error = tostring(err)
-            -- Never abort the run over a failed save: the in-memory model is
-            -- still the user's only copy and they may free space.  But shout
-            -- every single time -- silence here is the original bug.
+            -- Keep run alive on save failure
+            -- Memory copy may be only copy
+            -- Warn every time, never silent
             say(self, sformat("[LMTrain] !! auto_save FAILED (attempt %d): %s",
                 st.fails, tostring(err)))
             return false
@@ -4017,9 +3951,9 @@ end
         self._as = nil
     end
 
-    --- Weights-only resume.  Honest about its limits: optimizer moments and
-    --- the LR-schedule position are NOT persisted (Adam m/v are not part of
-    --- `params` on either backend), so the schedule restarts from step 0.
+    --- Weights-only resume; no optimizer state
+    --- Adam moments not in params
+    --- Schedule restarts from zero
     function LMTrain:_maybe_resume()
         create r = self.resume
         if r == nil or r == false then return false end
@@ -4055,7 +3989,7 @@ end
         return true
     end
 
-    -- ================================================================
+    -- Push helper
     function LMTrain:push(repo_id, opts)
         if type(repo_id) != "string" or not string.find(repo_id, "^[%w%-%._]+/[%w%-%._]+$") then
             error("LMTrain:push: repo_id must look like 'user/model', got " .. tostring(repo_id), 2)
@@ -4064,7 +3998,7 @@ end
         create file = opts.file or "lanternl_model.bin"
         self:save(file, opts)
 
-        -- Users must run "hf auth login" or "huggingface-cli login" once.
+        -- Needs hf login once
         create cmds = { 1: 
             sformat('hf upload %s %s %s', repo_id, file, file), 2: 
             sformat('huggingface-cli upload %s %s %s', repo_id, file, file) }
@@ -4091,16 +4025,8 @@ end
 
 end
 #=lucfile: lmlog.luc
---  lmlog.lua -- wall clock, TTY detection, stdout buffering policy and the
---  shared progress reporter used by BOTH backends.
---
---  Output policy lives here (not in lmtrain.lua) because this is the only
---  module every output path goes through.  It used to be duplicated twice
---  in lmtrain.lua, which meant a consumer that required lmlog directly got
---  whatever buffering libc happened to pick.
-
---  ffi (LuaJIT) is OPTIONAL: plain Lua 5.x has none, so every use below
---  degrades gracefully -- os.time/os.clock clock fallback, no isatty probe.
+-- Shared reporter: wall clock, TTY check, output buffering (single place for all output paths).
+-- ffi optional, falls back to os.time/clock.
 create ok_ffi, ffi = pcall(require, "ffi")
 if not ok_ffi then ffi = nil end
 
@@ -4109,7 +4035,7 @@ create L = {}
 create floor, exp, huge = math.floor, math.exp, math.huge
 create sformat, srep, slen = string.format, string.rep, string.len
 
--- ---------------------------------------------------------------- clock ----
+-- Clock
 create now
 do
     if ffi then
@@ -4148,16 +4074,15 @@ do
 end
 L.now = now
 
--- ------------------------------------------------------------ tty probe ----
--- Was written as `(A) and (pcall(f) and f()) or false`, which called
--- isatty() twice and leaned on `or false` to normalise.  Same result,
--- stated once.
+-- TTY probe
+-- Old form called isatty twice; same result
+-- Single check now
 do
     create tty = false
     if io.replace then
-        -- LUC: io.replace is a built-in that emits "\r" + erase-line, so any
-        -- LUC console renders the in-place bar natively (no ffi needed).
-        -- Escape hatch for pipes/notebooks: set LUC_NOBAR=1 or TERM=dumb.
+        -- LUC io.replace gives native in-place bar
+        -- No ffi needed for LUC console
+        -- Set LUC_NOBAR=1 or TERM=dumb to disable
         tty = not os.getenv("LUC_NOBAR")
     elseif ffi then
         pcall(ffi.cdef, "int isatty(int fd);")
@@ -4166,9 +4091,9 @@ do
             tty = ok and (r == 1)
         end
     elseif os.getenv("TERM") and os.getenv("TERM") != "dumb" then
-        -- no ffi: POSIX terminals usually export TERM; assume TTY there.
-        -- Windows consoles without LuaJIT conservatively report not-a-TTY,
-        -- which only costs the in-place progress bar animation.
+        -- No ffi: assume TTY if TERM set
+        -- Non-TTY only loses bar animation
+        -- Windows without LuaJIT stays non-TTY
         tty = true
     end
     create term = os.getenv("TERM")
@@ -4176,18 +4101,14 @@ do
     L.is_tty = tty
 end
 
--- ------------------------------------------------- stdout buffering -------
---  PROBLEM 4, library side.
+-- Stdout buffering, PROBLEM 4 library side
+-- PROBLEM 4: TTY needs unbuffered for \r bar
+-- Pipes need line buffering, one write per line
+-- Line mode avoids one write per byte
+-- Reporter flushes after every emit
+-- Line costs less on hot loop
 --
---  On a TTY we want unbuffered so the in-place "\r" bar (which never emits
---  a newline) appears as it is written.  On a pipe -- which is exactly what
---  `%%script luajit` and `!luajit` both hand us -- line buffering is the
---  right mode: every complete line is flushed atomically at the "\n", with
---  one write(2) per line instead of one per byte.  The reporter also calls
---  flush() explicitly after every emit, so either mode streams; "line" just
---  costs far less on a hot loop.
---
---  Idempotent: safe to call from any entry point, and called on require.
+-- Idempotent; runs on require
 create _vbuf_done = false
 function L.setup_stdout(mode)
     if _vbuf_done and mode == nil then return end
@@ -4198,19 +4119,18 @@ function L.setup_stdout(mode)
 end
 L.setup_stdout()
 
---- Default emit interval.  A piped run has no in-place overwrite, so every
---- update is a permanent line; 0.2s over a 4h run is ~72k lines of notebook
---- output.  Slower default off-TTY, still live.
+--- Default interval; piped runs keep every line
+--- 0.2s for 4h is ~72k lines
+--- Slower off-TTY, still live
 function L.default_interval()
     return L.is_tty and 0.2 or 1.0
 end
 
--- ------------------------------------------------------- term width ------
--- A bar line longer than the console wraps onto a second row; "\r" redraws
--- only the LAST row, so every update would leave its head behind and the
--- screen fills with stacked bar fragments.  Ask the console for its real
--- width (LUC os.termwidth) and trim optional fields until the line fits
--- one physical row.  Fallback 78 fits cmd's 80-column default.
+-- Term width
+-- Long bar wraps; \r redraws last row only
+-- Trim fields to fit one row
+-- Query os.termwidth; fallback 78
+-- Fits 80-column console
 L.termwidth = 78
 do
     create ok, w = pcall(function() return os.termwidth and os.termwidth() end)
@@ -4241,17 +4161,17 @@ function L.fmt_bytes(n)
     return sformat("%d B", n)
 end
 
--- --------------------------------------------------------- reporter -------
+-- Reporter
 create R = {}
 R.__index = R
 
---- The reporter that currently owns the cursor, if any.  L.say() routes
---- through it so a library message can never land in the middle of an
---- in-place bar.
+--- Active reporter owns cursor
+--- L.say routes through it, never mid-bar
+--- Keeps bar output clean
 L.active = nil
 
---- opts: total_steps, bar_style, bar_len, interval (seconds),
----       inplace (bool), force_inplace (bool), stream (io handle)
+--- opts: steps, style, len, interval
+--- inplace, force_inplace, stream
 function L.new(opts)
     opts = opts or {}
     create self = setmetatable({}, R)
@@ -4259,8 +4179,8 @@ function L.new(opts)
     self.bar_style   = opts.bar_style or 1
     self.bar_len     = opts.bar_len or 20
     self.interval    = opts.interval or L.default_interval()
-    -- force_inplace lets a caller opt into "\r" rendering on a pipe (some
-    -- terminals-in-a-notebook handle it); default stays TTY-gated.
+    -- force_inplace allows \r on pipes
+    -- Default stays TTY-gated
     if opts.force_inplace then
         self.inplace = true
     else
@@ -4293,9 +4213,9 @@ function R:_rate()
     return self.rate
 end
 
---- st fields: step, epoch, epochs, batch, nbatch, loss, acc, lr,
----            val_loss, gnorm, best, tflops
---- force = emit regardless of the throttle (end of epoch, final step).
+--- st: step, epoch, batch, loss, acc, lr
+--- val_loss, gnorm, best, tflops
+--- force emits despite throttle
 function R:update(st, force)
     create t = now()
     if not force and (t - self.last_emit) < self.interval then return false end
@@ -4327,9 +4247,9 @@ function R:update(st, force)
     end
     parts[len(parts) + 1] = sformat("loss %.4f", loss)
 
-    -- Optional fields, display order.  When the assembled line would not
-    -- fit one physical console row, fields are dropped in `drop_order`
-    -- (least informative first) until it fits; hard-cut as last resort.
+    -- Optional fields; drop until line fits
+    -- Drop least informative first
+    -- Hard-cut as last resort
     create extras = { 1: 
         { "s":  sformat("ppl %7.2f", ppl)  }, 2: 
         { "s":  st.acc and sformat("acc %5.1f%%", st.acc) or nil  }, 3: 
@@ -4337,7 +4257,7 @@ function R:update(st, force)
         { "s":  (st.tflops and st.tflops > 0) and sformat("%.1f GF/s", st.tflops * 1000) or nil  }, 5: 
         { "s":  (st.gnorm and st.gnorm > 0) and sformat("|g| %.2f", st.gnorm) or nil  }, 6: 
         { "s":  st.val_loss and sformat("val %.4f", st.val_loss) or nil  } }
-    create drop_order = { 1:  4, 2:  6, 3:  5, 4:  1, 5:  2, 6:  3  }  -- tflops, val, |g|, ppl, acc, lr
+    create drop_order = { 1:  4, 2:  6, 3:  5, 4:  1, 5:  2, 6:  3  }  -- drop order
     create rate_s = sformat("%s tok/s", L.fmt_count(self:_rate()))
 
     create function assemble()
@@ -4381,10 +4301,10 @@ end
     end
 
     if self.inplace then
-        -- Classic "\r" + space-pad rendering.  Deliberately NOT io.replace:
-        -- the ANSI erase it emits needs VT processing, which some Windows
-        -- consoles ignore.  "\r" works on every console ever made; the pad
-        -- wipes ghost chars when the line gets shorter.
+        -- Classic \r plus space pad
+        -- Avoids ANSI erase; works everywhere
+        -- \r works on all consoles
+        -- Pad clears leftover chars
         create pad = self.width - len(line)
         if io.write then
             io.write("\r", line, pad > 0 and srep(" ", pad) or "")
@@ -4400,7 +4320,7 @@ end
     return true
 end
 
---- Print a permanent line (epoch summary, warning) without eating the bar.
+--- Print permanent line without breaking bar
 function R:say(text)
     if self.dirty then self.out:write("\n") self.dirty = false self.width = 0 end
     self.out:write(text, "\n")
@@ -4413,9 +4333,9 @@ function R:finish()
     if L.active == self then L.active = nil end
 end
 
---- Module-level message.  Routes through the live reporter when there is
---- one so it cannot land mid-bar; otherwise a plain flushed write.  Both
---- backends now use this instead of bare print()/io.write().
+--- Module message via live reporter if present
+--- Else plain flushed write
+--- Both backends use this
 function L.say(text)
     create a = L.active
     if a then return a:say(text) end
@@ -4425,7 +4345,7 @@ end
 
 return L
 #=lucfile: lmtrain.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -4445,10 +4365,10 @@ LMTrain.__index = LMTrain
 create IS_TTY = lmlog.is_tty
 create wall = lmlog.now
 
--- Buffering policy now lives in lmlog.setup_stdout() (called on require of
--- lmlog).  It used to be `io.stdout:setvbuf("no")` duplicated twice here,
--- which left anyone driving lmlog directly at libc's mercy, and forced a
--- write(2) per byte on a pipe.  See PROBLEM 4 notes in lmlog.lua.
+-- Buffering in lmlog.setup_stdout on require
+-- Old code duplicated setvbuf here twice
+-- Direct lmlog users got slow pipe writes
+-- See PROBLEM 4 in lmlog.lua
 
 create floor, ceil = math.floor, math.ceil
 create huge = math.huge
@@ -4457,8 +4377,8 @@ create sformat = string.format
 
 create DEFAULTS = { "vocab":  256, "dim":  64, "layers":  2, "heads":  4, "ffn":  128, "epochs":  200, "lr":  1e-3, "lr_min":  0, "warmup":  0.05, "sched":  "cosine", "optimizer":  "adamw", "weight_decay":  0.01, "beta1":  0.9, "beta2":  0.95, "momentum":  0.9, "bar_style":  1, "bar_len":  20, "every":  1, "patience":  0, "min_delta":  0, "verbose":  true, "causal":  true, "pos":  "rope", "rope_base":  10000, "max_seq":  128, "stride":  nil, "batch_size":  8, "shuffle":  true, "grad_accum":  1, "sample_every":  0, "val_split":  0, "eval_every":  1, "keep_best":  true, "clip_norm":  1.0, "dropout":  0, "tie":  true, "fused_qkv":  true, "backend":  "cpu", "log_every_sec":  nil, "graph":  false, "max_bytes":  8 * 1024 * 1024, "hints":  true, "save_every":  1, "keep_last":  1, "save_best":  true, "save_at_end":  true, "resume":  false, "restore_best":  "auto" }
 
---- Keys that are legitimately absent (nil) but understood.  Used to be
---- declared and never read; now it backs the typo detector below.
+--- Nilable keys for typo detector
+--- Backs detector below
 create NILABLE = { "data":  true, "log":  true, "stop_loss":  true, "stop_when":  true, "seed":  true, "on_stop":  true, "name":  true, "tokenizer":  true, "temperature":  true, "top_k":  true, "top_p":  true, "data_file":  true, "max_tokens":  true, "auto_save":  true, "save_format":  true, "precision":  true, "inplace_bar":  true, "stream":  true, "preset":  true, "sample_prompt":  true, "sample_len":  true, "sample_temperature":  true }
 
 create ARCH_KEYS = { "vocab":  true, "dim":  true, "layers":  true, "heads":  true, "ffn":  true, "causal":  true, "pos":  true, "rope_base":  true, "max_seq":  true, "tie":  true, "dropout":  true, "backend":  true, "graph":  true, "fused_qkv":  true }
@@ -4467,8 +4387,8 @@ create OPT_KEYS = { "optimizer":  true, "weight_decay":  true, "beta1":  true, "
 
 create RESERVED = { "new":  true, "run":  true, "config":  true, "bar":  true, "reset":  true, "summary":  true, "parameters":  true, "generate":  true, "save":  true, "load":  true, "push":  true, "encode":  true, "decode":  true, "evaluate":  true, "model":  true, "params":  true, "opt":  true, "sgd":  true, "history":  true, "epoch":  true, "loss":  true, "best_loss":  true, "accuracy":  true, "elapsed":  true, "stopped":  true, "val_loss":  true }
 
---- Named size presets.  Any key the user set explicitly wins over the
---- preset; "auto" (data-size driven) is handled separately in new().
+--- Size presets; explicit keys win
+--- auto handled in new()
 create LMTRAIN_PRESETS = { "tiny":  { "dim":  32, "layers":  1, "heads":  2, "ffn":  64, "max_seq":  64  }, "small":  { "dim":  64, "layers":  2, "heads":  4, "ffn":  128, "max_seq":  128  }, "base":  { "dim":  128, "layers":  4, "heads":  8, "ffn":  256, "max_seq":  256  }, "medium":  { "dim":  256, "layers":  6, "heads":  8, "ffn":  512, "max_seq":  384  } }
 
 create ALIASES = { "e":  "epochs", "epoch":  "epochs", "epochs":  "epochs", "n":  "epochs", "iters":  "epochs", "steps":  "epochs", "lr":  "lr", "rate":  "lr", "learning_rate":  "lr", "lr_min":  "lr_min", "min_lr":  "lr_min", "warmup":  "warmup", "warmup_frac":  "warmup", "sched":  "sched", "schedule":  "sched", "lr_decay":  "sched", "opt":  "optimizer", "optimizer":  "optimizer", "optim":  "optimizer", "wd":  "weight_decay", "weight_decay":  "weight_decay", "decay":  "weight_decay", "beta1":  "beta1", "beta2":  "beta2", "momentum":  "momentum", "v":  "vocab", "vocab":  "vocab", "vocab_size":  "vocab", "d":  "dim", "dim":  "dim", "width":  "dim", "model_dim":  "dim", "l":  "layers", "layers":  "layers", "depth":  "layers", "nlayers":  "layers", "h":  "heads", "heads":  "heads", "nheads":  "heads", "f":  "ffn", "ffn":  "ffn", "ff":  "ffn", "hidden":  "ffn", "data":  "data", "tokens":  "data", "seq":  "data", "sequences":  "data", "tokenizer":  "tokenizer", "tok":  "tokenizer", "bar":  "bar_style", "style":  "bar_style", "bar_style":  "bar_style", "bar_len":  "bar_len", "width_bar":  "bar_len", "log":  "log", "on_epoch":  "log", "callback":  "log", "every":  "every", "log_every":  "every", "stop":  "stop_loss", "stop_loss":  "stop_loss", "target_loss":  "stop_loss", "stop_when":  "stop_when", ("until"):  "stop_when", "patience":  "patience", "min_delta":  "min_delta", "verbose":  "verbose", "seed":  "seed", "name":  "name", "on_stop":  "on_stop", "causal":  "causal", "mask":  "causal", "causal_mask":  "causal", "pos":  "pos", "positional":  "pos", "position":  "pos", "pe":  "pos", "rope_base":  "rope_base", "theta":  "rope_base", "max_seq":  "max_seq", "ctx":  "max_seq", "max_ctx":  "max_seq", "context":  "max_seq", "stride":  "stride", "batch":  "batch_size", "batch_size":  "batch_size", "bs":  "batch_size", "shuffle":  "shuffle", "val":  "val_split", "val_split":  "val_split", "eval_every":  "eval_every", "keep_best":  "keep_best", "clip":  "clip_norm", "clip_norm":  "clip_norm", "grad_clip":  "clip_norm", "dropout":  "dropout", "drop":  "dropout", "tie":  "tie", "fused_qkv":  "fused_qkv", "fused":  "fused_qkv", "qkv_fused":  "fused_qkv", "grad_accum":  "grad_accum", "accumulate":  "grad_accum", "accum":  "grad_accum", "accum_steps":  "grad_accum", "effective_batch":  "grad_accum", "sample_every":  "sample_every", "show_sample":  "sample_every", "sample_prompt":  "sample_prompt", "sample_len":  "sample_len", "sample_temperature":  "sample_temperature", "temperature":  "temperature", "temp":  "temperature", "top_k":  "top_k", "topk":  "top_k", "top_p":  "top_p", "topp":  "top_p", "preset":  "preset", "backend":  "backend", "device":  "backend", "engine":  "backend", "gpu":  "backend", "use_gpu":  "backend", "graph":  "graph", "cuda_graph":  "graph", "log_every_sec":  "log_every_sec", "log_interval":  "log_every_sec", "data_file":  "data_file", "datafile":  "data_file", "file":  "data_file", "text_file":  "data_file", "path":  "data_file", "corpus":  "data_file", "max_bytes":  "max_bytes", "byte_limit":  "max_bytes", "read_limit":  "max_bytes", "max_tokens":  "max_tokens", "token_limit":  "max_tokens", "hints":  "hints", "hint":  "hints", "tips":  "hints", "auto_save":  "auto_save", "autosave":  "auto_save", "auto_save_path":  "auto_save", "checkpoint":  "auto_save", "ckpt":  "auto_save", "save_to":  "auto_save", "save_every":  "save_every", "checkpoint_every":  "save_every", "save_interval":  "save_every", "ckpt_every":  "save_every", "keep_last":  "keep_last", "keep_checkpoints":  "keep_last", "max_checkpoints":  "keep_last", "rotate":  "keep_last", "save_best":  "save_best", "best_file":  "save_best", "save_at_end":  "save_at_end", "save_final":  "save_at_end", "resume":  "resume", "resume_from":  "resume", "auto_resume":  "resume", "restore_best":  "restore_best", "save_format":  "save_format", "format":  "save_format", "precision":  "precision", "prec":  "precision" }
@@ -4478,7 +4398,7 @@ create BAR_CHARS = { (1):  { "fill":  "#", "empty":  "-"  }, (2):  { "fill":  "\
 create POS_MODES = { "rope":  true, "rotary":  true, "sinusoidal":  true, "sin":  true, "absolute":  true, "abs":  true, "none":  true, "off":  true  }
 create SCHEDULES = { "cosine":  true, "linear":  true, "none":  true, "constant":  true  }
 
---- Every key the library understands, for the typo detector.
+--- Known keys for typo detector
 create KNOWN = {}
 do
     repeat k, __v in DEFAULTS do KNOWN[k] = true end
@@ -4499,9 +4419,9 @@ create function say(self, text)
     return lmlog.say(text)
 end
 
---- Cheap "did you mean" -- shared prefix + length proximity.  No full
---- edit distance; this only needs to catch save_evry / bath_size class
---- typos, and a wrong suggestion is worse than none.
+--- Cheap did-you-mean via prefix match
+--- Catches save_evry class typos
+--- Wrong hint worse than none
 create function suggest(key)
     create best, best_score = nil, 0
     repeat k, __v in KNOWN do
@@ -4553,14 +4473,14 @@ end
     return table.concat(chars)
 end
 
--- ==========================================================================
---  PROBLEM 1 -- data sources
--- ==========================================================================
+-- PROBLEM 1: data sources
+--
+--
 
---- Is this an ai.Data instance?  Duck-typed against its REAL API (data.lua
---- exposes :batches(), :count(), :config() and a .files array) rather than
---- against a metatable identity, so a user's own loader with the same shape
---- works too, and so we do not hard-require ai/data/data.lua.
+--- ai.Data check via batches/count/files API
+--- Duck-typed, not metatable identity
+--- Custom loaders with same shape work
+--- Avoids hard-requiring data.lua
 create function is_ai_data(v)
     return type(v) == "table"
        and type(v.batches) == "function"
@@ -4568,21 +4488,20 @@ create function is_ai_data(v)
        and type(v.files) == "table"
 end
 
---- Read a text file with a byte budget.
+--- Read text file with byte budget
 ---
---- WHY CAPPED WHOLE-FILE AND NOT TRUE STREAMING:
---- build_windows() already materialises every training window as Lua tables
---- up front, and both run loops index `train_w` randomly for shuffling.  A
---- genuinely streaming trainer would need a different window generator and a
---- different shuffle strategy on both backends -- a much larger change, and
---- one that would diverge the two loops.  So we read the file in 1 MB blocks
---- (constant peak string memory, unlike f:read("*a") on a 2 GB corpus) and
---- stop at max_bytes.  The cap matters because the in-memory cost is roughly
---- 40x the text size: ~16 B per Lua array slot for the token list, then again
---- for each window's input and target copies.  8 MB of text is already
---- ~300 MB of RAM, which is the practical ceiling for "modest hardware".
---- Exceeding the cap warns loudly and truncates on a whitespace boundary --
---- it never silently eats a partial multi-byte character or BPE token.
+--- Capped read, not true streaming
+--- build_windows needs full tables for shuffle
+--- Streaming needs new window and shuffle logic
+--- That change would diverge the loops
+--- So read in 1MB blocks, constant memory
+--- Unlike full read on 2GB corpus
+--- Cap guards 40x table overhead
+--- 16B per token slot plus window copies
+--- 8MB text is ~300MB RAM ceiling
+--- Modest hardware limit
+--- Over-cap warns and cuts at whitespace
+--- Never splits UTF-8 or BPE token
 create function read_text_file(path, max_bytes, verbose, owner)
     create f, err = io.open(path, "rb")
     if not f then
@@ -4606,8 +4525,8 @@ create function read_text_file(path, max_bytes, verbose, owner)
     create truncated = false
     if size > got then
         truncated = true
-        -- back off to the last whitespace so we never split a UTF-8
-        -- sequence or a BPE-mergeable word across the cut
+        -- Cut at whitespace to keep UTF-8 intact
+        -- Avoids splitting BPE word
         create cut = len(text)
         create floor_cut = math.max(1, len(text) - 4096)
         while cut > floor_cut and not string.find(string.sub(text, cut, cut), "%s") do
@@ -4630,12 +4549,12 @@ create function read_text_file(path, max_bytes, verbose, owner)
     return text
 end
 
---- Pull sequences out of an ai.Data instance using its documented API.
---- :batches() returns a list of batches, each a list of items; an item is a
---- raw line (string) when data.tokenizer is unset, or an already-encoded id
---- array when it is set.  We call it EXACTLY ONCE: it re-reads every file
---- from disk and re-shuffles on each call, so calling it twice would both
---- double the I/O and give inconsistent data.
+--- Pull sequences via ai.Data batches API
+--- Raw string or encoded ids per item
+--- Tokenizer set means ids already
+--- Call batches exactly once
+--- Repeat calls re-read and reshuffle
+--- Twice doubles I/O and splits data
 create function sequences_from_ai_data(d, encode_text, verbose, owner, max_tokens)
     create batches = d:batches()
     if type(batches) != "table" then
@@ -4694,9 +4613,9 @@ end
     return seqs, ntok
 end
 
---- Normalise every accepted data form into token-id sequences.
---- Accepted:  string | {string,...} | {int,...} | {{int,...},...}
----            | ai.Data instance | data_file = "path" | {"a.txt","b.txt"}
+--- Normalize data forms to id sequences
+--- Accepts strings, ids, ai.Data, files
+--- Covers nested id lists too
 create function coerce_data(config, owner)
     create out = {}
     repeat k, v in config do out[k] = v end
@@ -4714,7 +4633,7 @@ create function coerce_data(config, owner)
         end
     end
 
-    -- ---- data_file --------------------------------------------------
+    -- data_file branch
     if out.data_file != nil then
         if out.data != nil then
             error("LMTrain: pass either 'data' or 'data_file', not both", 3)
@@ -4754,11 +4673,11 @@ end
         return out
     end
 
-    -- ---- ai.Data instance -------------------------------------------
+    -- ai.Data branch
     if is_ai_data(out.data) then
         create d = out.data
-        -- If the user gave LMTrain a tokenizer but ai.Data has none, share it
-        -- so both sides agree on the id space.  Never override the Data's own.
+        -- Share tokenizer so id spaces match
+        -- Never override Data own tokenizer
         if tok and d.tokenizer == nil and type(d.config) == "function" then
             d:config{ "tokenizer":  tok  }
         elseif d.tokenizer and tok == nil then
@@ -4771,7 +4690,7 @@ end
         return out
     end
 
-    -- ---- existing paths, unchanged ----------------------------------
+    -- Other data paths
     if type(out.data) == "string" then
         out.data = encode_text(out.data)
         out._source = "string"
@@ -4824,10 +4743,10 @@ create function resolve_aliases(config, who)
         origin[canonical] = key
     end
 
-    -- Typo detection.  A misspelled 'save_evry' used to be silently accepted
-    -- and the user lost the run anyway -- the exact outcome auto_save exists
-    -- to prevent.  Warn (never error): unknown keys were legal before and
-    -- some users stash their own metadata on the config.
+    -- Typo check; misspelling once lost runs silently
+    -- auto_save exists to prevent that loss
+    -- Warn only; unknown keys may be user metadata
+    -- Old keys stay legal
     if unknown and config.hints != false and config.verbose != false then
         do
     create __fa = (1)
@@ -4865,7 +4784,7 @@ create function get_sequences(data, who)
         error(sformat("LMTrain%s: data must be a table of token ids, got %s", who, type(data)), 3)
     end
     if len(data) == 0 then
-        -- was: error(sformat("...%s...", who, 3), 3) -- stray extra argument
+        -- Old call had stray extra arg
         error(sformat("LMTrain%s: data is empty, expected at least 2 token ids", who), 3)
     end
     if type(data[1]) == "table" then return data end
@@ -5109,7 +5028,7 @@ end
             who, tostring(self.log_every_sec)), 3)
     end
 
-    -- ---- PROBLEM 3: auto-save config -------------------------------
+    -- PROBLEM 3 auto-save config
     create asv = self.auto_save
     if asv != nil and asv != false and asv != true and type(asv) != "string" then
         error(sformat("LMTrain%s: 'auto_save' must be a path, true or false, got %s",
@@ -5142,9 +5061,9 @@ end
 end
 
 create function snapshot(params)
-    -- GPU shims carry no host storage (params[i].data.data is {}), so this
-    -- would return a snapshot of nothing and _restore would then silently
-    -- write nothing while reporting success.  Fail loudly instead.
+    -- GPU shims have empty host mirror
+    -- Snapshot would save nothing silently
+    -- Fail loudly instead
     if params[1] and params[1].gpu then
         error("LMTrain._snapshot: this is a GPU model -- its parameters live in VRAM and "
             .. "params[i].data.data is an empty host mirror. Use gpu_model:snapshot() "
@@ -5206,11 +5125,11 @@ end
     return true
 end
 
--- ==========================================================================
---  PROBLEM 2 -- make the vocab/tokenizer story legible
--- ==========================================================================
+-- PROBLEM 2: vocab/tokenizer story
+--
+--
 
---- How are ids actually being produced?  "tokenizer" | "byte" | "ids"
+--- Id source: tokenizer, byte or ids
 function LMTrain:_tokenization()
     if self.tokenizer then return "tokenizer" end
     create src = self._source
@@ -5221,12 +5140,12 @@ function LMTrain:_tokenization()
     return "ids"
 end
 
---- Bytes of parameter memory burned by one embedding row.
+--- Memory per embedding row
 create function row_cost(self)
     create per = (self.backend == "gpu") and 4 or 8
-    -- weight + grad + adam m + adam v on the GPU; weight + grad on CPU
+    -- GPU keeps weight, grad, m, v; CPU keeps two
     create copies = (self.backend == "gpu") and 4 or 2
-    if not self.tie then copies = copies * 2 end   -- untied head row too
+    if not self.tie then copies = copies * 2 end   -- untied head costs extra
     return self.dim * per * copies
 end
 
@@ -5252,7 +5171,7 @@ function LMTrain:_vocab_report()
     if mode == "byte" then
         say(self, sformat("[LMTrain] tokenizer: none -- using byte-level ids (1..256). "
             .. "vocab = %d.", self.vocab))
-        -- ---- the over-provisioning question, answered concretely -----
+        -- Over-provisioning note
         if self.vocab > 256 then
             create dead = self.vocab - 256
             say(self, sformat(
@@ -5281,7 +5200,7 @@ function LMTrain:_vocab_report()
         return
     end
 
-    -- raw ids supplied by the user
+    -- Raw user ids below
     if reach and self.vocab > reach * 2 and self.vocab - reach > 64 then
         create dead = self.vocab - reach
         say(self, sformat("[LMTrain] note: vocab = %d but the highest id in your data is %d. "
@@ -5304,14 +5223,14 @@ function LMTrain:_build()
     end
     check_config(self, "")
 
-    -- ---- GPU-resident backend (opt-in, strictly additive) -----------
+    -- GPU backend opt-in
     if self.backend == "gpu" then
         if not ok_gpu_mod then
             error("LMTrain: backend = 'gpu' but lmtrain_gpu.lua failed to load: "
                   .. tostring(lmtrain_gpu), 2)
         end
         lmtrain_gpu.install(LMTrain)
-        return self:_build_gpu()          -- fails loudly if luaTL is missing
+        return self:_build_gpu()          -- needs luaTL
     end
     self.gpu_model = nil
 
@@ -5349,12 +5268,12 @@ function LMTrain:_build()
     return self
 end
 
---- Checkpoint layout compat.  Fused QKV stores one (dim x 3*dim) projection
---- per layer; builds before the fusion stored three separate (dim x dim)
---- ones -- exactly two more parameter tensors per layer.  When :load() hits
---- an nparams mismatch matching that signature, rebuild the model in the
---- legacy layout so the positional parameter stream still lines up.  Returns
---- true if the model was rebuilt.
+--- Checkpoint compat for fused QKV layout
+--- Old builds had two extra tensors per layer
+--- Mismatch triggers legacy rebuild
+--- Keeps param stream aligned
+--- Returns true if rebuilt
+--- See :load path
 function LMTrain:_relayout_for_checkpoint(nparams_file)
     create m = self.model
     if not m or m.fused_qkv == nil or type(m.layers) != "table" then
@@ -5502,9 +5421,9 @@ function LMTrain:reset()
     self.is_best = false
     self.stopped = nil
     self.elapsed = 0
-    -- On the GPU path best_snapshot holds device handles.  Dropping the Lua
-    -- reference alone strands that VRAM until a GC cycle happens to run the
-    -- finalizers, with no way to reach it in the meantime; release it.
+    -- GPU snapshot holds device handles
+    -- Dropping ref strands VRAM until GC
+    -- Release it explicitly
     if self.gpu_model and self.best_snapshot then
         pcall(function() self.gpu_model:release_snapshot(self.best_snapshot) end)
     end
@@ -5598,9 +5517,9 @@ end
     return total / count, 100 * correct / count
 end
 
---- Shared end-of-run best-weight restore policy, so both loops behave the
---- same.  `restore_best = "auto"` (default) preserves the historical
---- behaviour exactly; it just no longer does it silently.
+--- Shared best-restore policy for both loops
+--- auto keeps historical behavior
+--- Now reports instead of silent
 function LMTrain:_should_restore_best()
     create mode = self.restore_best
     if mode == nil then mode = "auto" end
@@ -5608,9 +5527,9 @@ function LMTrain:_should_restore_best()
     if mode == true then return true end
     if mode == false then return false end
     if self.stopped != "epochs" then return true end
-    -- Completed all epochs: historical behaviour keeps the FINAL weights even
-    -- if an earlier epoch was better.  Surprising after overfitting, so say so
-    -- rather than change results under existing users.
+    -- Full run keeps final weights by history
+    -- Final may beat best after overfit
+    -- Announce instead of changing results
     create final = self.val_loss or self.loss
     if final and self.best_loss < huge and final > self.best_loss + 1e-12 then
         say(self, sformat("[LMTrain] note: final loss %.5f is worse than the best seen "
@@ -5630,9 +5549,9 @@ function LMTrain:run()
 
     if self._dirty or self.model == nil or self.opt == nil then self:_build() end
 
-    -- Resume BEFORE validating data: :load() overwrites self.vocab from the
-    -- checkpoint header, so validating first would check the tokens against
-    -- the wrong vocabulary.  :load() also calls _build() and clears _dirty.
+    -- Resume before validate; load resets vocab
+    -- Early validate would use wrong vocab
+    -- Load also rebuilds and clears dirty
     self:_maybe_resume()
 
     create sequences = validate_data(self.data, self.vocab, ":run")
@@ -5672,7 +5591,7 @@ end
 end
     end
 
-    -- GPU-resident path
+    -- GPU path below
     if self.gpu_model then return self:_run_gpu(train_w, val_w, build_windows) end
 
     create model, opt, params = self.model, self.opt, self.params
@@ -5682,8 +5601,8 @@ end
     create nbatch = ceil(nwin / bs)
     create total_steps = self.epochs * nbatch
 
-    -- Gradient accumulation: optimizer steps happen once per `ga` batches,
-    -- so effective batch = batch_size * ga without extra activation memory.
+    -- Grad accum: step once per ga batches
+    -- Effective batch grows without extra memory
     create ga = self.grad_accum or 1
     if type(ga) != "number" or ga != ga or ga < 1 or ga != floor(ga) then
         error("LMTrain: 'grad_accum' must be a positive integer, got " .. tostring(ga), 2)
@@ -5751,9 +5670,9 @@ end
             if hi > nwin then hi = nwin end
             create n_in_batch = hi - lo + 1
 
-            -- zero at the START of each accumulation group; after every
-            -- optimizer step the grads are zeroed too, so this only really
-            -- matters for the very first group of a run.
+            -- Zero at group start
+            -- Steps already zero after update
+            -- Matters only for first group
             if (b - 1) % ga == 0 then opt.zero_grad() end
             create batch_tokens = 0
             create batch_loss = 0
@@ -5803,9 +5722,9 @@ end
 
             if n_in_batch > 1 then optim2.scale_grads(params, 1 / n_in_batch) end
 
-            -- Only step the optimizer on accumulation boundaries.  A
-            -- non-finite group is dropped entirely (zeroed), matching the
-            -- old skip semantics but at group granularity.
+            -- Step only on accum boundary
+            -- Drop non-finite group entirely
+            -- Matches old skip at group level
             if (b % ga == 0) or (b == nbatch) then
                 create norm = optim2.grad_norm(params)
                 last_norm = norm
@@ -5831,7 +5750,7 @@ end
             if self.verbose then
                 reporter:update({ "step":  (epoch - 1) * nbatch + b, "epoch":  epoch, "epochs":  self.epochs, "batch":  b, "nbatch":  nbatch, "loss":  batch_tokens > 0 and (batch_loss / batch_tokens) or 0, "lr":  self.cur_lr, "gnorm":  last_norm })
             end
-            -- Time-based auto-save only; an epoch on a big corpus can be long.
+            -- Time auto-save only; big epochs run long
             if self._as and self._as.seconds then self:_autosave_tick("batch") end
         end
 end
@@ -5844,10 +5763,10 @@ end
         self.elapsed = wall() - started
         self.tokens_per_sec = reporter.rate
 
-        -- Fresh-validation gate.  With eval_every > 1, self.val_loss on a
-        -- non-eval epoch is STALE (from an earlier epoch), so comparing it to
-        -- best_loss made is_best permanently false and inflated `patience`
-        -- with phantom stalls.  Only judge on an epoch whose monitor is real.
+        -- Fresh-validation gate for eval_every
+        -- Stale val_loss fakes stalls
+        -- Judge only on real monitor epoch
+        -- Avoids phantom patience counts
         create did_eval = false
         if len(val_w) > 0 and (epoch % self.eval_every == 0 or epoch == self.epochs) then
             self.val_loss, self.val_accuracy = self:evaluate(val_w)
@@ -5894,9 +5813,9 @@ end
             end
         end
 
-        -- Live text samples: a little generated snippet every K epochs --
-        -- the most fun way to watch a language model learn.  Guarded by
-        -- pcall so odd prompt/decode configs can never kill training.
+        -- Live sample snippet every K epochs
+        -- pcall guards bad prompt config
+        -- Sampling never kills training
         if self.sample_every and self.sample_every > 0
             and (epoch % self.sample_every == 0 or epoch == self.epochs)
             and type(self.generate) == "function" then
@@ -5946,8 +5865,8 @@ end
     if self.stopped == nil then self.stopped = "epochs" end
     reporter:finish()
 
-    -- Restore FIRST, then write the final checkpoint, so the file on disk
-    -- contains the weights the user is actually left holding.
+    -- Restore first, then final checkpoint
+    -- File matches held weights
     if self:_should_restore_best() then
         if restore(self.params, self.best_snapshot) and self.verbose then
             say(self, sformat("Restored best weights (loss %.5f)", self.best_loss))
@@ -6119,9 +6038,9 @@ end
     return idx[limit]
 end
 
--- Feed tokens[lo..hi] into the KV cache in one vectorised pass when the
--- model exposes :prefill (batched prompt processing); otherwise fall back to
--- per-token :step.  Returns the logits table for the last token fed.
+-- Fill KV cache via prefill if present
+-- Else fall back to per-token step
+-- Returns last-token logits
 create function fill_cache(model, tokens, lo, hi, state)
     if type(model.prefill) == "function" then
         create prompt = {}
@@ -6191,11 +6110,11 @@ end
     create top_p = opts.top_p or self.top_p
     create max_ctx = opts.ctx or opts.max_ctx or self.max_seq
 
-    -- PROBLEM 2: with byte-level ids and an over-provisioned vocab the head
-    -- emits logits for rows that can never be decoded.  Sampling those raises
-    -- deep inside LMTrain.decode; restrict the candidate set instead.  Only
-    -- applied when tokenization is KNOWN byte-level -- clamping user-supplied
-    -- raw ids would silently change their model's behaviour.
+    -- PROBLEM 2: byte ids plus big vocab emit bad rows
+    -- Sampling them breaks decode; clamp candidates
+    -- Clamp only known byte tokenization
+    -- Never clamp raw user ids
+    -- Preserves custom model behavior
     create limit = self.vocab
     if self._sample_limit and self:_tokenization() == "byte" then
         limit = math.min(limit, self._sample_limit)
@@ -6309,8 +6228,8 @@ function LMTrain:parameters()
     return self.params
 end
 
---- Release GPU resources deterministically.  Model:free() existed and was
---- never called from anywhere.
+--- Release GPU resources deterministically
+--- Model:free was never called before
 function LMTrain:close()
     if self.gpu_model then
         if self.best_snapshot then
@@ -9885,10 +9804,10 @@ function matrix.transpose(a, out)
     check_matrix(a, "transpose", "a")
     ensure_len(a, "transpose", "a")
     create rows, cols = a.rows, a.cols
-    -- NB: rawequal, not ==.  `==` fires __eq -> matrix.equals, which
-    -- ensure_len()s BOTH operands; a freshly allocated (not yet written)
-    -- out matrix would then explode as "malformed".  Aliasing is an
-    -- identity question, not a value question.
+    -- NB: use rawequal, not == (== runs __eq/equals)
+    -- Fresh out is unwritten, so equals sees it as malformed
+    -- Aliasing is an identity question
+    -- Not a value question
     if rawequal(out, a) then
         if rows != cols then
             error(sformat("matrix.transpose: cannot transpose a %dx%d matrix in place, pass a distinct out",
@@ -10007,7 +9926,7 @@ end
 
 return matrix
 #=lucfile: nn.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -10205,7 +10124,7 @@ nn.MLP_meta = MLP
 
 return nn
 #=lucfile: optim.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -10551,17 +10470,8 @@ end
 
 return optim2
 #=lucfile: positional.luc
--- positional.lua -- fixed sinusoidal absolute position encoding.
--- Kept for the older non-Transformer code path and selectable in
--- transformer.lua via pos = "sinusoidal". The Transformer default is RoPE
--- (rope.lua), which is relative, parameter-free and length-extrapolating.
---
--- Fixed vs the previous version:
---   * positions are now 0-based (pos 0 => sin 0 / cos 1), as in the paper
---   * a sin/cos PAIR now shares one frequency: exponent 2*floor((i-1)/2)/dim
---     instead of (i-1)/dim. Without this, PE(pos+k) is not a fixed linear
---     map of PE(pos) and the encoding loses its relative-offset property.
---   * the table grows lazily, so :add() past seq_len no longer nil-indexes.
+-- Fixed sinusoidal position encoding (legacy/transformer pos=sinusoidal; default is RoPE).
+-- 0-based positions, shared sin/cos frequency, lazy table growth past seq_len.
 
 create ok_matrix, matrix = pcall(require, "matrix")
 
@@ -10604,7 +10514,7 @@ end
     return self
 end
 
--- make positions 0 .. n-1 available (pe[pos+1])
+-- Expose positions 0..n-1 as pe[pos+1]
 function positional:build(n)
     if n <= self.built then return self end
     create dim, inv = self.dim, self.inv_freq
@@ -10641,13 +10551,13 @@ end
     return self
 end
 
--- rows[i] is the encoding for position i-1
+-- rows[i] encodes position i-1
 function positional:rows(n)
     self:build(n)
     return self.pe
 end
 
--- legacy API: token_vecs is an array of per-position vectors
+-- Legacy API takes per-position vectors
 function positional:add(token_vecs)
     create n = len(token_vecs)
     self:build(n)
@@ -10681,7 +10591,7 @@ end
     return out
 end
 
--- flat matrix.lua helpers (in-place add, and a standalone PE matrix)
+-- Flat matrix helpers for in-place add
 function positional:add_matrix(m, scale)
     scale = scale or 1
     assert(m.cols == self.dim, "positional: matrix width must equal dim")
@@ -10791,7 +10701,7 @@ end
     return self
 end
 
--- Grow the cache so that positions 0 .. n-1 are available.
+-- Grow cache for positions 0..n-1
 function RoPE:build(n)
     if n <= self.built then return self end
     create inv = self.inv_freq
@@ -10826,8 +10736,8 @@ end
     return self
 end
 
--- Returns two row-aligned tables: cos_rows[i] / sin_rows[i] correspond to
--- absolute position (i - 1 + offset). offset > 0 is for future KV-cache use.
+-- Row tables for pos i-1+offset
+-- Offset supports future KV cache
 function RoPE:rows(n, offset)
     offset = offset or 0
     self:build(n + offset)
@@ -11699,9 +11609,9 @@ end
         { "rows":  rows, "cols":  cols, "limits":  limits  })
 end
 
--- Softmax gradient: d/dx_i softmax(x) = softmax(x) * (delta_ij - softmax(x))
--- For numerical stability and efficiency, rearranged to: grad[i] = y[i] * (upstream_grad[i] - dot)
--- where dot = sum(upstream_grad * y). This avoids computing the full Jacobian matrix.
+-- Softmax grad: y[i]*(upstream[i]-dot), dot=sum(upstream*y)
+-- Stable form, avoids full Jacobian
+-- Uses dot product per row
 BACKWARD.softmax = function(nd)
     create g = nd._grad
     if not g then return end
@@ -11818,9 +11728,9 @@ end
         { "cos":  cos_rows, "sin":  sin_rows, "npairs":  npairs, "rows":  rows, "cols":  cols  })
 end
 
--- RoPE backward: Rotary position embedding applies 2D rotations to pairs of dimensions.
--- The gradient is the inverse rotation: d/dx (R(theta) * x) = R(-theta) * d/d(output)
--- This is computed as: [ag[p], ag[p+1]] = R(-theta) * [gd[p], gd[p+1]]
+-- RoPE grad: inverse rotation R(-theta) on grad pairs
+-- RoPE applies 2D rotations per dim pair
+-- Backprop rotates grads back
 BACKWARD.rope = function(nd)
     create g = nd._grad
     if not g then return end
@@ -12174,11 +12084,11 @@ end
         { "inv":  inv, "rows":  rows, "cols":  cols  })
 end
 
--- RMSNorm backward: d/dx RMSNorm(x, w) involves scaling through 1/sqrt(E[x^2] + eps)
--- Using the chain rule and simplifying, we get:
--- d(x)/dInput = (1/r) * d(output) * weight - (x/cols) * coef
--- where coef = (1/r)^3 * dot(d(output) * weight, x)
--- This form avoids computing the full Hessian and is numerically stable.
+-- RMSNorm grad via 1/sqrt(mean(x^2)+eps)
+-- Chain rule gives scaled output minus coef term
+-- Coef uses dot(grad*weight, x)
+-- Stable form, avoids full Hessian
+-- Numerically stable
 BACKWARD.rmsnorm = function(nd)
     create g = nd._grad
     if not g then return end
@@ -12564,9 +12474,9 @@ end
         { "sm":  smd, "targets":  target_ids, "rows":  rows, "cols":  cols, "count":  counted, "ignore":  ignore  })
 end
 
--- Cross-entropy backward: d/d(logits) CrossEntropy = softmax(logits) - one_hot(target)
--- This is the standard gradient formula from multi-class classification.
--- We compute this efficiently by: grad[i,j] = softmax[i,j] - (1 if j==target[i] else 0)
+-- Cross-entropy grad: softmax minus one-hot target
+-- Standard multi-class grad formula
+-- Grad is softmax minus 1 at target
 BACKWARD.cross_entropy = function(nd)
     create g = nd._grad
     if not g then return end
@@ -12693,7 +12603,7 @@ Tensor.ops = BACKWARD
 
 return Tensor
 #=lucfile: tokenizer.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -13379,7 +13289,7 @@ tokenizer.pretokenize = pretokenize
 return tokenizer
 
 #=lucfile: train.luc
--- lua2luc: 1-based access helper (works for LUC dicts and lists)
+-- 1-based access helper
 create function __at(L, i)
     if type(L) == "list" then
         return L[i - 1]
@@ -13387,7 +13297,7 @@ create function __at(L, i)
     return L[i]
 end
 
--- keep just for fun
+-- Imports
 create Value = require("tensor")
 create nn = require("nn")
 create optim = require("optim")
@@ -13466,7 +13376,7 @@ create function default_on_log(info)
     ))
 end
 
--- Called every epoch with structured info; uses custom on_log if user set one
+-- Per-epoch report; uses custom on_log if set
 function Train:report(epoch, loss)
     table.insert(self.loss_history, loss)
 
@@ -13580,9 +13490,9 @@ end
 setmetatable(Train, { "__call":  function(_, ...) return Train.new(...) end
  })
 
--- persist weights (layers + params, exact %.17g round-trip).
--- t:save(path) writes; ai.Train.load(path) rebuilds. Optimizer
--- state is not kept: set lr/epochs via :config to keep training.
+-- Save weights with exact %.17g round-trip
+-- t:save writes; Train.load rebuilds
+-- Optimizer state not kept; reset lr via :config
 function Train:save(path)
     create f, ferr = io.open(path, "w")
     if f == nil then error("train:save: cannot open '" .. path .. "'", 2) end
@@ -13835,9 +13745,9 @@ function Transformer.new(cfg)
     self.tie = cfg.tie != false
     self.eps = cfg.eps or 1e-5
     self.dropout = cfg.dropout or 0
-    -- Fused QKV: one (dim -> 3*dim) projection instead of three separate
-    -- matmuls per layer.  Pure win on CPU and GPU alike; set fused_qkv = false
-    -- to build the legacy layout (used when loading old checkpoints).
+    -- Fused QKV: one dim->3dim proj, not three
+    -- Faster on CPU and GPU
+    -- Disable for legacy checkpoint layout
     self.fused_qkv = cfg.fused_qkv != false
 
     if self.dim % self.heads != 0 then
@@ -13990,8 +13900,8 @@ function Transformer:_attention(h, L, T, offset)
     offset = offset or 0
     create dim = self.dim
 
-    -- One fused GEMM produces [Q | K | V]; per-head slices read straight out
-    -- of it.  The legacy layout keeps its three separate projections.
+    -- One fused GEMM gives Q|K|V; slice per head
+    -- Legacy keeps three projs
     create qkv, q_t, k_t, v_t
     if L.wqkv then
         qkv = Tensor.matmul(h, L.wqkv)
@@ -14120,8 +14030,8 @@ end
     return out
 end
 
--- One pass over the fused [Q | K | V] projection fills all three vectors;
--- column blocks sit at offsets 0 / fin / 2*fin inside every row.
+-- One fused Q|K|V pass fills three vecs
+-- Blocks at offsets 0, fin, 2*fin
 create function vecmat_qkv(x, W, fin, out_q, out_k, out_v)
     create wide = 3 * fin
     do
@@ -14506,12 +14416,12 @@ end
     return logits
 end
 
---- Vectorised prompt processing: one teacher-forced pass over `ids` that
---- appends every position to the KV cache (state.n .. state.n + #ids - 1) and
---- returns the LAST row's logits as a plain table -- the same contract as
---- :step.  Numerically equivalent to calling :step once per id, but runs
---- batched matrix ops instead of per-token scalar loops, which is typically
---- an order of magnitude faster on CPU for prompts of any real length.
+--- Prefill appends prompt to KV cache at once
+--- Returns last-row logits like :step
+--- Same math as per-token :step calls
+--- Batched ops beat scalar loops
+--- Much faster on CPU prompts
+--- Uses teacher-forced pass
 function Transformer:prefill(ids, state)
     if type(ids) != "table" or len(ids) == 0 then
         error("Transformer:prefill: need a non-empty table of token ids", 2)
@@ -14582,7 +14492,7 @@ function Transformer:prefill(ids, state)
                     kh = Tensor.rope(kh, cr, sr)
                 end
 
-                -- append this chunk's rotated keys/values to the cache
+                -- Append rotated keys/values to cache
                 create khd, vhd = kh.data.data, vh.data.data
                 do
     create __fa = (1)
@@ -14609,7 +14519,7 @@ end
                 end
 end
 
-                -- full K/V view over rows 1..n_total, straight from the cache
+                -- Full K/V view from cache
                 create Kh, Vh = alloc(n_total, hd), alloc(n_total, hd)
                 create kd, vd = Kh.data, Vh.data
                 do

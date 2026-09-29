@@ -1,21 +1,5 @@
-/* lua2luc.c - mechanical Lua -> LUC source converter (lanternl porting aid)
- *
- * usage: lua2luc <in.lua> <out.luc>
- *
- * syntax-only transforms.  Lua array tables are KEPT 1-based by emitting
- * LUC dicts with explicit numeric keys, so index arithmetic is preserved:
- *   local x                 -> create x        (local function -> create function)
- *   ~=                      -> !=
- *   #expr                   -> len(expr)
- *   {k = v, [e] = v}        -> { "k": v, (e): v }
- *   {a, b, c}               -> { 1: a, 2: b, 3: c }
- *   for i = a, b [,s] do    -> do create __a/__b/__s/__n + repeat 1, __n as __j
- *   for k [,v] in pairs(t)  -> repeat k [, v] in (t) do
- *   for v in ipairs(t)      -> repeat __k, v in (t) do
- *   for i, v in ipairs(t)   -> do .. create i/v = __at(__L, __i) .. (injects __at)
- *   for x[,y] in gmatch     -> do create __g .. while true do .. (extra end)
- *   repeat <b> until c      -> while true do <b> if (c) then break end end
- */
+/* Mechanical Lua -> LUC converter (usage: lua2luc <in.lua> <out.luc>). */
+/* Maps locals/~=/#/tables/for-in/repeat-until to LUC; arrays stay 1-based via explicit numeric keys. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -104,8 +88,7 @@ static int wse(int ws,int we,const char *w){
     return we-ws==n&&strncmp(SRC+ws,w,(size_t)n)==0;
 }
 
-/* block scan: from i (after an opener) find matching 'end'(want=0) or 'until'(want=1)
-   word start index, or -1. */
+/* Find matching 'end' (want=0) or 'until' (want=1) word index from i, or -1. */
 static int match_block(int i,int b,int want){
     int depth=0;
     while(i<b){

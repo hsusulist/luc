@@ -1,11 +1,5 @@
---  bench_gpu_transformer.lua — prove the resident path is real
---
---    luajit bench_gpu_transformer.lua              -- default config
---    luajit bench_gpu_transformer.lua 256 4 8 1024 8 64 5000
---                     dim layers heads ffn batch seq vocab
---
---  Reports achieved GFLOP/s for a FULL forward + backward + AdamW step,
---  the round-trip GEMM baseline, and the CPU-autograd wall time.
+-- GPU-resident benchmark: full forward + backward + AdamW step, GEMM baseline, CPU wall time.
+-- Usage: luajit bench_gpu_transformer.lua [dim layers heads ffn batch seq vocab]
 
 package.path = package.path .. ";./ai/core/?.lua;./ai/nn/?.lua;./ai/gpu/?.lua;./?.lua"
 

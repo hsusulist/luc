@@ -1,35 +1,8 @@
--- forge: full-control branch
---
--- PyTorch-style modules on tensor2 autograd
--- Nothing trains automatically; you build modules
--- You write the loop and choose losses
--- Manual counterpart to LMTrain
---
---      local F = ai.forge()
---
---      local model = F.Sequential(
---          F.Linear(2, 32), F.ReLU(),
---          F.Linear(32, 16), F.GELU(),
---          F.Linear(16, 1))
---      local opt = F.optim.AdamW(model:parameters(), { lr = 1e-3 })
---
---      for step = 1, 1000 do
---          local pred = model(x)                 -- __call -> :forward
---          local loss = F.mse(pred, y)
---          opt.zero_grad()
---          loss:backward()
---          opt.step()
---      end
---
--- Conventions:
--- Tensors are always 2-D; flatten batches yourself
--- Engine is 2-D too
--- Linear weight is out x in, y = x*W^T+b
--- Embedding is vocab x dim
--- Targets are Tensors or flat tables
--- train/eval flips global Tensor.training switch
--- Dropout reads that switch
--- Call eval before generating, train to resume
+-- forge: full-control branch (PyTorch-style modules on tensor2 autograd).
+-- You build modules, write the loop, choose losses; manual counterpart to LMTrain.
+-- Example: F = ai.forge(); m = F.Sequential(F.Linear(2,32), F.ReLU(), F.Linear(32,1)).
+-- Conventions: 2-D tensors; Linear weight out x in; targets are Tensors/flat tables.
+-- Call m:eval() before generating, m:train() to resume (Dropout follows the switch).
 
 create matrix = require("matrix")
 create Tensor = require("tensor2")

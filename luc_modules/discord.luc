@@ -1,27 +1,7 @@
--- luc_modules/discord.luc -- Discord bot (import discord).
--- Needs a bot token: https://discord.com/developers/applications
--- Turn on MESSAGE CONTENT INTENT (to read text) and SERVER MEMBERS INTENT
--- (for full member lists + join events) on the Bot page.
---
---   import discord("bot")
---   create token = bot.token("TOKEN")
---   bot:run(token)
---   while bot.run do
---       create cmd = bot.prefix("!")
---       if cmd == "ping" then bot.msg:send("pong!") end
---   end
---
--- Groups: bot.msg (send/dm/last/lastby/sender), bot.user (join/getid),
--- bot.slash (new/slash), bot.debug (name/username/id/servers - grab early),
--- bot.embed (create/add_field/set_footer/set_author/set_thumbnail/set_image/send),
--- bot.buttons (new/disable/enable/click), bot.select (new/choose).
--- bot:run(token) only starts the bot: no loop, no config, no do-block
--- (throws on failure, so code after it only runs when online).
--- bot.on reads state, bot:stop() pauses (events queue up),
--- bot:on() resumes (queued events flush out).
--- The lib is silent by default; set LUC_WSDEBUG=1 for traffic logs.
--- NOTE: bot.prefix / bot.user.join / cmd.slash BLOCK until their event
--- arrives (each in its own task). Unmatched events stay queued.
+-- Discord bot (import discord). Needs a token + MESSAGE CONTENT / SERVER MEMBERS intents.
+-- Groups: bot.msg, bot.user, bot.slash, bot.debug, bot.embed, bot.buttons, bot.select.
+-- bot:run(token) only starts the bot (throws on failure); silent unless LUC_WSDEBUG=1.
+-- NOTE: bot.prefix / bot.user.join / cmd.slash BLOCK per event (own task); unmatched stay queued.
 import net("dn")
 create json = require("json")
 

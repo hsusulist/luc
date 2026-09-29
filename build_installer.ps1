@@ -20,7 +20,7 @@
 #
 #   2) Run ISCC to pack dist\luc-installer.exe.
 #
-# Yeu cau: Inno Setup 6/7. gcc chi can khi phai build lai.
+# Requires Inno Setup 6/7. gcc is only needed when a rebuild is required.
 $ErrorActionPreference = 'Stop'
 
 $env:Path += ';C:\msys64\mingw64\bin'

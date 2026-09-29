@@ -1,42 +1,12 @@
-/* lucgcc.exe - LUC installer "silent-fail" helper.
- *
- * WHY THIS EXISTS
- * Inno Setup's Exec() spawns children with CREATE_DEFAULT_ERROR_MODE
- * (Projects/Src/Setup.InstFunc.pas, InstExec: "dwCreationFlags :=
- * CREATE_DEFAULT_ERROR_MODE"), so an error mode set in the installer is
- * NOT inherited and a broken toolchain (cc1.exe unable to load
- * libgmp-10.dll / libisl-23.dll / libmpc-3.dll / libmpfr-6.dll) pops one
- * "System Error" dialog per missing DLL - a dialog storm during the
- * install-time build.
- *
- * HOW IT FIXES IT
- * This tiny helper runs BELOW that hop: it sets
- * SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX
- * for ITSELF, then launches the rest of its own command line via
- *     cmd.exe /C "<rest>"
- * with creation flags 0.  Child processes inherit the caller's error
- * mode unless CREATE_DEFAULT_ERROR_MODE is passed (gcc's pex-win32.c
- * uses flags 0), so cmd -> gcc -> cc1 and the produced exes all inherit
- * the suppressed mode and fail silently; their stderr still reaches the
- * caller (build_log.txt).  Exit code = cmd's exit code.
- *
- * The outer quotes around <rest> are essential: cmd's /C quote rule
- * strips the first and last quote character of the line, restoring
- * <rest> verbatim even when it contains several quoted paths (same
- * trick Inno Setup itself uses for .bat files).
- *
- * Build (static so the helper itself never needs mingw runtime DLLs):
- *   gcc -O2 -s -static -o lucgcc.exe lucgcc.c
- */
+/* Silent-fail wrapper: suppresses missing-DLL error dialogs during install-time builds. */
+/* Runs the rest of its command line via cmd.exe /C so children inherit the suppressed error mode. */
+/* Build: gcc -O2 -s -static -o lucgcc.exe lucgcc.c */
 
 #ifndef LUCGCCTest
 #include <windows.h>
 #endif
 
-/* Skip argv[0] on our own command line and return a pointer to the rest.
-   Handles quoted argv[0] and the C-runtime backslash rules (a backslash
-   before a quote escapes it), so paths like C:\dir with \" from batch
-   files are parsed correctly. */
+/* Skip argv[0] (handles quotes and backslash escapes) and return the rest of the command line. */
 static const char *after_arg0(const char *s)
 {
     int bs;

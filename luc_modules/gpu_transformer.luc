@@ -1,30 +1,6 @@
--- One step: ids in, loss out, weights on GPU
--- Host crossed twice per step
---
--- Upload N ids plus N targets, ~8KB
--- Download 1 loss plus argmax if needed
---
--- Embed through AdamW stays on device
--- Attention, norms, FFN and clipping included
--- Backward plus update queued too
--- Queued in luaTL.Program objects
--- Few FFI calls, one with graph replay
---
--- Layout
--- N=B*T rows; seq b owns its rows
--- D dim, H heads, hd D/H, F ffn, V vocab
--- qkv is N x 3D with Q,K,V blocks
--- scores is B*H*T x T with causal mask
--- Group mask keeps sequences separate
--- No cross-sequence view
---
--- Padding contract
--- Shapes static; short batch padded
--- Pad id 0 and target -1
--- Padded rows give loss and grad zero
--- Zero contribution to every gradient
--- Scales patched to 1/valid_tokens
--- Loss and grad magnitude stay exact
+-- GPU-resident step: ids in, loss out, weights stay on device (2 host crossings/step).
+-- Layout: N=B*T rows; qkv N x 3D; scores B*H*T x T with causal + group masks.
+-- Padding: static shapes, pad id 0 / target -1 gives zero loss/grad; scales use 1/valid_tokens.
 
 create ffi = require("ffi")
 

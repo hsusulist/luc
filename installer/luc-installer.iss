@@ -104,7 +104,7 @@ Name: "window"; Description: "Window support - SDL2 2D graphics, PNG/JPG sprites
 Name: "ailib"; Description: "lanternl AI library - 'import ai': neural nets, LMTrain, BPE tokenizer (optional; add later with: luc install ai)"
 Name: "discord"; Description: "Discord bot library - 'import discord': bot, slash commands, gateway (optional; add later with: luc install discord)"
 Name: "vsext"; Description: "VS Code extension - LUC syntax highlighting"; Types: full
-Name: "lccode"; Description: "LC Code editor - built-in code editor with file explorer (Start Menu shortcut)"; Types: full
+Name: "lcode"; Description: "LCode editor - built-in code editor with file explorer (Start Menu shortcut)"; Types: full
 Name: "source"; Description: "Keep the C source in the install folder (for developers)"; Types: full
 
 [Files]
@@ -197,7 +197,7 @@ Source: "..\src\*.c"; DestDir: "{app}\src"; Components: source; Flags: ignorever
 
 [Icons]
 Name: "{group}\LUC"; Filename: "{app}\luc.exe"
-Name: "{group}\LC Code"; Filename: "{app}\luc.exe"; Parameters: "--edit ""{app}\demos"""; Components: lccode
+Name: "{group}\LCode"; Filename: "{app}\luc.exe"; Parameters: "--lcode ""{app}\demos"""; Components: lcode
 Name: "{userdesktop}\LUC"; Filename: "{app}\luc.exe"
 ; Reopens the maintenance dialog (Install libraries / Fix / Uninstall) any time
 Name: "{group}\Luc Installer"; Filename: "{app}\luc-installer.exe"

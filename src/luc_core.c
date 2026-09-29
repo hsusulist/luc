@@ -4080,7 +4080,8 @@ static void print_help(void){
     "usage: luc [options] [script [args...]]\n\n"
     "  script.luc          run a LUC source file\n"
     "  -e \"chunk\"          execute LUC code from the command line\n"
-    "  --edit [path]       open the LC Code editor\n"
+    "  lcode [path] / --lcode [path]  open the LCode editor\n"
+    "  --edit [path]       same as --lcode (legacy alias)\n"
     "  install [pkg]       list or install a package  (window, ai, discord)\n"
     "  -v, --version       print version and exit\n"
     "  -h, --help          print this help and exit\n\n"
@@ -4466,14 +4467,17 @@ static const HelpTopic HELP_TOPICS[] = {
 {"len",
  "len(x) counts lists, dicts and strings: len([1,2]), len(\"hi\")."},
 {"edit",
- "edit hello.luc opens lc code, the tiny built-in editor (.luc, .lua, .py).\n"
+ "edit hello.luc opens LCode, the tiny built-in editor (.luc, .lua, .py).\n"
  "Type, arrows move, Enter splits, Ctrl+C copies the line, Ctrl+V pastes,\n"
  "Ctrl+S saves, ^R runs the .luc file, Esc quits."},
-{"lccode",
- "lccode [path] opens lc code: files on the left, code on the right.\n"
+{"lcode",
+ "lcode [path] opens LCode on ONE project folder (like VSCode).\n"
+ "No path opens the current folder, except home/drive roots (refused).\n"
  "Tree: Enter expands, Left/Right collapse, click opens, wheel scrolls.\n"
  "Files: N new, D folder, F2 rename, ^C/^V copy/paste, right-click menu.\n"
  "Code gets colors. ^E switches panes, ^B hides the tree, ^R runs."},
+{"lccode",
+ "alias of lcode (legacy name)."},
 {"require",
  "create m = require(\"name\") loads a third-party file module.\n"
  "System libs use import instead."},
@@ -4900,7 +4904,11 @@ static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
       } }
 }
 
-/* Render line; start=h-scroll, cm/stt=open block */
+/* Render line; col = true display column for tab stops, w = clipped width. */
+static void ed_tab_out(int *w,int *col,int maxw){
+    int tw=4-((*col)%4), q;
+    for(q=0;q<tw&&*w<maxw;q++){ fputc(' ',stdout); (*w)++; (*col)++; }
+}
 static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int cm,int stt){
     size_t k=0;
     int w=0, col=0, cur=EC_NONE, done=0;
@@ -4919,30 +4927,50 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
                 while(j<len&&b[j]=='='&&e<lvl){e++;j++;}
                 if(e==lvl&&j<len&&b[j]==']'){
                     size_t m;
-                    for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; } }
+                    for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                     k=j+1; st=0; continue;
                 } }
-            if(k>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(c,stdout); w++; }
+            if(k>=start&&w<maxw){
+                ed_hl_emit(want,&cur);
+                if(c=='\t') ed_tab_out(&w,&col,maxw);
+                else { fputc(c,stdout); w++; col++; }
+            }
             else if(k>=start) done=1;
+            else col+=ed_chw(c,col);
             k++; continue;
         }
         if(st==1||st==2){
             char q=st==1?'"':'\'';
-            if(k>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(c,stdout); w++; }
+            if(k>=start&&w<maxw){
+                ed_hl_emit(EC_STR,&cur);
+                if(c=='\t') ed_tab_out(&w,&col,maxw);
+                else { fputc(c,stdout); w++; col++; }
+            }
             else if(k>=start) done=1;
-            if(c=='\\'&&k+1<len){ k++; if(k>=start&&w<maxw){ fputc(b[k],stdout); w++; } else if(k>=start) done=1; }
+            else col+=ed_chw(c,col);
+            if(c=='\\'&&k+1<len){ k++; c=(unsigned char)b[k];
+                if(k>=start&&w<maxw){ fputc(b[k],stdout); w++; col++; }
+                else if(k>=start) done=1;
+                else col++; }
             else if(c==q) st=0;
             k++; continue;
         }
         /* code mode */
         if(c=='-'&&k+1<len&&b[k+1]=='-'){
-            while(k<len){ if(k>=start&&w<maxw){ ed_hl_emit(EC_COM,&cur); fputc(b[k],stdout); w++; } else if(k>=start) { done=1; break; } k++; }
+            while(k<len){ c=(unsigned char)b[k];
+                if(k>=start&&w<maxw){ ed_hl_emit(EC_COM,&cur);
+                    if(c=='\t') ed_tab_out(&w,&col,maxw);
+                    else { fputc(c,stdout); w++; col++; } }
+                else if(k>=start) { done=1; break; }
+                else col+=ed_chw(c,col);
+                k++; }
             continue;
         }
         if((c=='"'||c=='\'')){
             st=(c=='"')?1:2;
-            if(k>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(c,stdout); w++; }
+            if(k>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(c,stdout); w++; col++; }
             else if(k>=start) done=1;
+            else col++;
             k++; continue;
         }
         if(is_luc&&c=='['){
@@ -4950,7 +4978,7 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
             while(j<len&&b[j]=='='&&e<64){e++;j++;}
             if(e>0&&j<len&&b[j]=='['){
                 size_t m;
-                for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(b[m],stdout); w++; } }
+                for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                 k=j+1; st=4; lvl=e; continue;
             }
         }
@@ -4963,7 +4991,7 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
               if(!iskw){ size_t m=j; while(m<len&&(b[m]==' '||b[m]=='\t')) m++;
                   if(m<len&&b[m]=='(') iscall=1; }
               { size_t m;
-                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(iskw?EC_KEY:(iscall?EC_FN:EC_NONE),&cur); fputc(b[m],stdout); w++; } }
+                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(iskw?EC_KEY:(iscall?EC_FN:EC_NONE),&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                 if(j>k&&j-1>=start&&w>=maxw) done=1; }
               k=j; continue; }
         }
@@ -4973,7 +5001,7 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
                 if((d>='0'&&d<='9')||(d>='a'&&d<='f')||(d>='A'&&d<='F')) j++; else break; } }
             else { while(j<len&&((b[j]>='0'&&b[j]<='9')||b[j]=='.')) j++; }
             { size_t m;
-              for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_NUM,&cur); fputc(b[m],stdout); w++; } }
+              for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_NUM,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
               if(j>k&&j-1>=start&&w>=maxw) done=1; }
             k=j; continue;
         }
@@ -4984,7 +5012,7 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
             if(lead){ m++; while(m<len){ unsigned char d=(unsigned char)b[m];
                 if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||d=='_') m++; else break; }
                 if(m>k+1){ size_t q;
-                    for(q=k;q<m;q++){ if(q>=start&&w<maxw){ ed_hl_emit(EC_DIR,&cur); fputc(b[q],stdout); w++; } }
+                    for(q=k;q<m;q++){ if(q>=start&&w<maxw){ ed_hl_emit(EC_DIR,&cur); fputc(b[q],stdout); w++; col++; } else if(q>=start) done=1; else col++; }
                     k=m; continue; } }
         }
         /* plain char (tabs expand, controls placeholder) */
@@ -5016,7 +5044,7 @@ static int ed_ex_color(const char *nm,int isdir){
 }
 
 static void ed_popup_draw(Editor *e,int W,int H);
-static void ed_menu_open(Editor *e,int kind);
+static void ed_menu_open(Editor *e,int kind,int ax,int ay);
 static void ed_naming_start(Editor *e,int mode);
 
 static void ed_draw(Editor *e){
@@ -5093,7 +5121,7 @@ static void ed_draw(Editor *e){
             if(ei<e->exn){
                 const char *nm=e->ex[ei].name;
                 int cw=0, kk=0, i, isd=e->ex[ei].isdir;
-                int dep=e->ex[ei].depth; if(dep>4) dep=4;
+                int dep=e->ex[ei].depth; if(dep<1) dep=1; if(dep>5) dep=5;
                 /* Dirty names yellow, else extension color */
                 int col=isd ? (ed_dir_dirty(e,e->ex[ei].full)?33:0)
                             : (ed_path_dirty(e,e->ex[ei].full)?33:ed_ex_color(nm,isd));
@@ -5115,6 +5143,8 @@ static void ed_draw(Editor *e){
                 printf("\x1b[0m");
             } } }
           }
+          /* Emoji width varies by font; re-anchor code pane so code never shifts. */
+          if(EXW) printf("\x1b[%d;%dH",r+2,EXW+1);
           if(e->path[0] && li<e->n){
               char *lb=e->ln[li].b; size_t LL=e->ln[li].len, kk=0;
               int col=0;
@@ -5199,7 +5229,8 @@ static void ex_refresh(Editor *e){
         { char fb[1088]; snprintf(fb,sizeof fb,"%s\\%s",e->exdir[0]?e->exdir:".",fd.cFileName);
           e->ex[e->exn].full=(char*)lmalloc(strlen(fb)+1); memcpy(e->ex[e->exn].full,fb,strlen(fb)+1); }
         e->ex[e->exn].isdir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
-        e->ex[e->exn].depth=0; e->ex[e->exn].expanded=0;
+        /* Top-level entries sit inside the root header (VSCode-style), so depth starts at 1. */
+        e->ex[e->exn].depth=1; e->ex[e->exn].expanded=0;
         e->exn++;
     }while(FindNextFileA(fh,&fd));
     FindClose(fh);
@@ -5349,11 +5380,13 @@ static void ed_menu_add(Editor *e,const char *label,int id){
     e->nitems++;
 }
 
-/* Kind 0=root button, 1=context on selection */
-static void ed_menu_open(Editor *e,int kind){
+/* Kind 0 = root menu, 1 = context menu; ax/ay = mouse anchor (-1 = centered). */
+static void ed_menu_open(Editor *e,int kind,int ax,int ay){
     char dir[1024];
     e->nitems=0; e->msel=0; e->menu=1; e->naming=0;
-    e->menu_anch=0; e->menutitle[0]=0;
+    e->menutitle[0]=0;
+    if(ax>=0&&ay>=0){ e->menu_anch=1; e->menu_ax=ax; e->menu_ay=ay; }
+    else { e->menu_anch=0; e->menu_ax=0; e->menu_ay=0; }
     if(kind==0){
         ex_target_dir(e,dir,sizeof dir);
         ed_menu_add(e,"new file",MA_NEWFILE);
@@ -5609,7 +5642,7 @@ static void ed_naming_confirm(Editor *e){
     }
 }
 
-/* Popup geometry for draw and click */
+/* Menu rows: top border, title, items, footer hint, bottom border (bh = nitems+4). */
 static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
     int bw, bh, i, maxw=0;
     if(e->naming){
@@ -5620,10 +5653,26 @@ static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
         *x0=(W-bw)/2; *y0=H/2-2; *w=bw; *h=5;
         return;
     }
+    { int tl=e->menutitle[0]?(int)strlen(e->menutitle):4;
+      if(tl>maxw) maxw=tl; }
     for(i=0;i<e->nitems;i++){ int L=(int)strlen(e->mitems[i].label); if(L>maxw) maxw=L; }
-    bw=maxw+6; if(bw>W-4) bw=W-4; if(bw<20) bw=20;
-    bh=e->nitems+2; if(bh>H-2) bh=H-2;
-    *x0=(W-bw)/2; *y0=(H-bh)/2; *w=bw; *h=bh;
+    { const char *ft="Esc / click outside to close";
+      int fl=(int)strlen(ft); if(fl>maxw) maxw=fl; }
+    bw=maxw+6; if(bw>W-4) bw=W-4; if(bw<26) bw=26;
+    bh=e->nitems+4; if(bh>H-1) bh=H-1; if(bh<5) bh=5;
+    if(e->menu_anch){
+        int ax=e->menu_ax, ay=e->menu_ay;
+        if(ax<0) ax=0; if(ay<1) ay=1;
+        *x0=ax; *y0=ay;
+        if(*x0+bw>W) *x0=W-bw;
+        if(*x0<0) *x0=0;
+        /* keep above the status line */
+        if(*y0+bh>H-1) *y0=(H-1)-bh;
+        if(*y0<1) *y0=1;
+    } else {
+        *x0=(W-bw)/2; *y0=(H-bh)/2; if(*y0<1) *y0=1;
+    }
+    *w=bw; *h=bh;
 }
 
 static void ed_popup_draw(Editor *e,int W,int H){
@@ -5648,21 +5697,52 @@ static void ed_popup_draw(Editor *e,int W,int H){
         printf("\x1b[?25h");
         return;
     }
-    printf("\x1b[%d;%dH+",y0+1,x0+1);
-    for(i=0;i<bw-2;i++) fputc('-',stdout);
-    fputc('+',stdout);
-    for(i=0;i<e->nitems&&i<bh-2;i++){
-        printf("\x1b[%d;%dH| ",y0+2+i,x0+1);
-        if(i==e->msel) printf("\x1b[7m");
-        { int k, L=(int)strlen(e->mitems[i].label);
-          for(k=0;k<L&&k<bw-4;k++) fputc(e->mitems[i].label[k],stdout);
-          for(;k<bw-4;k++) fputc(' ',stdout); }
-        if(i==e->msel) printf("\x1b[0m");
-        fputc('|',stdout);
+    /* Modern context menu: rounded box, title, highlight, footer hint */
+    { int inner=bw-2, k;
+      /* top border */
+      printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x95\xad",y0+1,x0+1);
+      for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
+      fputs("\xe2\x95\xae\x1b[0m",stdout);
+      /* title */
+      { char tb[256]; const char *tt=e->menutitle[0]?e->menutitle:"menu";
+        snprintf(tb,sizeof tb,"%.200s",tt);
+        printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",y0+2,x0+1);
+        printf("\x1b[48;2;28;28;28m\x1b[97m %-.*s",inner-1,tb);
+        { int tl=(int)strlen(tb); if(tl>inner-1) tl=inner-1;
+          for(k=tl;k<inner-1;k++) fputc(' ',stdout); }
+        printf("\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m"); }
+      /* items: │ marker+label │, left/right borders stay dim */
+      for(i=0;i<e->nitems;i++){
+          int yy=y0+3+i;
+          if(yy>=y0+bh-2) break;
+          printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",yy+1,x0+1);
+          if(i==e->msel)
+              printf("\x1b[48;2;0;120;215m\x1b[97m");
+          else
+              printf("\x1b[48;2;28;28;28m\x1b[37m");
+          fputs(i==e->msel?"\xe2\x96\xb8 ":"  ",stdout);
+          { int k2, L=(int)strlen(e->mitems[i].label);
+            int maxl=inner-3;
+            for(k2=0;k2<L&&k2<maxl;k2++) fputc(e->mitems[i].label[k2],stdout);
+            for(;k2<maxl;k2++) fputc(' ',stdout); }
+          fputc(' ',stdout);
+          printf("\x1b[0m\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m");
+      }
+      /* footer hint */
+      { int fy=y0+3+e->nitems;
+        if(fy<y0+bh-1){
+            printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",fy+1,x0+1);
+            printf("\x1b[48;2;28;28;28m\x1b[90m %-.*s",inner-1,"Esc / click outside to close");
+            { const char *ft="Esc / click outside to close"; int fl=(int)strlen(ft);
+              if(fl>inner-1) fl=inner-1;
+              for(k=fl;k<inner-1;k++) fputc(' ',stdout); }
+            printf("\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m");
+        } }
+      /* bottom border */
+      printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x95\xb0",y0+bh,x0+1);
+      for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
+      fputs("\xe2\x95\xaf\x1b[0m",stdout);
     }
-    printf("\x1b[%d;%dH+",y0+1+bh-1,x0+1);
-    for(i=0;i<bw-2;i++) fputc('-',stdout);
-    fputc('+',stdout);
 }
 
 /* Menu pick */
@@ -5746,9 +5826,13 @@ static void ed_popup_click(Editor *e,int x,int y,int W,int H){
     if(!e->menu&&!e->naming) return;
     ed_popup_geom(e,W,H,&x0,&y0,&bw,&bh);
     if(e->naming){ return; }   /* Outside clicks cancel, handled by caller */
-    for(i=0;i<e->nitems&&i<bh-2;i++){
-        if(y==y0+1+i && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
+    /* click outside -> dismiss (no action, like Cancel) */
+    if(x<x0||x>=x0+bw||y<y0||y>=y0+bh){ e->menu=0; return; }
+    /* items start at y0+2 (after top border + title) */
+    for(i=0;i<e->nitems;i++){
+        if(y==y0+2+i && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
     }
+    /* clicks on border/title/footer do nothing (stay open) */
 }
 
 /* Wait for key after run */
@@ -5769,7 +5853,7 @@ static void ed_run(Editor *e,HANDLE hin,DWORD oldmode){
     if(e->dirty && !ed_save(e)) return;
     if(!g_exepath[0]){ snprintf(e->status,sizeof e->status,"cannot find luc"); return; }
     SetConsoleMode(hin,oldmode);
-    printf("\x1b[?7h\x1b[2J\x1b[H--- lc code run: %s ---\n",e->path);
+    printf("\x1b[?7h\x1b[2J\x1b[H--- lcode run: %s ---\n",e->path);
     fflush(stdout);
     { const char *av[3]; av[0]=g_exepath; av[1]=e->path; av[2]=NULL;
       intptr_t rc=_spawnv(_P_WAIT,g_exepath,av);
@@ -5895,14 +5979,38 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
         int x=(int)m->dwMousePosition.X-wx;
         int H=e->vh>0?e->vh:24;
         int EXW=e->show_ex?ED_EXW:0;
+        int rows=H>2?H-2:1;
         if(EXW&&x<EXW){
             if(up){ if(e->extop>=3) e->extop-=3; else e->extop=0; }
             else e->extop+=3;
+            ed_clamp_view(e,H);
+            /* keep selection visible so next draw doesn't snap back */
+            if(e->exn>0){
+                int erows=rows>2?rows-2:1;
+                if((int)e->exsel<(int)e->extop) e->exsel=e->extop;
+                if((int)e->exsel>=(int)(e->extop+erows)){
+                    e->exsel=e->extop+erows-1;
+                    if(e->exsel>=e->exn) e->exsel=e->exn-1;
+                }
+                e->focus=1;
+            }
+            e->status[0]=0;
         } else {
             if(up){ if(e->top>=3) e->top-=3; else e->top=0; }
             else e->top+=3;
+            ed_clamp_view(e,H);
+            /* keep cursor visible: wheel scrolls view + cursor together */
+            if(e->n>0){
+                if(e->cy<e->top) e->cy=e->top;
+                if(e->cy>=e->top+(size_t)rows){
+                    e->cy=e->top+(size_t)rows-1;
+                    if(e->cy>=e->n) e->cy=e->n-1;
+                }
+                ed_clamp(e);
+                e->focus=0;
+            }
+            e->status[0]=0;
         }
-        ed_clamp_view(e,H);
         return;
     }
     if(m->dwEventFlags!=0 && m->dwEventFlags!=DOUBLE_CLICK) return;
@@ -5912,14 +6020,14 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
       size_t CW=(size_t)(W-EXW)-e->numw; if((int)CW<8) CW=8;
       if(y<1||y>H-2||x<0) return;
       if(m->dwButtonState&RIGHTMOST_BUTTON_PRESSED){
-          /* Right-click: file menu, else nothing */
+          /* Right-click: file menu anchored at mouse, else nothing */
           if(EXW&&x<EXW){
               int r=y-1;
               e->focus=1;
               if(r==1||(r>=2 && e->extop+(r-2)<e->exn)){
                   if(r>=2) e->exsel=e->extop+(r-2);
-                  ed_menu_open(e,1);
-              } else ed_menu_open(e,0);
+                  ed_menu_open(e,1,x,y);
+              } else ed_menu_open(e,0,x,y);
           }
           return;
       }
@@ -5928,7 +6036,7 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
           int r=y-1;
           if(r==0){
               e->focus=1;
-              if(x>=EXW-3) ed_menu_open(e,0);
+              if(x>=EXW-3) ed_menu_open(e,0,x,y);
               return;
           }
           if(r==1){ e->focus=1; ex_toggle_all(e); return; }
@@ -5958,13 +6066,63 @@ static int ed_isfile(const char *p){
     return a!=INVALID_FILE_ATTRIBUTES && !(a&FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* Case-insensitive path equality on canonical absolute paths */
+static int ed_same_path(const char *a,const char *b){
+    char fa[1024], fb[1024];
+    DWORD na=GetFullPathNameA(a,sizeof fa,fa,NULL);
+    DWORD nb=GetFullPathNameA(b,sizeof fb,fb,NULL);
+    if(na==0||na>=sizeof fa||nb==0||nb>=sizeof fb)
+        return _stricmp(a,b)==0;
+    return _stricmp(fa,fb)==0;
+}
+
+/* Drive root like C:\ , C: , C:/ or UNC root \\srv\share */
+static int ed_is_drive_root(const char *p){
+    if(!p||!p[0]) return 1;
+    if((p[0]=='\\'&&p[1]=='\\')){           /* \\srv\share[\] */
+        const char *q=strchr(p+2,'\\');
+        if(!q) q=strchr(p+2,'/');
+        if(!q) return 1;
+        { const char *r=strchr(q+1,'\\'); const char *s=strchr(q+1,'/');
+          const char *e=r; if(s&&( !e||s<e)) e=s;
+          if(!e) return 1;                  /* \\srv\share */
+          if(!e[1]) return 1;               /* \\srv\share\ */
+          return 0; }
+    }
+    if(((p[0]>='A'&&p[0]<='Z')||(p[0]>='a'&&p[0]<='z'))&&p[1]==':'){
+        if(!p[2]) return 1;                 /* C: */
+        if((p[2]=='\\'||p[2]=='/')&&!p[3]) return 1;  /* C:\ */
+        return 0;
+    }
+    if(!strcmp(p,".")||!strcmp(p,".\\")||!strcmp(p,"./")) return 0; /* resolved later */
+    return 0;
+}
+
+/* True when p is the user's home folder (%USERPROFILE%) */
+static int ed_is_home_path(const char *p){
+    char home[1024];
+    DWORD n=GetEnvironmentVariableA("USERPROFILE",home,sizeof home);
+    if(n==0||n>=sizeof home||!home[0]) return 0;
+    return ed_same_path(p,home);
+}
+
+/* lcode edits one project folder; home/drive roots are refused without an explicit path. */
+static int ed_is_bad_implicit_root(const char *p){
+    char full[1024];
+    DWORD n=GetFullPathNameA(p[0]?p:".",sizeof full,full,NULL);
+    const char *q=(n>0&&n<sizeof full)?full:p;
+    if(ed_is_drive_root(q)) return 1;
+    if(ed_is_home_path(q)) return 1;
+    return 0;
+}
+
 /* Entry: NULL=cwd, file, or dir */
 static void lc_code(const char *start){
     HANDLE hin=GetStdHandle(STD_INPUT_HANDLE);
     DWORD m=0, old=0;
     Editor e;
     if((!hin||hin==INVALID_HANDLE_VALUE||!GetConsoleMode(hin,&m)) && !getenv("LUC_TESTDRAW")){
-        printf("lc code needs a console (stdin is redirected).\n");
+        printf("lcode needs a console (stdin is redirected).\n");
         return;
     }
     old=m;
@@ -5992,6 +6150,15 @@ static void lc_code(const char *start){
     } else {
         if(!GetCurrentDirectoryA(sizeof e.exdir,e.exdir))
             snprintf(e.exdir,sizeof e.exdir,".");
+        if(ed_is_bad_implicit_root(e.exdir)){
+            SetConsoleMode(hin,old);
+            printf("lcode: refusing to open '%s' - that is %s, not a project folder.\n",
+                e.exdir,
+                ed_is_home_path(e.exdir)?"your home folder":"a drive root");
+            printf("cd into a project first, or pass one explicitly:\n");
+            printf("  luc --lcode <folder>   (e.g. luc --lcode .\\luc)\n");
+            return;
+        }
         e.focus=1;
     }
     ex_refresh(&e);
@@ -6076,11 +6243,11 @@ done:
 #else
 static void lc_code(const char *start){
     (void)start;
-    printf("lc code needs a Windows console for now.\n");
+    printf("lcode needs a Windows console for now.\n");
 }
 #endif
 
-static void lccode_cmd(const char *line);
+static void lcode_cmd(const char *line);
 
 static void interactive_shell(void){
     char buf[512], key[64];
@@ -6092,14 +6259,16 @@ static void interactive_shell(void){
         if(!strcmp(key,"help")){ repl_help_loop(); continue; }
         if(!strcmp(key,"credit")||!strcmp(key,"credits")){ printf("made by hsusulist\n"); continue; }
         if(!strcmp(key,"license")||!strcmp(key,"licence")){ printf("%s",LUC_LICENSE); continue; }
-        if(!strcmp(key,"lccode")){ lccode_cmd(buf); continue; }
-        printf("I know: help, lccode, credit, license. (Type 'exit' to quit.)\n");
+        if(!strcmp(key,"lcode")||!strcmp(key,"lccode")){ lcode_cmd(buf); continue; }
+        printf("I know: help, lcode, credit, license. (Type 'exit' to quit.)\n");
     }
 }
 
-/* lccode [path]: open file, dir, or cwd */
-static void lccode_cmd(const char *line){
-    const char *p=line+6;
+/* lcode [path]: open file, dir, or cwd (lccode kept as legacy alias) */
+static void lcode_cmd(const char *line){
+    const char *p=line;
+    /* skip command word (lcode or lccode), keep [path] */
+    while(*p && *p!=' ' && *p!='\t' && *p!='\r' && *p!='\n') p++;
     char path[1024];
     size_t n;
     while(*p==' '||*p=='\t') p++;
@@ -6142,7 +6311,8 @@ int main(int argc,char **argv){
         if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
         return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);
     }
-    if(strcmp(argv[1],"--edit")==0){
+    if(strcmp(argv[1],"--edit")==0||strcmp(argv[1],"--lcode")==0
+       ||strcmp(argv[1],"lcode")==0||strcmp(argv[1],"lccode")==0){
         lc_code(argc>2?argv[2]:NULL);
         return 0;
     }
