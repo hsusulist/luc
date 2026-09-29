@@ -2432,6 +2432,7 @@ void lucL_open_string(void){
 /* Satellite DLLs bind at runtime; missing ones degrade gracefully. */
 #ifdef _WIN32
 #  include <windows.h>
+#  include <shellapi.h>   /* ShellExecuteA fallback for open_url */
 #  define W_LIB_H  HMODULE
 #  define W_LIB_OPEN(n)  LoadLibraryA(n)
 #  define W_LIB_SYM(h,n) GetProcAddress(h,n)
@@ -2480,6 +2481,8 @@ typedef void (*w_Mix_FreeChunk_t)(Mix_Chunk_opaque*);
 typedef int (*w_Mix_PlayChannel_t)(int,Mix_Chunk_opaque*,int);
 typedef int (*w_Mix_Volume_t)(int,int);
 typedef int (*w_Mix_HaltChannel_t)(int);
+typedef int (*w_Mix_Pause_t)(int);
+typedef int (*w_Mix_Resume_t)(int);
 typedef Mix_Music_opaque* (*w_Mix_LoadMUS_t)(const char*);
 typedef void (*w_Mix_FreeMusic_t)(Mix_Music_opaque*);
 typedef int (*w_Mix_PlayMusic_t)(Mix_Music_opaque*,int);
@@ -2497,6 +2500,8 @@ static w_Mix_FreeChunk_t pMix_FreeChunk=NULL;
 static w_Mix_PlayChannel_t pMix_PlayChannel=NULL;
 static w_Mix_Volume_t pMix_Volume=NULL;
 static w_Mix_HaltChannel_t pMix_HaltChannel=NULL;
+static w_Mix_Pause_t pMix_Pause=NULL;
+static w_Mix_Resume_t pMix_Resume=NULL;
 static w_Mix_LoadMUS_t pMix_LoadMUS=NULL;
 static w_Mix_FreeMusic_t pMix_FreeMusic=NULL;
 static w_Mix_PlayMusic_t pMix_PlayMusic=NULL;
@@ -2512,6 +2517,9 @@ static w_Mix_VolumeMusic_t pMix_VolumeMusic=NULL;
 #define W_FONTSLOTS   12
 #define W_SNDCACHE    32
 #define W_MAXPOLY     256
+#define W_TOUCHMAX    16
+#define W_PADMAX      4
+typedef struct { int active; long long touch; long long finger; float x, y; } WTouch;
 
 typedef struct { char path[512]; SDL_Texture *tex; int w,h; unsigned age; } WImg;
 #ifndef LUC_NO_MIXER
@@ -2538,6 +2546,9 @@ static struct {
     int vsync, fullscreen;
     unsigned clock;
     char textbuf[256]; int textlen;
+    WTouch touch[W_TOUCHMAX];   /* active fingers (normalized 0..1 coords) */
+    int touch_new, touch_lost;  /* edge flags, cleared per frame */
+    SDL_Joystick *pads[W_PADMAX]; int npads, pad_ready, pad_seen;
     WImg img[W_IMGCACHE];
     WTxt txt[W_TXTCACHE];
     int has_ttf, has_img, has_mix;   /* optional DLLs present */
@@ -2939,6 +2950,62 @@ static void w_circle_outline(int cx,int cy,int r){
         else { x--; err+=2*(y-x)+1; }
     }
 }
+/* angle of (dx,dy) in [0,2pi); SDL y grows down, matching screen rotation */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+static double w_ang(double dx,double dy){
+    double a=atan2(dy,dx);
+    return a<0? a+2*M_PI : a;
+}
+static int w_in_arc(double a,double a1,double a2){
+    while(a1<0){ a1+=2*M_PI; a2+=2*M_PI; }
+    while(a<a1) a+=2*M_PI;
+    return a<=a2;
+}
+static void w_fill_arc(int cx,int cy,int r,double a1,double a2){
+    double span=a2-a1;
+    while(span<0) span+=2*M_PI;
+    if(r<0) return;
+    if(span>=2*M_PI){ w_fill_circle(cx,cy,r); return; }
+    for(int dy=-r;dy<=r;dy++){
+        int dx=(int)(sqrt((double)r*(double)r-(double)dy*(double)dy)+0.5);
+        for(int x=-dx;x<=dx;x++){
+            if(x==0 && dy==0){ SDL_RenderDrawPoint(W.ren,cx,cy); continue; }
+            if(w_in_arc(w_ang((double)x,(double)dy),a1,a2))
+                SDL_RenderDrawPoint(W.ren,cx+x,cy+dy);
+        }
+    }
+}
+static void w_arc_outline(int cx,int cy,int r,double a1,double a2){
+    double span=a2-a1;
+    while(span<0) span+=2*M_PI;
+    int steps=r*2+16; if(steps<16) steps=16; if(steps>2048) steps=2048;
+    if(span>=2*M_PI){ w_circle_outline(cx,cy,r); return; }
+    for(int i=0;i<=steps;i++){
+        double a=a1+span*(double)i/(double)steps;
+        SDL_RenderDrawPoint(W.ren,
+            cx+(int)(cos(a)*(double)r+0.5),
+            cy+(int)(sin(a)*(double)r+0.5));
+    }
+}
+static void w_fill_ellipse(int cx,int cy,int rx,int ry){
+    if(rx<0||ry<0) return;
+    for(int dy=-ry;dy<=ry;dy++){
+        double t=1.0-(double)dy*(double)dy/((double)ry*(double)ry+1e-9);
+        int dx=(int)((double)rx*sqrt(t<0?0:t)+0.5);
+        SDL_RenderDrawLine(W.ren,cx-dx,cy+dy,cx+dx,cy+dy);
+    }
+}
+static void w_ellipse_outline(int cx,int cy,int rx,int ry){
+    int steps=(rx>ry?rx:ry)*2+16; if(steps<16) steps=16; if(steps>2048) steps=2048;
+    for(int i=0;i<=steps;i++){
+        double a=2*M_PI*(double)i/(double)steps;
+        SDL_RenderDrawPoint(W.ren,
+            cx+(int)(cos(a)*(double)rx+0.5),
+            cy+(int)(sin(a)*(double)ry+0.5));
+    }
+}
 static void w_fill_poly(const double *pts,int n){
     if(n<3) return;
     double miny=pts[1],maxy=pts[1];
@@ -2967,6 +3034,10 @@ static void w_shutdown(void){
     if(!W.started) return;
     w_drop_text_cache();
     w_drop_img_cache();
+    { int i;
+      for(i=0;i<W.npads;i++) if(W.pads[i]) SDL_JoystickClose(W.pads[i]);
+      W.npads=0; W.pad_seen=-2;
+      if(W.pad_ready){ SDL_QuitSubSystem(SDL_INIT_JOYSTICK); W.pad_ready=0; } }
 #ifndef LUC_NO_MIXER
     w_drop_sounds();
     if(W.mix_ok){ pMix_CloseAudio(); W.mix_ok=0; }
@@ -3011,6 +3082,10 @@ static void w_start_impl(const char *title,int ww,int hh){
     memset(W.keys_prev,0,sizeof W.keys_prev);
     memset(W.keys_curr,0,sizeof W.keys_curr);
     W.mouse_state=0; W.mouse_prev=0;
+    memset(W.touch,0,sizeof W.touch);
+    W.touch_new=0; W.touch_lost=0;
+    memset(W.pads,0,sizeof W.pads);
+    W.npads=0; W.pad_ready=0; W.pad_seen=-2;
     SDL_StartTextInput();
 #ifndef LUC_NO_TTF
     W.fontsize=16; w_find_font();
@@ -3033,6 +3108,51 @@ LFN(f_w_close){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
     w_shutdown(); return 0;
 }
 
+/* touch tracking: fingers identified by (touchId,fingerId), coords normalized */
+static void w_touch_event(const SDL_TouchFingerEvent *t){
+    int i, free=-1;
+    for(i=0;i<W_TOUCHMAX;i++){
+        if(W.touch[i].active &&
+           W.touch[i].touch==(long long)t->touchId &&
+           W.touch[i].finger==(long long)t->fingerId) break;
+        if(!W.touch[i].active && free<0) free=i;
+    }
+    if(t->type==SDL_FINGERDOWN){
+        if(i>=W_TOUCHMAX && free>=0){
+            W.touch[free].active=1;
+            W.touch[free].touch=(long long)t->touchId;
+            W.touch[free].finger=(long long)t->fingerId;
+            W.touch[free].x=t->x; W.touch[free].y=t->y;
+            W.touch_new=1;
+        } else if(i<W_TOUCHMAX){
+            W.touch[i].x=t->x; W.touch[i].y=t->y;
+        }
+    } else if(t->type==SDL_FINGERUP){
+        if(i<W_TOUCHMAX){ W.touch[i].active=0; W.touch_lost=1; }
+    } else if(i<W_TOUCHMAX){
+        W.touch[i].x=t->x; W.touch[i].y=t->y;
+    }
+}
+/* gamepad hotplug: reopen only when the stick count changes */
+static void w_pad_ensure(void){
+    int n, k;
+    if(!W.pad_ready){
+        if(SDL_InitSubSystem(SDL_INIT_JOYSTICK)!=0) return;
+        W.pad_ready=1;
+    }
+    n=SDL_NumJoysticks();
+    if(n==W.pad_seen) return;
+    for(k=0;k<W.npads;k++){
+        if(W.pads[k]){ SDL_JoystickClose(W.pads[k]); W.pads[k]=NULL; }
+    }
+    W.npads=0;
+    for(k=0;k<n && W.npads<W_PADMAX;k++){
+        SDL_Joystick *j=SDL_JoystickOpen(k);
+        if(j) W.pads[W.npads++]=j;
+    }
+    W.pad_seen=n;
+}
+static void w_pad_refresh(void){ W.pad_seen=-2; w_pad_ensure(); }
 /* event pump: shared by running() and go() */
 static void w_pump(void){
     SDL_Event e;
@@ -3048,6 +3168,10 @@ static void w_pump(void){
                 break;
             case SDL_MOUSEWHEEL:
                 W.wheel_dy+=e.wheel.y; W.wheel_dx+=e.wheel.x; break;
+            case SDL_FINGERDOWN: case SDL_FINGERUP: case SDL_FINGERMOTION:
+                w_touch_event(&e.tfinger); break;
+            case SDL_JOYDEVICEADDED: case SDL_JOYDEVICEREMOVED:
+                w_pad_refresh(); break;
             case SDL_TEXTINPUT: {
                 int n=(int)strlen(e.text.text);
                 if(W.textlen+n < (int)sizeof W.textbuf-1){
@@ -3061,6 +3185,7 @@ static void w_pump(void){
     { const Uint8 *ks=SDL_GetKeyboardState(NULL);
       memcpy(W.keys_curr,ks,W_KEYS); }
     W.mouse_state=SDL_GetMouseState(&W.mouse_x,&W.mouse_y);
+    if(W.npads>0) SDL_JoystickUpdate();
     SDL_GetWindowSize(W.win,&W.w,&W.h);
 }
 /* present + fps pacing + delta clock */
@@ -3082,6 +3207,7 @@ static void w_frame_end(void){
     W.mouse_prev=W.mouse_state;
     W.wheel_dy=0; W.wheel_dx=0;
     W.textlen=0; W.textbuf[0]=0;
+    W.touch_new=0; W.touch_lost=0;
     W.clock++;
 }
 LFN(f_w_running){ UNUSED_SELF; (void)base;(void)nargs;
@@ -3200,6 +3326,36 @@ LFN(f_w_circle_outline){ UNUSED_SELF;
     int r=checkint(L,base,nargs,2,"circle_outline");
     w_setcolor(w_color(w_argc(L,base,nargs,3)));
     w_circle_outline(x,y,r); return 0;
+}
+LFN(f_w_arc){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"arc"), y=checkint(L,base,nargs,1,"arc");
+    int r=checkint(L,base,nargs,2,"arc");
+    double a1=checknum(L,base,nargs,3,"arc"), a2=checknum(L,base,nargs,4,"arc");
+    w_setcolor(w_color(w_argc(L,base,nargs,5)));
+    w_fill_arc(x,y,r,a1,a2); return 0;
+}
+LFN(f_w_arc_outline){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"arc_outline"), y=checkint(L,base,nargs,1,"arc_outline");
+    int r=checkint(L,base,nargs,2,"arc_outline");
+    double a1=checknum(L,base,nargs,3,"arc_outline"), a2=checknum(L,base,nargs,4,"arc_outline");
+    w_setcolor(w_color(w_argc(L,base,nargs,5)));
+    w_arc_outline(x,y,r,a1,a2); return 0;
+}
+LFN(f_w_ellipse){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"ellipse"), y=checkint(L,base,nargs,1,"ellipse");
+    int rx=checkint(L,base,nargs,2,"ellipse"), ry=checkint(L,base,nargs,3,"ellipse");
+    w_setcolor(w_color(w_argc(L,base,nargs,4)));
+    w_fill_ellipse(x,y,rx,ry); return 0;
+}
+LFN(f_w_ellipse_outline){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"ellipse_outline"), y=checkint(L,base,nargs,1,"ellipse_outline");
+    int rx=checkint(L,base,nargs,2,"ellipse_outline"), ry=checkint(L,base,nargs,3,"ellipse_outline");
+    w_setcolor(w_color(w_argc(L,base,nargs,4)));
+    w_ellipse_outline(x,y,rx,ry); return 0;
 }
 LFN(f_w_triangle){ UNUSED_SELF;
     w_need();
@@ -3448,6 +3604,65 @@ LFN(f_w_cursor){ UNUSED_SELF;
     int show = nargs<1 || truthy(w_argc(L,base,nargs,0));
     SDL_ShowCursor(show?SDL_ENABLE:SDL_DISABLE); return 0;
 }
+LFN(f_w_mouse_grab){ UNUSED_SELF;
+    w_need();
+    int on = nargs<1 || truthy(w_argc(L,base,nargs,0));
+    SDL_SetWindowGrab(W.win,on?SDL_TRUE:SDL_FALSE); return 0;
+}
+LFN(f_w_mouse_set){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"mouse_set"), y=checkint(L,base,nargs,1,"mouse_set");
+    SDL_WarpMouseInWindow(W.win,x,y); return 0;
+}
+
+/* touch: active fingers as a list of {x, y, id} */
+LFN(f_w_touches){ UNUSED_SELF; (void)base;(void)nargs;
+    w_need();
+    Table *t=tab_new(1);
+    for(int i=0;i<W_TOUCHMAX;i++){
+        if(!W.touch[i].active) continue;
+        Table *f=tab_new(0);
+        tab_set(f,cstrv("x"),mknum(W.touch[i].x*(double)W.w));
+        tab_set(f,cstrv("y"),mknum(W.touch[i].y*(double)W.h));
+        tab_set(f,cstrv("id"),mknum((double)W.touch[i].finger));
+        list_push(t,mkobj(LT_TABLE,f));
+    }
+    RET(0,mkobj(LT_LIST,t)); return 1;
+}
+LFN(f_w_touch_pressed){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); RET(0,mkbool(W.touch_new)); return 1;
+}
+LFN(f_w_touch_released){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); RET(0,mkbool(W.touch_lost)); return 1;
+}
+
+/* gamepad: sticks opened lazily, refreshed on hotplug */
+LFN(f_w_pad_count){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); w_pad_ensure(); RET(0,mknum(W.npads)); return 1;
+}
+static SDL_Joystick *w_pad_at(LucState *L,int base,int nargs,int i,const char *fn){
+    w_need(); w_pad_ensure();
+    int p=checkint(L,base,nargs,i,fn);
+    if(p<0||p>=W.npads) luc_error("window.%s: pad #%d out of range (have %d)",fn,p,W.npads);
+    return W.pads[p];
+}
+LFN(f_w_pad_button){ UNUSED_SELF;
+    SDL_Joystick *j=w_pad_at(L,base,nargs,0,"pad_button");
+    int b=checkint(L,base,nargs,1,"pad_button");
+    if(b<0||b>=SDL_JoystickNumButtons(j)){ RET(0,mkbool(0)); return 1; }
+    RET(0,mkbool(SDL_JoystickGetButton(j,b))); return 1;
+}
+LFN(f_w_pad_axis){ UNUSED_SELF;
+    SDL_Joystick *j=w_pad_at(L,base,nargs,0,"pad_axis");
+    int a=checkint(L,base,nargs,1,"pad_axis");
+    if(a<0||a>=SDL_JoystickNumAxes(j)){ RET(0,mknum(0)); return 1; }
+    RET(0,mknum((double)SDL_JoystickGetAxis(j,a)/32767.0)); return 1;
+}
+LFN(f_w_pad_name){ UNUSED_SELF;
+    SDL_Joystick *j=w_pad_at(L,base,nargs,0,"pad_name");
+    const char *n=SDL_JoystickName(j);
+    RET(0,cstrv(n?n:"pad")); return 1;
+}
 
 /* timing */
 LFN(f_w_fps){ UNUSED_SELF;
@@ -3524,6 +3739,76 @@ LFN(f_w_screenshot){ UNUSED_SELF;
     SDL_FreeSurface(s);
     if(rc!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
     RET(0,mkbool(1)); return 1;
+}
+
+/* window placement + displays */
+LFN(f_w_minimize){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); SDL_MinimizeWindow(W.win); return 0;
+}
+LFN(f_w_maximize){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); SDL_MaximizeWindow(W.win); return 0;
+}
+LFN(f_w_restore){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    w_need(); SDL_RestoreWindow(W.win); return 0;
+}
+LFN(f_w_window_pos){ UNUSED_SELF; (void)nargs;
+    w_need();
+    int x=0,y=0; SDL_GetWindowPosition(W.win,&x,&y);
+    RET(0,mknum(x)); RET(1,mknum(y)); return 2;
+}
+LFN(f_w_move_window){ UNUSED_SELF;
+    w_need();
+    int x=checkint(L,base,nargs,0,"move_window"), y=checkint(L,base,nargs,1,"move_window");
+    SDL_SetWindowPosition(W.win,x,y); return 0;
+}
+LFN(f_w_display_count){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    int n=SDL_GetNumVideoDisplays(); RET(0,mknum(n<0?0:n)); return 1;
+}
+LFN(f_w_display_size){ UNUSED_SELF;
+    int i = nargs>=1? checkint(L,base,nargs,0,"display_size") : 0;
+    SDL_Rect r;
+    if(SDL_GetDisplayBounds(i,&r)!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
+    RET(0,mknum(r.w)); RET(1,mknum(r.h)); return 2;
+}
+
+/* system helpers (love.system equivalents) */
+LFN(f_w_clipboard){ UNUSED_SELF;
+    if(nargs>=1 && w_argc(L,base,nargs,0).t!=LT_NIL){
+        Str *s=checkstr(L,base,nargs,0,"clipboard");
+        if(SDL_SetClipboardText(s->s)!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
+        RET(0,mkbool(1)); return 1;
+    }
+    if(!SDL_HasClipboardText()){ RET(0,NIL); return 1; }
+    { char *t=SDL_GetClipboardText();
+      if(!t){ RET(0,NIL); return 1; }
+      RET(0,strv(t,(int)strlen(t))); SDL_free(t); return 1; }
+}
+LFN(f_w_message){ UNUSED_SELF;
+    w_need();
+    Str *title=checkstr(L,base,nargs,0,"message");
+    Str *text = nargs>=2? checkstr(L,base,nargs,1,"message") : title;
+    if(SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION,title->s,text->s,W.win)!=0){
+        RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2;
+    }
+    RET(0,mkbool(1)); return 1;
+}
+LFN(f_w_open_url){ UNUSED_SELF;
+    Str *u=checkstr(L,base,nargs,0,"open_url");
+#if SDL_VERSION_ATLEAST(2,0,14)
+    if(SDL_OpenURL(u->s)!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
+    RET(0,mkbool(1)); return 1;
+#elif defined(_WIN32)
+    if((int)(intptr_t)ShellExecuteA(NULL,"open",u->s,NULL,NULL,SW_SHOWNORMAL)>32){
+        RET(0,mkbool(1)); return 1;
+    }
+    RET(0,mkbool(0)); return 1;
+#else
+    (void)u;
+    RET(0,mkbool(0)); RET(1,cstrv("open_url needs SDL 2.0.14+")); return 2;
+#endif
+}
+LFN(f_w_os_name){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
+    RET(0,cstrv(SDL_GetPlatform())); return 1;
 }
 
 /* sound (SDL_mixer): WAV built-in, rest need DLLs */
@@ -3622,6 +3907,20 @@ LFN(f_w_stop){ UNUSED_SELF;
     (void)L;(void)base;(void)nargs;
 #ifndef LUC_NO_MIXER
     if(W.mix_ok) pMix_HaltChannel(-1);
+#endif
+    return 0;
+}
+LFN(f_w_pause_sound){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_Pause(-1);
+#endif
+    return 0;
+}
+LFN(f_w_resume_sound){ UNUSED_SELF;
+    (void)L;(void)base;(void)nargs;
+#ifndef LUC_NO_MIXER
+    if(W.mix_ok) pMix_Resume(-1);
 #endif
     return 0;
 }
@@ -3767,6 +4066,8 @@ static void w_load_satellites(void){
         pMix_PlayChannel=(w_Mix_PlayChannel_t)W_LIB_SYM(w_hMIX,"Mix_PlayChannel");
         pMix_Volume=(w_Mix_Volume_t)W_LIB_SYM(w_hMIX,"Mix_Volume");
         pMix_HaltChannel=(w_Mix_HaltChannel_t)W_LIB_SYM(w_hMIX,"Mix_HaltChannel");
+        pMix_Pause=(w_Mix_Pause_t)W_LIB_SYM(w_hMIX,"Mix_Pause");
+        pMix_Resume=(w_Mix_Resume_t)W_LIB_SYM(w_hMIX,"Mix_Resume");
         pMix_LoadMUS=(w_Mix_LoadMUS_t)W_LIB_SYM(w_hMIX,"Mix_LoadMUS");
         pMix_FreeMusic=(w_Mix_FreeMusic_t)W_LIB_SYM(w_hMIX,"Mix_FreeMusic");
         pMix_PlayMusic=(w_Mix_PlayMusic_t)W_LIB_SYM(w_hMIX,"Mix_PlayMusic");
@@ -3776,7 +4077,8 @@ static void w_load_satellites(void){
         pMix_VolumeMusic=(w_Mix_VolumeMusic_t)W_LIB_SYM(w_hMIX,"Mix_VolumeMusic");
 
         if(pMix_Init&&pMix_OpenAudio&&pMix_CloseAudio&&pMix_LoadWAV&&pMix_FreeChunk&&
-           pMix_PlayChannel&&pMix_Volume&&pMix_HaltChannel&&pMix_LoadMUS&&pMix_FreeMusic&&
+           pMix_PlayChannel&&pMix_Volume&&pMix_HaltChannel&&pMix_Pause&&pMix_Resume&&
+           pMix_LoadMUS&&pMix_FreeMusic&&
            pMix_PlayMusic&&pMix_HaltMusic&&pMix_PauseMusic&&pMix_ResumeMusic&&
            pMix_VolumeMusic)
             W.has_mix=1;
@@ -3813,6 +4115,8 @@ Value lucL_window_module(void){
     reg(t,"line",f_w_line);           reg(t,"rect",f_w_rect);
     reg(t,"rect_outline",f_w_rect_outline);
     reg(t,"circle",f_w_circle);       reg(t,"circle_outline",f_w_circle_outline);
+    reg(t,"arc",f_w_arc);             reg(t,"arc_outline",f_w_arc_outline);
+    reg(t,"ellipse",f_w_ellipse);     reg(t,"ellipse_outline",f_w_ellipse_outline);
     reg(t,"triangle",f_w_triangle);   reg(t,"polygon",f_w_polygon);
     reg(t,"text",f_w_text);           reg(t,"text_size",f_w_text_size);
     reg(t,"text_center",f_w_text_center);
@@ -3825,17 +4129,32 @@ Value lucL_window_module(void){
     reg(t,"mouse",f_w_mouse);         reg(t,"mouse_pressed",f_w_mouse_pressed);
     reg(t,"mouse_released",f_w_mouse_released);
     reg(t,"mouse_wheel",f_w_mouse_wheel);
+    reg(t,"mouse_grab",f_w_mouse_grab); reg(t,"mouse_set",f_w_mouse_set);
     reg(t,"text_input",f_w_text_input); reg(t,"cursor",f_w_cursor);
+    reg(t,"touches",f_w_touches);
+    reg(t,"touch_pressed",f_w_touch_pressed);
+    reg(t,"touch_released",f_w_touch_released);
+    reg(t,"pad_count",f_w_pad_count); reg(t,"pad_button",f_w_pad_button);
+    reg(t,"pad_axis",f_w_pad_axis);   reg(t,"pad_name",f_w_pad_name);
 
     reg(t,"fps",f_w_fps);             reg(t,"delta",f_w_delta);
     reg(t,"time",f_w_time);
 
     reg(t,"fullscreen",f_w_fullscreen); reg(t,"vsync",f_w_vsync);
     reg(t,"icon",f_w_icon);           reg(t,"screenshot",f_w_screenshot);
+    reg(t,"minimize",f_w_minimize);   reg(t,"maximize",f_w_maximize);
+    reg(t,"restore",f_w_restore);
+    reg(t,"window_pos",f_w_window_pos); reg(t,"move_window",f_w_move_window);
+    reg(t,"display_count",f_w_display_count);
+    reg(t,"display_size",f_w_display_size);
+    reg(t,"clipboard",f_w_clipboard); reg(t,"message",f_w_message);
+    reg(t,"open_url",f_w_open_url);   reg(t,"os_name",f_w_os_name);
 
 #ifndef LUC_NO_MIXER
     reg(t,"sound",f_w_sound);         reg(t,"play",f_w_play);
     reg(t,"stop",f_w_stop);
+    reg(t,"pause_sound",f_w_pause_sound);
+    reg(t,"resume_sound",f_w_resume_sound);
     reg(t,"music",f_w_music);         reg(t,"play_music",f_w_play_music);
     reg(t,"stop_music",f_w_stop_music);
     reg(t,"pause_music",f_w_pause_music);
@@ -3844,7 +4163,7 @@ Value lucL_window_module(void){
     reg(t,"sound_volume",f_w_sound_volume);
 #endif
 
-    tab_set(t,cstrv("_VERSION"),cstrv("luc.window 0.1 (SDL2)"));
+    tab_set(t,cstrv("_VERSION"),cstrv("luc.window 0.2 (SDL2)"));
 #ifndef LUC_NO_TTF
     tab_set(t,cstrv("has_ttf"),mkbool(W.ttf_ok));
 #else

@@ -4494,6 +4494,11 @@ static const HelpTopic HELP_TOPICS[] = {
  "See demos/net_libaries/."},
 {"window",
  "import window(\"w\"): SDL2 graphics and sound.\n"
+ "Draw: clear/pixel/line/rect/circle/arc/ellipse/triangle/polygon/text/image/sprite.\n"
+ "Input: key/mouse + pressed/released, wheel, text_input, cursor, mouse_grab/set.\n"
+ "Touch: touches/touch_pressed/released. Gamepad: pad_count/button/axis/name.\n"
+ "System: clipboard, message, open_url, os_name. Window: fullscreen, minimize,\n"
+ "maximize/restore, move_window, display_size. Sound: play/stop/pause_sound.\n"
  "Needs: luc install window. See demos/window_libaries/."},
 {"discord",
  "import discord: chat bots with prefix/slash commands and buttons.\n"
