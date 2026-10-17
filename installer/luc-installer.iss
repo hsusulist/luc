@@ -105,6 +105,7 @@ Name: "ailib"; Description: "lanternl AI library - 'import ai': neural nets, LMT
 Name: "discord"; Description: "Discord bot library - 'import discord': bot, slash commands, gateway (optional; add later with: luc install discord)"
 Name: "vsext"; Description: "VS Code extension - LUC syntax highlighting"; Types: full
 Name: "lcode"; Description: "LCode editor - built-in code editor with file explorer (Start Menu shortcut)"; Types: full
+Name: "lcodefont"; Description: "Download for LCode: FiraCode Nerd Font Mono for file icons (then set your terminal font to it)"; Types: full
 Name: "source"; Description: "Keep the C source in the install folder (for developers)"; Types: full
 
 [Files]
@@ -188,6 +189,10 @@ Source: "..\dist\app\libgcc_s_seh-1.dll"; DestDir: "{app}\packages\window"; Flag
 Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
+; FiraCode Nerd Font for lcode file icons (registered with Windows, kept on uninstall)
+Source: "..\fonts\FiraCodeNerdFontMono-Regular.ttf"; DestDir: "{fonts}"; FontInstall: "FiraCode Nerd Font Mono"; Flags: skipifsourcedoesntexist uninsneveruninstall sharedfile; Components: lcodefont
+; LCode plugins (built-in luc example: suggestions, syntax colors, themes)
+Source: "..\plugin\*"; DestDir: "{app}\plugin"; Components: lcode; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 ; VS Code extension (copied into the VS Code extensions folder)
 Source: "..\vscode\*"; DestDir: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc"; Components: vsext; Flags: ignoreversion recursesubdirs createallsubdirs
 ; C source for developers (explicit: src also contains stray exes that

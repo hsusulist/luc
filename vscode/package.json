@@ -1,6 +1,6 @@
 {
-  "name": "luc-language",
-  "displayName": "LUC Language",
+  "name": "luc",
+  "displayName": "LUC",
   "description": "Syntax highlighting and snippets for LUC (.luc files)",
   "version": "0.2.1",
   "publisher": "hsusulist",

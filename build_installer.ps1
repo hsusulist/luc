@@ -169,6 +169,33 @@ if (Test-Path (Join-Path $ProjectDir 'luc_modules')) {
     & (Join-Path $ProjectDir 'tools\make_pkg.ps1')
 }
 
+function Get-NerdFont {
+    # FiraCode Nerd Font for lcode icons (skipped silently when offline).
+    # Prefers the file you drop into fonts\ yourself (FiraCodeNerdFontMono-Regular.ttf).
+    $fontFile = Join-Path $ProjectDir 'fonts\FiraCodeNerdFontMono-Regular.ttf'
+    if (Test-Path $fontFile) { return }
+    $url = $env:LUC_NERDFONT_URL
+    if (-not $url) { $url = 'https://github.com/ryanoasis/nerd-fonts/releases/download/v3.2.1/FiraCode.zip' }
+    try {
+        $zip = Join-Path ([IO.Path]::GetTempPath()) 'firacode-nf.zip'
+        Write-Host 'Downloading Nerd Font for lcode icons...'
+        Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $arc = [IO.Compression.ZipFile]::OpenRead($zip)
+        try {
+            $entry = $arc.Entries | Where-Object { $_.Name -eq 'FiraCodeNerdFontMono-Regular.ttf' } | Select-Object -First 1
+            if (-not $entry) { throw 'ttf not found in zip' }
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $fontFile, $true)
+        } finally { $arc.Dispose() }
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        Write-Host 'Nerd Font ready.'
+    } catch {
+        Write-Warning "Nerd Font skipped ($($_.Exception.Message)). Set LUC_NERDFONT_URL or drop FiraCodeNerdFontMono-Regular.ttf into fonts\\."
+    }
+}
+
+Get-NerdFont
+
 $iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $iscc) {
     $isccCandidates = @(

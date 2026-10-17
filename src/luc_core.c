@@ -4469,13 +4469,19 @@ static const HelpTopic HELP_TOPICS[] = {
 {"edit",
  "edit hello.luc opens LCode, the tiny built-in editor (.luc, .lua, .py).\n"
  "Type, arrows move, Enter splits, Ctrl+C copies the line, Ctrl+V pastes,\n"
- "Ctrl+S saves, ^R runs the .luc file, Esc quits."},
+ "Ctrl+S saves, bottom shell runs commands, Esc quits."},
 {"lcode",
  "lcode [path] opens LCode on ONE project folder (like VSCode).\n"
  "No path opens the current folder, except home/drive roots (refused).\n"
  "Tree: Enter expands, Left/Right collapse, click opens, wheel scrolls.\n"
  "Files: N new, D folder, F2 rename, ^C/^V copy/paste, right-click menu.\n"
- "Code gets colors. ^E switches panes, ^B hides the tree, ^R runs."},
+ "Code gets colors. ^E switches panes, ^B hides the tree.\n"
+ "Bottom shell runs commands (Enter runs, Up/Down history, ^` focuses it).\n"
+ ":plugin lists plugins, :setting opens settings, :theme [dark|light] colors.\n"
+ ":help in the shell lists commands. Words complete with Tab as you type.\n"
+ "^Z/^Y undo/redo, ^C copies selection first, else the line.\n"
+ "F5 refreshes the tree, F8 toggles file icons (nerd/none, saved).\n"
+ "Nerd icons need the FiraCode Nerd Font Mono terminal font (bundled with the installer)."},
 {"lccode",
  "alias of lcode (legacy name)."},
 {"require",
@@ -4528,9 +4534,27 @@ static void repl_help_loop(void){
 typedef struct { char *b; size_t len, cap; } EdLine;
 
 /* Parked buffer for unsaved file switch */
-typedef struct { EdLine *ln; size_t n, cap, cx, cy, top; int dirty; char path[1024]; } EdStash;
+typedef struct { EdLine *ln; size_t n, cap, cx, cy, top; int dirty; char path[1024]; int is_binary; } EdStash;
 
 typedef struct { const char *label; int id; } EdMenuItem;
+
+/* lcode plugin: a plugin/ folder with plugin.cfg (example: the built-in luc) */
+#define ED_PLUGMAX 8
+#define ED_SETMAX 8
+typedef struct {
+    char name[64], author[64], desc[128];
+    int enabled, locked;
+    char cfg[1024];   /* plugin.cfg path, "" for the built-in fallback */
+    char set_id[ED_SETMAX][32], set_label[ED_SETMAX][64];
+    int set_val[ED_SETMAX], nset;
+} Plug;
+
+/* One undo step: whole-buffer snapshot (small files, so this stays cheap) */
+typedef struct { char *data; size_t len, cy, cx, top; int dirty; } EdUndo;
+#define ED_UNDOMAX 50   /* steps kept per buffer */
+
+#define ED_LOGMAX 64  /* kept log lines (panel shows 1, or 3 when expanded) */
+#define ED_SHHIST 32  /* shell command history */
 
 typedef struct {
     EdLine *ln; size_t n, cap;
@@ -4569,12 +4593,44 @@ typedef struct {
     char menutitle[320];
     /* Pending delete confirm */
     char deltarget[1024]; int delisdir;
+    int is_binary;        /* current buffer is a binary placeholder (no save) */
+    /* Text selection: anchor (byte col, line) + live end = cursor */
+    int sel_on, sel_armed;
+    size_t sel_ax, sel_ay;
+    int icons_nerd;       /* 1 = Nerd Font devicons, 0 = no icons */
+    /* Bottom shell: input line, history, and the log panel above it */
+    char shbuf[1024]; size_t shlen, shcur;
+    char shhist[ED_SHHIST][1024]; int shn, shpos;
+    size_t sh_promptw;       /* display width of the shell prompt (for cursor) */
+    int sh_quit;             /* shell asked to quit (exit/quit command) */
+    char logs[ED_LOGMAX][240]; int logn;
+    char lastlog[160];      /* last status already copied into logs */
+    int log_expand, log_scroll; /* 1 = 3-row log view, scroll offset into history */
+    int last_expand;      /* layout key of the last painted frame */
+    /* Undo/redo stacks (cleared on file switch) */
+    EdUndo *un, *rn; int un_n, un_cap, rn_n, rn_cap;
+    int un_last_op; double un_last_time;
+    int opt_guides;       /* tree indent guides (Appearance setting, default off) */
+    /* Plugins: built-in luc + plugin.cfg folders, toggled in the :plugin UI */
+    Plug plugs[ED_PLUGMAX]; int nplugs, plug_sel, plug_top, show_plugins;
+    char plugdir[1024];
+    /* Settings modal: left index tabs, right content */
+    int show_settings, set_tab, set_row, set_left;
+    /* Suggestions: filtered word list under the cursor (Tab accepts) */
+    char sug_items[8][64], sug_tag[8][16], sug_px[64];
+    int sug_n, sug_sel, sug_on;
 } Editor;
 
 typedef struct ExItem { char *name; char *full; int isdir; int depth; int expanded; } ExItem;
 #define ED_EX_MAX 2000   /* visible tree cap */
 
 #define ED_EXW 28   /* explorer pane width */
+
+static void ed_sel_delete(Editor *e);   /* defined with the copy helpers below */
+static void ed_undo_push(Editor *e,int op);   /* defined with the undo engine below */
+static void ex_free(Editor *e);   /* defined below */
+static int ed_sys_copy(const char *s,size_t len);   /* Windows clipboard below */
+static char *ed_sys_paste(size_t *outlen);   /* Windows clipboard below */
 
 static void ed_line_reserve(EdLine *l,size_t extra){
     if(l->len+extra+1>l->cap){
@@ -4600,9 +4656,11 @@ static void ed_clamp(Editor *e){
     if(e->cx>e->ln[e->cy].len) e->cx=e->ln[e->cy].len;
 }
 
-/* Keep scroll in range */
+/* Keep scroll in range (code rows exclude title/log/shell) */
+static int ed_logshow(Editor *e){ return e->log_expand?3:1; }
+static int ed_crows(int H,Editor *e){ int r=H-2-ed_logshow(e); return r>1?r:1; }
 static void ed_clamp_view(Editor *e,int H){
-    size_t rows=H>2?(size_t)(H-2):1;
+    size_t rows=(size_t)ed_crows(H,e);
     size_t maxtop=e->n>rows?e->n-rows:0;
     size_t erows=rows>2?rows-2:1;
     size_t maxex=e->exn>erows?e->exn-erows:0;
@@ -4653,6 +4711,9 @@ static size_t ed_byte_at(char *b,size_t len,size_t dc){
 
 static void ed_insert_bytes(Editor *e,const char *s,size_t m){
     ed_clamp(e);
+    if(e->is_binary){ snprintf(e->status,sizeof e->status,"binary file is read-only"); return; }
+    ed_undo_push(e,m<=4?1:0);
+    if(e->sel_on) ed_sel_delete(e);
     if(m==0) return;
     { EdLine *l=&e->ln[e->cy];
       ed_line_reserve(l,m);
@@ -4663,6 +4724,9 @@ static void ed_insert_bytes(Editor *e,const char *s,size_t m){
 
 static void ed_backspace(Editor *e){
     ed_clamp(e);
+    if(e->is_binary){ snprintf(e->status,sizeof e->status,"binary file is read-only"); return; }
+    ed_undo_push(e,1);
+    if(e->sel_on){ ed_sel_delete(e); return; }
     if(e->cx>0){
         size_t from=e->cx; ed_move_left(e);
         { EdLine *l=&e->ln[e->cy]; size_t cnt=from-e->cx;
@@ -4682,6 +4746,9 @@ static void ed_backspace(Editor *e){
 
 static void ed_newline(Editor *e){
     ed_clamp(e);
+    if(e->is_binary){ snprintf(e->status,sizeof e->status,"binary file is read-only"); return; }
+    ed_undo_push(e,0);
+    if(e->sel_on) ed_sel_delete(e);
     { EdLine *l=&e->ln[e->cy];
       ed_ins_line(e,e->cy+1);
       l=&e->ln[e->cy];
@@ -4698,7 +4765,205 @@ static void ed_copy_line(Editor *e){
     { EdLine *l=&e->ln[e->cy];
       free(e->clip); e->clip=NULL; e->cliplen=0;
       if(l->len){ e->clip=(char*)lmalloc(l->len+1); memcpy(e->clip,l->b,l->len+1); e->cliplen=l->len; }
-      snprintf(e->status,sizeof e->status,"copied line %d",(int)e->cy+1); }
+      snprintf(e->status,sizeof e->status,"copied line %d",(int)e->cy+1);
+      if(e->clip) ed_sys_copy(e->clip,e->cliplen); }
+}
+
+/* Text selection: ordered (sy,sx)-(ey,ex) between anchor and cursor */
+static void ed_sel_norm(Editor *e,size_t *sy,size_t *sx,size_t *ey,size_t *ex){
+    *sy=e->sel_ay; *sx=e->sel_ax; *ey=e->cy; *ex=e->cx;
+    if(*ey<*sy||(*ey==*sy&&*ex<*sx)){
+        size_t t=*sy;*sy=*ey;*ey=t; t=*sx;*sx=*ex;*ex=t;
+    }
+    /* stale anchor (file shrank underneath): clamp into range */
+    if(e->n==0){ *sy=*ey=0; *sx=*ex=0; return; }
+    if(*sy>=e->n) *sy=e->n-1;
+    if(*ey>=e->n) *ey=e->n-1;
+    if(*sx>e->ln[*sy].len) *sx=e->ln[*sy].len;
+    if(*ex>e->ln[*ey].len) *ex=e->ln[*ey].len;
+}
+static int ed_sel_empty(Editor *e){
+    size_t sy,sx,ey,ex;
+    if(!e->sel_on) return 1;
+    ed_sel_norm(e,&sy,&sx,&ey,&ex);
+    return sy==ey&&sx==ex;
+}
+/* Delete the selected range; cursor lands on its start */
+static void ed_sel_delete(Editor *e){
+    size_t sy,sx,ey,ex,k;
+    if(ed_sel_empty(e)) return;
+    ed_sel_norm(e,&sy,&sx,&ey,&ex);
+    if(sy==ey){
+        EdLine *l=&e->ln[sy];
+        memmove(l->b+sx,l->b+ex,l->len-ex+1);
+        l->len-=ex-sx;
+    } else {
+        EdLine *a=&e->ln[sy], *b=&e->ln[ey];
+        ed_line_reserve(a,b->len-ex);
+        memcpy(a->b+sx,b->b+ex,b->len-ex);
+        a->len=sx+(b->len-ex); a->b[a->len]=0;
+        for(k=sy+1;k<=ey;k++) free(e->ln[k].b);
+        memmove(&e->ln[sy+1],&e->ln[ey+1],(e->n-ey-1)*sizeof(EdLine));
+        e->n-=ey-sy;
+    }
+    e->cy=sy; e->cx=sx; e->sel_on=0;
+    e->dirty=1; e->status[0]=0;
+}
+/* Copy selection (with newlines) into the line clipboard */static void ed_copy_sel(Editor *e){
+    size_t sy,sx,ey,ex,k,total=0;
+    char *p;
+    ed_sel_norm(e,&sy,&sx,&ey,&ex);
+    for(k=sy;k<=ey;k++){
+        EdLine *l=&e->ln[k];
+        size_t a=(k==sy)?sx:0, b=(k==ey)?ex:l->len;
+        if(b>a) total+=b-a;
+        if(k<ey) total++;
+    }
+    free(e->clip); e->clip=NULL; e->cliplen=0;
+    if(!total){ snprintf(e->status,sizeof e->status,"nothing selected"); return; }
+    p=e->clip=(char*)lmalloc(total+1);
+    for(k=sy;k<=ey;k++){
+        EdLine *l=&e->ln[k];
+        size_t a=(k==sy)?sx:0, b=(k==ey)?ex:l->len;
+        if(b>a){ memcpy(p,l->b+a,b-a); p+=b-a; }
+        if(k<ey) *p++='\n';
+    }
+    *p=0; e->cliplen=total;
+    snprintf(e->status,sizeof e->status,"copied %d char(s)",(int)total);
+    if(e->clip) ed_sys_copy(e->clip,e->cliplen);
+}
+
+/* Windows clipboard (UTF-8); lets ^C/^V cross into other apps */
+static int ed_sys_copy(const char *s,size_t len){
+    int wlen;
+    HGLOBAL h; wchar_t *w;
+    if(len==0||len>0x7FFFFF00) return 0;
+    wlen=MultiByteToWideChar(CP_UTF8,0,s,(int)len,NULL,0);
+    if(wlen<=0) return 0;
+    h=GlobalAlloc(GMEM_MOVEABLE,(wlen+1)*sizeof(wchar_t));
+    if(!h) return 0;
+    w=(wchar_t*)GlobalLock(h);
+    MultiByteToWideChar(CP_UTF8,0,s,(int)len,w,wlen); w[wlen]=0;
+    GlobalUnlock(h);
+    if(!OpenClipboard(NULL)){ GlobalFree(h); return 0; }
+    EmptyClipboard();
+    SetClipboardData(CF_UNICODETEXT,h);   /* system owns h now */
+    CloseClipboard();
+    return 1;
+}
+/* Returns malloc'd UTF-8 text or NULL; caller frees */
+static char *ed_sys_paste(size_t *outlen){
+    HGLOBAL h; const wchar_t *w; int n; char *s;
+    *outlen=0;
+    if(!OpenClipboard(NULL)) return NULL;
+    h=GetClipboardData(CF_UNICODETEXT);
+    if(!h){ CloseClipboard(); return NULL; }
+    w=(const wchar_t*)GlobalLock(h);
+    if(!w){ CloseClipboard(); return NULL; }
+    n=WideCharToMultiByte(CP_UTF8,0,w,-1,NULL,0,NULL,NULL);
+    if(n<=1){ GlobalUnlock(h); CloseClipboard(); return NULL; }
+    s=(char*)malloc((size_t)n);
+    if(!s){ GlobalUnlock(h); CloseClipboard(); return NULL; }
+    WideCharToMultiByte(CP_UTF8,0,w,-1,s,n,NULL,NULL);
+    GlobalUnlock(h); CloseClipboard();
+    *outlen=(size_t)(n-1);
+    return s;
+}
+
+/* Undo/redo: whole-buffer snapshots, typing coalesced by time */
+static void ed_undo_ser(Editor *e,EdUndo *u){
+    size_t total=0, k;
+    char *p;
+    for(k=0;k<e->n;k++) total+=e->ln[k].len+1;
+    p=(char*)lmalloc(total+1);
+    u->data=p; u->len=total;
+    for(k=0;k<e->n;k++){
+        memcpy(p,e->ln[k].b,e->ln[k].len); p+=e->ln[k].len; *p++='\n';
+    }
+    *p=0;
+    u->cy=e->cy; u->cx=e->cx; u->top=e->top; u->dirty=e->dirty;
+}
+static void ed_undo_clear(Editor *e){
+    int i;
+    for(i=0;i<e->un_n;i++) free(e->un[i].data);
+    for(i=0;i<e->rn_n;i++) free(e->rn[i].data);
+    free(e->un); free(e->rn);
+    e->un=e->rn=NULL; e->un_n=e->un_cap=e->rn_n=e->rn_cap=0;
+    e->un_last_op=-1; e->un_last_time=0;
+}
+/* Snapshot before a mutation; op=1 typing-like (coalesced), op=0 always */
+static void ed_undo_push(Editor *e,int op){
+    EdUndo u;
+    double now=luc_now();
+    ed_clamp(e);
+    if(op==1&&e->un_last_op==1&&now-e->un_last_time<1.5) return;
+    ed_undo_ser(e,&u);
+    if(e->un_n>=ED_UNDOMAX){
+        free(e->un[0].data);
+        memmove(&e->un[0],&e->un[1],sizeof(EdUndo)*(ED_UNDOMAX-1));
+        e->un_n=ED_UNDOMAX-1;
+    }
+    if(e->un_n==e->un_cap){
+        e->un_cap=e->un_cap?e->un_cap*2:16;
+        e->un=(EdUndo*)lrealloc(e->un,sizeof(EdUndo)*(size_t)e->un_cap);
+    }
+    e->un[e->un_n++]=u;
+    { int i; for(i=0;i<e->rn_n;i++) free(e->rn[i].data); e->rn_n=0; }
+    e->un_last_op=op; e->un_last_time=now;
+}
+static void ed_undo_apply(Editor *e,EdUndo *u){
+    size_t k, s=0, n=1, at=0;
+    for(k=0;k<e->n;k++) free(e->ln[k].b);
+    free(e->ln); e->ln=NULL; e->n=0; e->cap=0;
+    for(k=0;k<u->len;k++) if(u->data[k]=='\n') n++;
+    if(n>0&&u->len>0&&u->data[u->len-1]=='\n') n--;   /* drop trailing empty */
+    if(n==0) n=1;
+    e->ln=(EdLine*)lmalloc(sizeof(EdLine)*n); e->cap=n;
+    for(k=0;k<n;k++){ e->ln[k].b=NULL; e->ln[k].len=0; e->ln[k].cap=0; }
+    e->n=n;
+    for(k=0;k<n;k++){
+        size_t j=at;
+        while(j<u->len&&u->data[j]!='\n') j++;
+        { size_t el=j-at;
+          ed_line_reserve(&e->ln[k],el);
+          if(el) memcpy(e->ln[k].b,u->data+at,el);
+          e->ln[k].b[el]=0; e->ln[k].len=el; }
+        at=j+1;
+    }
+    e->cy=u->cy; e->cx=u->cx; e->top=u->top; e->dirty=u->dirty;
+    e->sel_on=0; e->status[0]=0;
+    ed_clamp(e);
+}
+static void ed_undo(Editor *e){
+    EdUndo cur;
+    if(!e->un_n){ snprintf(e->status,sizeof e->status,"nothing to undo"); return; }
+    ed_undo_ser(e,&cur);
+    if(e->rn_n==e->rn_cap){
+        e->rn_cap=e->rn_cap?e->rn_cap*2:16;
+        e->rn=(EdUndo*)lrealloc(e->rn,sizeof(EdUndo)*(size_t)e->rn_cap);
+    }
+    e->rn[e->rn_n++]=cur;
+    { EdUndo u=e->un[--e->un_n];
+      ed_undo_apply(e,&u); free(u.data); }
+    e->un_last_op=-1;
+}
+static void ed_redo(Editor *e){
+    EdUndo cur, u;
+    if(!e->rn_n){ snprintf(e->status,sizeof e->status,"nothing to redo"); return; }
+    ed_undo_ser(e,&cur);
+    if(e->un_n>=ED_UNDOMAX){
+        free(e->un[0].data);
+        memmove(&e->un[0],&e->un[1],sizeof(EdUndo)*(ED_UNDOMAX-1));
+        e->un_n=ED_UNDOMAX-1;
+    }
+    if(e->un_n==e->un_cap){
+        e->un_cap=e->un_cap?e->un_cap*2:16;
+        e->un=(EdUndo*)lrealloc(e->un,sizeof(EdUndo)*(size_t)e->un_cap);
+    }
+    e->un[e->un_n++]=cur;
+    u=e->rn[--e->rn_n];
+    ed_undo_apply(e,&u); free(u.data);
+    e->un_last_op=-1;
 }
 
 static void ed_load(Editor *e);
@@ -4713,6 +4978,7 @@ static int ed_save_to(EdLine *ln,size_t n,const char *path){
 
 static int ed_save(Editor *e){
     if(!e->path[0]){ snprintf(e->status,sizeof e->status,"no file open"); return 0; }
+    if(e->is_binary){ snprintf(e->status,sizeof e->status,"cannot save a binary file"); return 0; }
     if(!ed_save_to(e->ln,e->n,e->path)){ snprintf(e->status,sizeof e->status,"cannot write '%s'",e->path); return 0; }
     e->dirty=0; e->quit_arm=0;
     snprintf(e->status,sizeof e->status,"saved %d line(s) to '%s'",(int)e->n,e->path);
@@ -4731,9 +4997,10 @@ static void ed_stash_current(Editor *e){
         e->stash=(EdStash*)lrealloc(e->stash,sizeof(EdStash)*e->scap); }
     s=&e->stash[e->nstash++];
     s->ln=e->ln; s->n=e->n; s->cap=e->cap; s->cx=e->cx; s->cy=e->cy; s->top=e->top;
-    s->dirty=e->dirty;
+    s->dirty=e->dirty; s->is_binary=e->is_binary;
     snprintf(s->path,sizeof s->path,"%s",e->path);
     e->ln=NULL; e->n=0; e->cap=0; e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0;
+    e->is_binary=0;
 }
 
 static int ed_unstash(Editor *e,const char *path){
@@ -4741,7 +5008,7 @@ static int ed_unstash(Editor *e,const char *path){
     for(i=0;i<e->nstash;i++) if(!strcmp(e->stash[i].path,path)){
         e->ln=e->stash[i].ln; e->n=e->stash[i].n; e->cap=e->stash[i].cap;
         e->cx=e->stash[i].cx; e->cy=e->stash[i].cy; e->top=e->stash[i].top;
-        e->dirty=e->stash[i].dirty;
+        e->dirty=e->stash[i].dirty; e->is_binary=e->stash[i].is_binary;
         snprintf(e->path,sizeof e->path,"%s",path);
         memmove(&e->stash[i],&e->stash[i+1],(e->nstash-i-1)*sizeof(EdStash));
         e->nstash--;
@@ -4754,6 +5021,8 @@ static int ed_unstash(Editor *e,const char *path){
 static void ed_open_path(Editor *e,const char *full){
     if(e->path[0] && !strcmp(e->path,full)){ e->focus=0; return; }
     ed_stash_current(e);
+    ed_undo_clear(e);   /* undo history belongs to the old buffer */
+    e->sug_on=0;        /* suggestions belong to the old buffer too */
     if(ed_unstash(e,full)){ e->focus=0; e->quit_arm=0; return; }
     snprintf(e->path,sizeof e->path,"%s",full);
     e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0; e->quit_arm=0;
@@ -4769,11 +5038,11 @@ static int ed_unsaved_count(Editor *e){
 
 static void ed_save_all(Editor *e){
     size_t i; int done=0, unnamed=0;
-    if(e->dirty){
+    if(e->dirty && !e->is_binary){
         if(e->path[0] && ed_save_to(e->ln,e->n,e->path)){ e->dirty=0; done++; }
         else unnamed++;
     }
-    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty){
+    for(i=0;i<e->nstash;i++) if(e->stash[i].dirty && !e->stash[i].is_binary){
         if(ed_save_to(e->stash[i].ln,e->stash[i].n,e->stash[i].path)){ e->stash[i].dirty=0; done++; }
         else unnamed++;
     }
@@ -4810,8 +5079,21 @@ static void ed_rename_paths(Editor *e,const char *oldp,const char *newp){
 static void ed_load(Editor *e){
     int len=0;
     char *src=read_file(e->path,&len);
-    e->n=0; e->cap=0; e->ln=NULL;
+    e->n=0; e->cap=0; e->ln=NULL; e->is_binary=0;
     if(!src){ ed_ins_line(e,0); snprintf(e->status,sizeof e->status,"new file '%s'",e->path); return; }
+    { int i;
+      for(i=0;i<len;i++) if(!src[i]) break;
+      if(i<len){
+          ed_ins_line(e,0);
+          { const char *msg="[binary file - not shown]";
+            EdLine *l=&e->ln[0];
+            ed_line_reserve(l,strlen(msg));
+            memcpy(l->b,msg,strlen(msg)+1); l->len=strlen(msg); }
+          e->is_binary=1;
+          snprintf(e->status,sizeof e->status,"binary file '%s' - not opened",e->path);
+          free(src);
+          return;
+      } }
     { int i=0,s=0;
       for(i=0;i<=len;i++){
           if(i==len||src[i]=='\n'){
@@ -4836,6 +5118,10 @@ static void ed_free(Editor *e){
     size_t i;
     for(i=0;i<e->n;i++) free(e->ln[i].b);
     free(e->ln); free(e->clip);
+    ex_free(e);
+    ed_undo_clear(e);
+    for(i=0;i<e->nstash;i++){ size_t k; for(k=0;k<e->stash[i].n;k++) free(e->stash[i].ln[k].b); free(e->stash[i].ln); }
+    free(e->stash); e->stash=NULL; e->nstash=0; e->scap=0;
 }
 
 /* LC syntax colors */
@@ -4846,9 +5132,78 @@ static void ed_free(Editor *e){
 #define EC_COM 4     /* Comments */
 #define EC_FN 5      /* Calls */
 #define EC_DIR 6     /* Directives */
-static const char *EC_SEQ[]={ "",
+static char EC_SEQ[7][32]={ "",
     "38;2;197;134;192", "38;2;206;145;120", "38;2;181;206;168",
     "38;2;106;153;85", "38;2;220;220;170", "38;2;86;156;214" };
+
+/* Syntax languages (the luc plugin gates everything but LUC itself) */
+enum { L_NONE=0, L_LUC, L_C, L_PY, L_JS, L_LUA, L_PS, L_SH, L_JSON, L_MD };
+static int ed_lang(const char *path){
+    const char *d=strrchr(path,'.');
+    char e[16]; size_t k;
+    if(!d||d==path||!d[1]) return L_NONE;
+    d++;
+    for(k=0;k<sizeof e-1&&d[k];k++){
+        char c=d[k]; e[k]=(c>='A'&&c<='Z')?(char)(c+32):c;
+    }
+    e[k]=0;
+    if(!strcmp(e,"luc")) return L_LUC;
+    if(!strcmp(e,"c")||!strcmp(e,"h")||!strcmp(e,"cpp")||!strcmp(e,"hpp")||
+       !strcmp(e,"cc")||!strcmp(e,"cxx")) return L_C;
+    if(!strcmp(e,"py")) return L_PY;
+    if(!strcmp(e,"js")||!strcmp(e,"mjs")||!strcmp(e,"ts")||!strcmp(e,"tsx")||
+       !strcmp(e,"jsx")) return L_JS;
+    if(!strcmp(e,"lua")) return L_LUA;
+    if(!strcmp(e,"ps1")) return L_PS;
+    if(!strcmp(e,"sh")) return L_SH;
+    if(!strcmp(e,"json")) return L_JSON;
+    if(!strcmp(e,"md")||!strcmp(e,"markdown")) return L_MD;
+    return L_NONE;
+}
+static int ed_is_kw_lang(int lang,const char *s,size_t n){
+    static const char *c_kw[]={
+        "auto","break","case","char","const","continue","default","do","double",
+        "else","enum","extern","float","for","goto","if","int","long","return",
+        "short","signed","sizeof","static","struct","switch","typedef","union",
+        "unsigned","void","volatile","while","NULL","true","false",NULL};
+    static const char *py_kw[]={
+        "False","None","True","and","as","assert","break","class","continue",
+        "def","elif","else","except","finally","for","from","global","if",
+        "import","in","is","lambda","not","or","pass","raise","return","try",
+        "while","with","yield","self","print",NULL};
+    static const char *js_kw[]={
+        "await","break","case","catch","class","const","continue","debugger",
+        "default","delete","do","else","export","extends","finally","for",
+        "function","if","import","in","instanceof","let","new","of","return",
+        "super","switch","this","throw","try","typeof","var","void","while",
+        "with","yield","true","false","null","undefined",NULL};
+    static const char *lua_kw[]={
+        "and","break","do","else","elseif","end","false","for","function","if",
+        "in","local","nil","not","or","repeat","return","then","true","until",
+        "while","print","require",NULL};
+    static const char *ps_kw[]={
+        "function","param","return","if","else","elseif","foreach","for",
+        "while","do","switch","break","continue","true","false","null","try",
+        "catch","throw",NULL};
+    static const char *json_kw[]={"true","false","null",NULL};
+    const char **t=NULL;
+    int i;
+    if(lang==L_C) t=c_kw;
+    else if(lang==L_PY) t=py_kw;
+    else if(lang==L_JS) t=js_kw;
+    else if(lang==L_LUA) t=lua_kw;
+    else if(lang==L_PS) t=ps_kw;
+    else if(lang==L_JSON) t=json_kw;
+    else return 0;
+    for(i=0;t[i];i++){ size_t k=0; while(k<n&&t[i][k]&&t[i][k]==s[k]) k++;
+        if(k==n&&t[i][k]==0) return 1; }
+    return 0;
+}
+/* Leading whitespace only before byte k (for # directives/headers) */
+static int ed_is_lead(char *b,size_t k){
+    while(k>0){ k--; if(b[k]!=' '&&b[k]!='\t') return 0; }
+    return 1;
+}
 
 static int ed_is_kw(const char *s,size_t n){
     static const char *kw[]={
@@ -4862,23 +5217,88 @@ static int ed_is_kw(const char *s,size_t n){
     return 0;
 }
 
-#define EC_LINEBG "\x1b[48;2;42;45;46m"   /* Cursor-line bg */
-#define EC_CODEBG "\x1b[48;2;30;30;30m"   /* Code pane bg */
-#define EC_EXBG "\x1b[48;2;17;17;17m"     /* Explorer pane bg */
-#define EC_TOPBG "\x1b[48;2;22;22;22m"    /* Top strip bg */
+/* Pane + selection backgrounds and bright/dim text (rewritten by :theme) */
+static char EC_LINEBG[32]="\x1b[48;2;42;45;46m";   /* Cursor-line bg */
+static char EC_CODEBG[32]="\x1b[48;2;30;30;30m";   /* Code pane bg */
+static char EC_EXBG[32]="\x1b[48;2;17;17;17m";     /* Explorer pane bg */
+static char EC_TOPBG[32]="\x1b[48;2;22;22;22m";    /* Top strip bg */
+static char EC_LOGBG[32]="\x1b[48;2;37;37;37m";    /* Log panel bg */
+static char EC_SELBG[32]="\x1b[48;2;38;79;120m";   /* Text selection bg */
+static char TH_TCUR[32]="\x1b[97m";                /* Bright text (gutter current, title) */
+static char TH_TDIM[32]="\x1b[90m";                /* Dim text (gutter, hints) */
+
+typedef struct { const char *name;
+    const char *code,*line,*ex,*top,*log,*sel;
+    const char *key,*str,*num,*com,*fn,*dir;
+    const char *tcur,*tdim; } ThemeDef;
+static const ThemeDef THEMES[]={
+    {"dark","48;2;30;30;30","48;2;42;45;46","48;2;17;17;17","48;2;22;22;22",
+     "48;2;37;37;37","48;2;38;79;120",
+     "38;2;197;134;192","38;2;206;145;120","38;2;181;206;168","38;2;106;153;85",
+     "38;2;220;220;170","38;2;86;156;214","97","90"},
+    {"light","48;2;255;255;255","48;2;240;240;240","48;2;243;243;243","48;2;225;225;226",
+     "48;2;248;248;248","48;2;173;214;255",
+     "38;2;175;0;192","38;2;163;21;21","38;2;9;134;88","38;2;0;128;0",
+     "38;2;121;94;38","38;2;0;0;255","30","38;2;110;110;110"},
+    {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL}
+};
+#define ED_NTHEMES 2
+static char ed_theme_cur[16]="dark";
+static int ed_theme_apply(const char *name){
+    int i;
+    for(i=0;i<ED_NTHEMES;i++){
+        const ThemeDef *t=&THEMES[i];
+        if(strcmp(t->name,name)) continue;
+        snprintf(EC_CODEBG,sizeof EC_CODEBG,"\x1b[%sm",t->code);
+        snprintf(EC_LINEBG,sizeof EC_LINEBG,"\x1b[%sm",t->line);
+        snprintf(EC_EXBG,sizeof EC_EXBG,"\x1b[%sm",t->ex);
+        snprintf(EC_TOPBG,sizeof EC_TOPBG,"\x1b[%sm",t->top);
+        snprintf(EC_LOGBG,sizeof EC_LOGBG,"\x1b[%sm",t->log);
+        snprintf(EC_SELBG,sizeof EC_SELBG,"\x1b[%sm",t->sel);
+        snprintf(EC_SEQ[1],sizeof EC_SEQ[1],"%s",t->key);
+        snprintf(EC_SEQ[2],sizeof EC_SEQ[2],"%s",t->str);
+        snprintf(EC_SEQ[3],sizeof EC_SEQ[3],"%s",t->num);
+        snprintf(EC_SEQ[4],sizeof EC_SEQ[4],"%s",t->com);
+        snprintf(EC_SEQ[5],sizeof EC_SEQ[5],"%s",t->fn);
+        snprintf(EC_SEQ[6],sizeof EC_SEQ[6],"%s",t->dir);
+        snprintf(TH_TCUR,sizeof TH_TCUR,"\x1b[%sm",t->tcur);
+        snprintf(TH_TDIM,sizeof TH_TDIM,"\x1b[%sm",t->tdim);
+        snprintf(ed_theme_cur,sizeof ed_theme_cur,"%s",t->name);
+        return 1;
+    }
+    return 0;
+}
 static int ed_hl_bg = 0;   /* 0 plain, 1 code bg, 2 line bg */
+static int ed_hl_wantsel = 0; /* current byte is inside the text selection */
+static int ed_hl_selon = 0;   /* selection bg currently on */
 static void ed_hl_emit(int code,int *cur){
-    if(code==*cur) return;
-    if(code) printf("\x1b[%sm",EC_SEQ[code]);
-    else if(ed_hl_bg==2) printf("\x1b[0m" EC_LINEBG);
-    else if(ed_hl_bg==1) printf("\x1b[0m" EC_CODEBG);
-    else printf("\x1b[0m");
-    *cur=code;
+    if(code!=*cur){
+        if(code) printf("\x1b[%sm",EC_SEQ[code]);
+        else if(ed_hl_bg==2) printf("\x1b[0m%s",EC_LINEBG);
+        else if(ed_hl_bg==1) printf("\x1b[0m%s",EC_CODEBG);
+        else printf("\x1b[0m");
+        *cur=code; ed_hl_selon=0;
+    }
+    /* selection sits on top of syntax colors (bg swap keeps fg readable) */
+    if(ed_hl_wantsel&&!ed_hl_selon){ printf(EC_SELBG); ed_hl_selon=1; }
+    else if(!ed_hl_wantsel&&ed_hl_selon){
+        if(ed_hl_bg==2) printf(EC_LINEBG);
+        else if(ed_hl_bg==1) printf(EC_CODEBG);
+        else printf("\x1b[49m");
+        ed_hl_selon=0;
+    }
 }
 
 /* Track block state per line; closer is ]=lvl] */
-static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
+static void ed_scan_state(char *b,size_t len,int *cm,int *stt,int lang){
     size_t k=0;
+    if(*cm==-2){   /* inside a C block comment */
+        while(k<len){
+            if(b[k]=='*'&&k+1<len&&b[k+1]=='/'){ k+=2; *cm=-1; break; }
+            k++;
+        }
+        if(*cm>=0||*stt>=0) return;
+    }
     if(*cm>=0||*stt>=0){
         int lvl=(*cm>=0)?*cm:*stt;
         while(k<len){
@@ -4889,20 +5309,27 @@ static void ed_scan_state(char *b,size_t len,int *cm,int *stt){
         }
         if(*cm>=0||*stt>=0) return;
     }
-    { int q=0;
+    { int q=0, lead=1;
       while(k<len){
           unsigned char c=(unsigned char)b[k];
           if(q==1){ if(c=='\\'){k+=2;continue;} if(c=='"') q=0; k++; continue; }
           if(q==2){ if(c=='\\'){k+=2;continue;} if(c=='\'') q=0; k++; continue; }
           if(c=='"'){q=1;k++;continue;}
           if(c=='\''){q=2;k++;continue;}
-          if(c=='-'&&k+1<len&&b[k+1]=='-'){
+          if(c!=' '&&c!='\t') lead=0;
+          if((lang==L_C||lang==L_JS)&&c=='/'&&k+1<len&&b[k+1]=='/') return;
+          if((lang==L_PY||lang==L_SH||lang==L_PS)&&c=='#') return;
+          if(lang==L_C&&c=='#'&&lead) return;
+          if(lang==L_MD&&c=='#'&&lead) return;
+          if((lang==L_C||lang==L_JS)&&c=='/'&&k+1<len&&b[k+1]=='*'){ *cm=-2; return; }
+          if((lang==L_LUC||lang==L_LUA)&&c=='-'&&k+1<len&&b[k+1]=='-'){
               size_t j=k+2; int e=0;
               if(j<len&&b[j]=='['){ j++; while(j<len&&b[j]=='='&&e<64){e++;j++;}
                   if(j<len&&b[j]=='['){ *cm=e; return; } }
               return;
           }
-          if(c=='['){ size_t j=k+1; int e=0;
+          if((lang==L_LUC||lang==L_LUA)&&c=='['){
+              size_t j=k+1; int e=0;
               while(j<len&&b[j]=='='&&e<64){e++;j++;}
               if(e>0&&j<len&&b[j]=='['){ *stt=e; return; } }
           k++;
@@ -4914,25 +5341,53 @@ static void ed_tab_out(int *w,int *col,int maxw){
     int tw=4-((*col)%4), q;
     for(q=0;q<tw&&*w<maxw;q++){ fputc(' ',stdout); (*w)++; (*col)++; }
 }
-static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int cm,int stt){
+/* Render to end of line in one color (shared by --, // and # comments) */
+static void ed_hl_eol(char *b,size_t len,size_t start,int maxw,size_t *k,int *col,
+                       int *w,int *done,int has_sel,size_t sel_s,size_t sel_e,
+                       int color,int *cur){
+    while(*k<len){
+        unsigned char c=(unsigned char)b[*k];
+        if(*k>=start&&*w<maxw){
+            ed_hl_wantsel=has_sel&&*k>=sel_s&&*k<sel_e;
+            ed_hl_emit(color,cur);
+            if(c=='\t') ed_tab_out(w,col,maxw);
+            else { fputc(c,stdout); (*w)++; (*col)++; }
+        }
+        else if(*k>=start){ *done=1; break; }
+        else *col+=ed_chw(c,*col);
+        (*k)++;
+    }
+}
+static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int lang,int cm,int stt,
+                       int has_sel,size_t sel_s,size_t sel_e){
     size_t k=0;
     int w=0, col=0, cur=EC_NONE, done=0;
     int st=0, lvl=0;   /* 0 code, 1 dqs, 2 sqs, 3 block */
-    if(cm>0){ st=3; lvl=cm-1; }
+    if(cm==-2){ st=3; lvl=-2; }
+    else if(cm>0){ st=3; lvl=cm-1; }
     else if(stt>0){ st=4; lvl=stt-1; }
+    ed_hl_wantsel=0; ed_hl_selon=0;
     while(k<start){ col+=ed_chw((unsigned char)b[k],col); k++; }
     /* block entry color */
     if(st==3&&start==0) ed_hl_emit(EC_COM,&cur);
     if(st==4&&start==0) ed_hl_emit(EC_STR,&cur);
     while(k<len&&!done){
+        ed_hl_wantsel = has_sel && k>=sel_s && k<sel_e;
         unsigned char c=(unsigned char)b[k];
         if(st==3||st==4){
             int want=(st==3)?EC_COM:EC_STR;
-            if(c==']'){ size_t j=k+1; int e=0;
+            if(lvl==-2){   /* C block: closer is star-slash */
+                if(c=='*'&&k+1<len&&b[k+1]=='/'){
+                    size_t m;
+                    for(m=k;m<k+2;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+                    k+=2; st=0; continue;
+                }
+            }
+            else if(c==']'){ size_t j=k+1; int e=0;
                 while(j<len&&b[j]=='='&&e<lvl){e++;j++;}
                 if(e==lvl&&j<len&&b[j]==']'){
                     size_t m;
-                    for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+                    for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(want,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                     k=j+1; st=0; continue;
                 } }
             if(k>=start&&w<maxw){
@@ -4961,15 +5416,30 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
             k++; continue;
         }
         /* code mode */
-        if(c=='-'&&k+1<len&&b[k+1]=='-'){
-            while(k<len){ c=(unsigned char)b[k];
-                if(k>=start&&w<maxw){ ed_hl_emit(EC_COM,&cur);
-                    if(c=='\t') ed_tab_out(&w,&col,maxw);
-                    else { fputc(c,stdout); w++; col++; } }
-                else if(k>=start) { done=1; break; }
-                else col+=ed_chw(c,col);
-                k++; }
+        if((lang==L_LUC||lang==L_LUA)&&c=='-'&&k+1<len&&b[k+1]=='-'){
+            ed_hl_eol(b,len,start,maxw,&k,&col,&w,&done,has_sel,sel_s,sel_e,EC_COM,&cur);
             continue;
+        }
+        if((lang==L_C||lang==L_JS)&&c=='/'&&k+1<len&&b[k+1]=='/'){
+            ed_hl_eol(b,len,start,maxw,&k,&col,&w,&done,has_sel,sel_s,sel_e,EC_COM,&cur);
+            continue;
+        }
+        if((lang==L_PY||lang==L_SH||lang==L_PS)&&c=='#'){
+            ed_hl_eol(b,len,start,maxw,&k,&col,&w,&done,has_sel,sel_s,sel_e,EC_COM,&cur);
+            continue;
+        }
+        if((lang==L_C||lang==L_MD)&&c=='#'&&ed_is_lead(b,k)){
+            ed_hl_eol(b,len,start,maxw,&k,&col,&w,&done,has_sel,sel_s,sel_e,EC_DIR,&cur);
+            continue;
+        }
+        if((lang==L_C||lang==L_JS)&&c=='/'&&k+1<len&&b[k+1]=='*'){
+            size_t m;
+            for(m=k;m<k+2;m++){
+                if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(EC_COM,&cur); fputc(b[m],stdout); w++; col++; }
+                else if(m>=start){ done=1; break; }
+                else col++;
+            }
+            k+=2; st=3; lvl=-2; continue;
         }
         if((c=='"'||c=='\'')){
             st=(c=='"')?1:2;
@@ -4978,25 +5448,36 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
             else col++;
             k++; continue;
         }
-        if(is_luc&&c=='['){
+        if((lang==L_LUC||lang==L_LUA)&&c=='['){
             size_t j=k+1; int e=0;
             while(j<len&&b[j]=='='&&e<64){e++;j++;}
             if(e>0&&j<len&&b[j]=='['){
                 size_t m;
-                for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_STR,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+                for(m=k;m<=j;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(EC_STR,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                 k=j+1; st=4; lvl=e; continue;
+            }
+        }
+        if(lang==L_PS&&c=='$'){
+            size_t j=k+1;
+            while(j<len){ unsigned char d=(unsigned char)b[j];
+                if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||(d>='0'&&d<='9')||d=='_'||d>=128) j++; else break; }
+            if(j>k+1){
+                size_t m;
+                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(EC_FN,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+                if(j>k&&j-1>=start&&w>=maxw) done=1;
+                k=j; continue;
             }
         }
         if((c>='A'&&c<='Z')||(c>='a'&&c<='z')||c=='_'||c>=128){
             size_t j=k;
             while(j<len){ unsigned char d=(unsigned char)b[j];
                 if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||(d>='0'&&d<='9')||d=='_'||d>=128) j++; else break; }
-            { int iskw=is_luc&&ed_is_kw(b+k,j-k);
+            { int iskw=(lang==L_LUC)?ed_is_kw((char*)b+k,j-k):ed_is_kw_lang(lang,(char*)b+k,j-k);
               int iscall=0;
               if(!iskw){ size_t m=j; while(m<len&&(b[m]==' '||b[m]=='\t')) m++;
                   if(m<len&&b[m]=='(') iscall=1; }
               { size_t m;
-                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(iskw?EC_KEY:(iscall?EC_FN:EC_NONE),&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+                for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(iskw?EC_KEY:(iscall?EC_FN:EC_NONE),&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
                 if(j>k&&j-1>=start&&w>=maxw) done=1; }
               k=j; continue; }
         }
@@ -5006,18 +5487,18 @@ static void ed_hl_line(char *b,size_t len,size_t start,int maxw,int is_luc,int c
                 if((d>='0'&&d<='9')||(d>='a'&&d<='f')||(d>='A'&&d<='F')) j++; else break; } }
             else { while(j<len&&((b[j]>='0'&&b[j]<='9')||b[j]=='.')) j++; }
             { size_t m;
-              for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_emit(EC_NUM,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
+              for(m=k;m<j;m++){ if(m>=start&&w<maxw){ ed_hl_wantsel=has_sel&&m>=sel_s&&m<sel_e; ed_hl_emit(EC_NUM,&cur); fputc(b[m],stdout); w++; col++; } else if(m>=start) done=1; else col++; }
               if(j>k&&j-1>=start&&w>=maxw) done=1; }
             k=j; continue;
         }
-        /* directives: !word at first token */
-        if(c=='!'&&is_luc){
+        /* directives: !word at first token (LUC only) */
+        if(c=='!'&&lang==L_LUC){
             size_t m=k; int lead=1, p;
             for(p=(int)k-1;p>=0;p--){ if(b[p]!=' '&&b[p]!='\t'){lead=0;break;} }
             if(lead){ m++; while(m<len){ unsigned char d=(unsigned char)b[m];
                 if((d>='A'&&d<='Z')||(d>='a'&&d<='z')||d=='_') m++; else break; }
                 if(m>k+1){ size_t q;
-                    for(q=k;q<m;q++){ if(q>=start&&w<maxw){ ed_hl_emit(EC_DIR,&cur); fputc(b[q],stdout); w++; col++; } else if(q>=start) done=1; else col++; }
+                    for(q=k;q<m;q++){ if(q>=start&&w<maxw){ ed_hl_wantsel=has_sel&&q>=sel_s&&q<sel_e; ed_hl_emit(EC_DIR,&cur); fputc(b[q],stdout); w++; col++; } else if(q>=start) done=1; else col++; }
                     k=m; continue; } }
         }
         /* plain char (tabs expand, controls placeholder) */
@@ -5048,12 +5529,530 @@ static int ed_ex_color(const char *nm,int isdir){
       return 0; }
 }
 
+/* 1 when the console font looks like a Nerd Font (auto-picks nerd icons) */
+static int ed_console_has_nerd_font(void){
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_FONT_INFOEX fi;
+    const wchar_t *p;
+    memset(&fi,0,sizeof fi); fi.cbSize=sizeof fi;
+    if(!GetCurrentConsoleFontEx(h,FALSE,&fi)) return 0;
+    for(p=fi.FaceName;*p;p++){
+        if((p[0]=='N'||p[0]=='n')&&(p[1]=='E'||p[1]=='e')&&
+           (p[2]=='R'||p[2]=='r')&&(p[3]=='D'||p[3]=='d')) return 1;
+    }
+    return 0;
+}
+/* 1 when a font family is registered with Windows */
+static int ed_font_installed(const char *name){
+    HKEY roots[2]={HKEY_LOCAL_MACHINE,HKEY_CURRENT_USER};
+    int r;
+    for(r=0;r<2;r++){
+        HKEY k;
+        DWORD idx=0;
+        if(RegOpenKeyExA(roots[r],"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts",
+                         0,KEY_READ,&k)!=ERROR_SUCCESS) continue;
+        for(;;){
+            char vn[256]; DWORD vnlen=sizeof vn, type=0;
+            BYTE data[512]; DWORD dlen=sizeof data;
+            LONG rc=RegEnumValueA(k,idx,vn,&vnlen,NULL,&type,data,&dlen);
+            if(rc!=ERROR_SUCCESS) break;
+            idx++;
+            if(type==REG_SZ&&strstr(vn,name)){ RegCloseKey(k); return 1; }
+        }
+        RegCloseKey(k);
+    }
+    return 0;
+}
+/* Point this console window at the bundled Nerd Font when it is installed
+   but not active (conhost honors it; Windows Terminal ignores the call) */
+static void ed_font_ensure(void){
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_FONT_INFOEX fi;
+    static const wchar_t want[]=L"FiraCode Nerd Font Mono";
+    size_t k;
+    if(ed_console_has_nerd_font()) return;
+    if(!ed_font_installed("FiraCode Nerd Font Mono")) return;
+    memset(&fi,0,sizeof fi); fi.cbSize=sizeof fi;
+    if(!GetCurrentConsoleFontEx(h,FALSE,&fi)) return;
+    for(k=0;k<LF_FACESIZE-1&&want[k];k++) fi.FaceName[k]=want[k];
+    fi.FaceName[k]=0;
+    SetCurrentConsoleFontEx(h,FALSE,&fi);
+}
+
+/* Nerd Font devicons (nvim-web-devicons codepoints + colors); 1 cell each */
+typedef struct { const char *ext; unsigned cp; unsigned rgb; } DevIcon;
+static const DevIcon DEVICONS[] = {
+    {"luc",0xE620,0x51A0CF}, {"lua",0xE620,0x51A0CF},
+    {"py",0xE606,0xFFBC03}, {"js",0xE60C,0xCBCB41},
+    {"cjs",0xE60C,0xCBCB41}, {"mjs",0xE60C,0xF1E05A},
+    {"ts",0xE628,0x519ABA}, {"mts",0xE628,0x519ABA},
+    {"cts",0xE628,0x519ABA}, {"tsx",0xE7BA,0x1354BF},
+    {"jsx",0xE625,0x20C2E3}, {"json",0xE60B,0xCBCB41},
+    {"json5",0xE60B,0xCBCB41}, {"jsonc",0xE60B,0xCBCB41},
+    {"md",0xE609,0xDDDDDD}, {"markdown",0xE609,0xDDDDDD},
+    {"txt",0xF15B,0x89E051}, {"log",0xF15B,0xDDDDDD},
+    {"html",0xE736,0xE44D26}, {"htm",0xE60E,0xE34C26},
+    {"css",0xE749,0x663399}, {"scss",0xE749,0xF55385},
+    {"less",0xE749,0x563D7C}, {"c",0xE61E,0x599EFF},
+    {"h",0xE61E,0xA074C4}, {"hh",0xE61E,0xA074C4},
+    {"hpp",0xE61E,0xA074C4}, {"cpp",0xE61D,0x519ABA},
+    {"cc",0xE61D,0xF34B7D}, {"cxx",0xE61D,0x519ABA},
+    {"rs",0xE7A8,0xDEA584}, {"go",0xE627,0x00ADD8},
+    {"java",0xE738,0xCC3E44}, {"rb",0xE791,0x701516},
+    {"php",0xE608,0xA074C4}, {"ps1",0xF120,0x4273CA},
+    {"bat",0xE615,0xC1F12E}, {"sh",0xE795,0x4D5A5E},
+    {"bash",0xE795,0x89E051}, {"exe",0xF15B,0x9F0500},
+    {"dll",0xF15B,0x4D2C0B}, {"so",0xF15B,0xDCDDD6},
+    {"png",0xE60D,0xA074C4}, {"jpg",0xE60D,0xA074C4},
+    {"jpeg",0xE60D,0xA074C4}, {"gif",0xE60D,0xA074C4},
+    {"bmp",0xE60D,0xA074C4}, {"ico",0xE60D,0xCBCB41},
+    {"avif",0xE60D,0xA074C4}, {"webp",0xE60D,0xA074C4},
+    {"svg",0xF1C5,0xFFB13B}, {"wav",0xF001,0x00AFFF},
+    {"mp3",0xF001,0x00AFFF}, {"ogg",0xF001,0x0075AA},
+    {"flac",0xF001,0x0075AA}, {"mp4",0xF008,0xFD971F},
+    {"mkv",0xF008,0xFD971F}, {"avi",0xF008,0xFD971F},
+    {"mov",0xF008,0xFD971F}, {"webm",0xF008,0xFD971F},
+    {"zip",0xF1C6,0xECA517}, {"gz",0xF1C6,0xECA517},
+    {"rar",0xF1C6,0xECA517}, {"7z",0xF1C6,0xECA517},
+    {"tgz",0xF1C6,0xECA517}, {"pdf",0xF1C1,0xB30B00},
+    {"ini",0xE615,0x6D8086}, {"cfg",0xE615,0x6D8086},
+    {"conf",0xE615,0x6D8086}, {"toml",0xE6B2,0x9C4221},
+    {"yml",0xE8EB,0xD70000}, {"yaml",0xE8EB,0xD70000},
+    {"ttf",0xF031,0xECECEC}, {"otf",0xF031,0xECECEC},
+    {"woff",0xF031,0xECECEC}, {"woff2",0xF031,0xECECEC},
+    {"csv",0xE64A,0x89E051}, {"sql",0xE706,0xDAD8D8},
+    {"swift",0xE755,0xE37933}, {"kt",0xE634,0x7F52FF},
+    {"vue",0xE6A0,0x8DC149}, {"lock",0xF023,0xBBBBBB},
+    {"makefile",0xE779,0x6D8086}, {"license",0xE60A,0xCBCB41},
+    {"dockerfile",0xE7B0,0x458EE6},
+    {NULL,0,0}
+};
+static const DevIcon DEVICON_DEF={"",0xF15B,0x6D8086};   /* generic file */
+static const DevIcon *ed_dev_find(const char *key){
+    int i;
+    for(i=0;DEVICONS[i].ext;i++) if(!strcmp(DEVICONS[i].ext,key)) return &DEVICONS[i];
+    return NULL;
+}
+/* Exact filenames first (makefile, dockerfile, license), then extension */
+static const DevIcon *ed_devicon(const char *nm){
+    char low[64]; size_t k;
+    const char *d=strrchr(nm,'.');
+    const DevIcon *f;
+    for(k=0;k<sizeof low-1&&nm[k];k++){
+        char c=nm[k]; low[k]=(c>='A'&&c<='Z')?(char)(c+32):c;
+    }
+    low[k]=0;
+    if(!strcmp(low,"makefile")||!strcmp(low,"gnumakefile")) return ed_dev_find("makefile");
+    if(!strcmp(low,"dockerfile")) return ed_dev_find("dockerfile");
+    if(!strcmp(low,"license")||!strcmp(low,"licence")) return ed_dev_find("license");
+    if(!d||d==nm||!d[1]) return NULL;
+    { char e[16]; size_t j;
+      d++;
+      for(j=0;j<sizeof e-1&&d[j];j++){
+          char c=d[j]; e[j]=(c>='A'&&c<='Z')?(char)(c+32):c;
+      }
+      e[j]=0;
+      f=ed_dev_find(e);
+      return f; }
+}
+/* Encode one codepoint as UTF-8; returns byte count */
+static int ed_cp_utf8(unsigned cp,char *out){
+    if(cp<0x80){ out[0]=(char)cp; return 1; }
+    if(cp<0x800){
+        out[0]=(char)(0xC0|(cp>>6)); out[1]=(char)(0x80|(cp&0x3F)); return 2;
+    }
+    if(cp<0x10000){
+        out[0]=(char)(0xE0|(cp>>12)); out[1]=(char)(0x80|((cp>>6)&0x3F));
+        out[2]=(char)(0x80|(cp&0x3F)); return 3;
+    }
+    out[0]=(char)(0xF0|(cp>>18)); out[1]=(char)(0x80|((cp>>12)&0x3F));
+    out[2]=(char)(0x80|((cp>>6)&0x3F)); out[3]=(char)(0x80|(cp&0x3F)); return 4;
+}
+/* lcode config: %APPDATA%\LUC\lcode.cfg (falls back to %USERPROFILE%\.lcode.cfg) */
+static void ed_cfg_path(char *out,size_t cap){
+    char base[1024]; DWORD n;
+    out[0]=0;
+    n=GetEnvironmentVariableA("APPDATA",base,sizeof base);
+    if(n>0&&n<sizeof base){ snprintf(out,cap,"%s\\LUC\\lcode.cfg",base); return; }
+    n=GetEnvironmentVariableA("USERPROFILE",base,sizeof base);
+    if(n>0&&n<sizeof base) snprintf(out,cap,"%s\\.lcode.cfg",base);
+}
+/* Saved icon mode: 1 nerd, 0 none, -1 no save yet */
+static int ed_cfg_get_icons(void){
+    char p[1024]; FILE *f; char b[128];
+    ed_cfg_path(p,sizeof p);
+    if(!p[0]) return -1;
+    f=fopen(p,"r"); if(!f) return -1;
+    while(fgets(b,sizeof b,f)) if(strstr(b,"nerd")){ fclose(f); return 1; }
+    fclose(f);
+    return 0;
+}
+/* Saved theme name ("" when unset) */
+static void ed_cfg_get_theme(char *out,size_t cap){
+    char p[1024]; FILE *f; char b[128];
+    out[0]=0;
+    ed_cfg_path(p,sizeof p);
+    if(!p[0]) return;
+    f=fopen(p,"r"); if(!f) return;
+    while(fgets(b,sizeof b,f)){
+        if(!strncmp(b,"theme=",6)){
+            size_t k=6, n=0;
+            while(b[k]==' '||b[k]=='\t') k++;
+            while(b[k]&&b[k]!='\r'&&b[k]!='\n'&&n+1<cap){ out[n++]=b[k++]; }
+            out[n]=0;
+            while(n>0&&(out[n-1]==' '||out[n-1]=='\t')) out[--n]=0;
+            break;
+        }
+    }
+    fclose(f);
+}
+/* Saved guides flag (0 when unset) */
+static int ed_cfg_get_guides(void){
+    char p[1024]; FILE *f; char b[128];
+    ed_cfg_path(p,sizeof p);
+    if(!p[0]) return 0;
+    f=fopen(p,"r"); if(!f) return 0;
+    while(fgets(b,sizeof b,f)){
+        if(!strncmp(b,"guides=",7)){
+            int v=(b[7]=='1'||b[7]=='t'||b[7]=='T');
+            fclose(f); return v;
+        }
+    }
+    fclose(f);
+    return 0;
+}
+/* Persist icons + theme + guides together */
+static void ed_cfg_save(Editor *e){
+    char p[1024]; FILE *f; char dir[1024]; size_t n;
+    ed_cfg_path(p,sizeof p);
+    if(!p[0]) return;
+    snprintf(dir,sizeof dir,"%s",p);
+    n=strlen(dir);
+    while(n>0&&dir[n-1]!='\\'&&dir[n-1]!='/') n--;
+    if(n>0){ dir[n-1]=0; CreateDirectoryA(dir,NULL); }
+    f=fopen(p,"w");
+    if(f){ fprintf(f,"icons=%s\ntheme=%s\nguides=%d\n",
+        e->icons_nerd?"nerd":"none",ed_theme_cur,e->opt_guides?1:0); fclose(f); }
+}
+/* Load saved prefs: icons (-1 unset) + theme + guides (applies when known) */
+static void ed_cfg_load(Editor *e){
+    char th[16];
+    e->icons_nerd=ed_cfg_get_icons();
+    ed_cfg_get_theme(th,sizeof th);
+    if(th[0]) ed_theme_apply(th);
+    e->opt_guides=ed_cfg_get_guides();
+}
+/* 1 on Windows Terminal (legacy console font APIs don't apply there) */
+static int ed_in_wt(void){
+    const char *s=getenv("WT_SESSION");
+    return s&&*s;
+}
+/* F8: flip icon mode, persist it, and say where the font goes */
+static void ed_icons_toggle(Editor *e){
+    e->icons_nerd=!e->icons_nerd;
+    ed_cfg_save(e);
+    if(e->icons_nerd) snprintf(e->status,sizeof e->status,
+        "icons: nerd on (saved) - boxes? set profile font to FiraCode Nerd Font Mono");
+    else snprintf(e->status,sizeof e->status,"icons: none (saved)");
+}
+
+/* Plugins: built-in luc first, then plugin.cfg folders (exe dir, then cwd) */
+static void ed_plug_dir(Editor *e,char *out,size_t cap){
+    char exe[1024]; DWORD n;
+    out[0]=0;
+    n=GetModuleFileNameA(NULL,exe,sizeof exe);
+    if(n>0&&n<sizeof exe){
+        size_t k=n;
+        while(k>0&&exe[k-1]!='\\'&&exe[k-1]!='/') k--;
+        if(k>0&&k+8<cap){
+            memcpy(out,exe,k); out[k]=0;
+            snprintf(out+k,cap-k,"\\plugin");
+            if(GetFileAttributesA(out)!=INVALID_FILE_ATTRIBUTES) return;
+        }
+    }
+    snprintf(out,cap,".\\plugin");
+    if(GetFileAttributesA(out)==INVALID_FILE_ATTRIBUTES) out[0]=0;
+    (void)e;
+}
+static void ed_plug_cfg_read(const char *path,Plug *p){
+    FILE *f; char line[256];
+    f=fopen(path,"r"); if(!f) return;
+    while(fgets(line,sizeof line,f)){
+        char *eq=strchr(line,'=');
+        char key[64], val[192];
+        size_t kn=0, vn=0, k=0;
+        if(!eq) continue;
+        while(eq>line&&(eq[-1]==' '||eq[-1]=='\t')) eq--;
+        while(line+k<eq&&kn+1<sizeof key){ key[kn++]=line[k++]; }
+        key[kn]=0;
+        eq=strchr(line,'=')+1;
+        while(*eq==' '||*eq=='\t') eq++;
+        while(*eq&&*eq!='\r'&&*eq!='\n'&&vn+1<sizeof val) val[vn++]=*eq++;
+        val[vn]=0;
+        while(vn>0&&(val[vn-1]==' '||val[vn-1]=='\t')) val[--vn]=0;
+        if(!strcmp(key,"name")) snprintf(p->name,sizeof p->name,"%s",val);
+        else if(!strcmp(key,"author")) snprintf(p->author,sizeof p->author,"%s",val);
+        else if(!strcmp(key,"desc")) snprintf(p->desc,sizeof p->desc,"%s",val);
+        else if(!strcmp(key,"enabled")) p->enabled=(!strcmp(val,"1")||!strcmp(val,"true")||!strcmp(val,"on"));
+        else if(!strcmp(key,"locked")) p->locked=(!strcmp(val,"1")||!strcmp(val,"true")||!strcmp(val,"on"));
+        else if(!strncmp(key,"setting.",8)&&p->nset<ED_SETMAX){
+            /* setting.<id>=<Label>|<0|1> */
+            char *bar=strchr(val,'|');
+            size_t idn=strlen(key+8);
+            if(bar&&idn>0&&idn<sizeof p->set_id[0]){
+                size_t ll=(size_t)(bar-val);
+                if(ll>=sizeof p->set_label[0]) ll=sizeof p->set_label[0]-1;
+                memcpy(p->set_id[p->nset],key+8,idn+1);
+                memcpy(p->set_label[p->nset],val,ll);
+                p->set_label[p->nset][ll]=0;
+                p->set_val[p->nset]=(bar[1]=='1'||bar[1]=='t'||bar[1]=='T');
+                p->nset++;
+            }
+        }
+    }
+    fclose(f);
+}
+static void ed_plug_scan(Editor *e){
+    char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
+    e->nplugs=0; e->plug_sel=0; e->plug_top=0;
+    { Plug *p=&e->plugs[e->nplugs++];
+      snprintf(p->name,sizeof p->name,"luc");
+      snprintf(p->author,sizeof p->author,"hsusulist");
+      snprintf(p->desc,sizeof p->desc,"LUC suggestions, syntax colors and themes");
+      p->enabled=1; p->locked=1; p->cfg[0]=0; }
+    ed_plug_dir(e,e->plugdir,sizeof e->plugdir);
+    if(!e->plugdir[0]) return;
+    snprintf(pat,sizeof pat,"%s\\*",e->plugdir);
+    fh=FindFirstFileA(pat,&fd);
+    if(fh==INVALID_HANDLE_VALUE) return;
+    do{
+        char sub[1120], cfg[1200];
+        size_t j;
+        if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
+        if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) continue;
+        snprintf(sub,sizeof sub,"%s\\%s",e->plugdir,fd.cFileName);
+        snprintf(cfg,sizeof cfg,"%s\\plugin.cfg",sub);
+        if(GetFileAttributesA(cfg)==INVALID_FILE_ATTRIBUTES) continue;
+        /* same name overrides (e.g. plugin/luc tunes the built-in) */
+        { Plug tmp; size_t j;
+          memset(&tmp,0,sizeof tmp);
+          ed_plug_cfg_read(cfg,&tmp);
+          if(!tmp.name[0]) snprintf(tmp.name,sizeof tmp.name,"%s",fd.cFileName);
+          for(j=0;j<(size_t)e->nplugs;j++) if(!strcmp(e->plugs[j].name,tmp.name)) break;
+          if(j>=(size_t)e->nplugs){
+              if(e->nplugs>=ED_PLUGMAX) continue;
+              j=e->nplugs++;
+              e->plugs[j].enabled=1;
+          }
+          { char keepcfg[1024];
+            snprintf(keepcfg,sizeof keepcfg,"%s",cfg);
+            e->plugs[j]=tmp;
+            snprintf(e->plugs[j].cfg,sizeof e->plugs[j].cfg,"%s",keepcfg); }
+        }
+    }while(FindNextFileA(fh,&fd));
+    FindClose(fh);
+}
+/* The luc plugin gates suggestions + extra syntax colors */
+static int ed_plug_luc_on(Editor *e){
+    int i;
+    for(i=0;i<e->nplugs;i++)
+        if(!strcmp(e->plugs[i].name,"luc")) return e->plugs[i].enabled;
+    return 1;
+}
+static void ed_plug_write(Editor *e,int i){
+    /* Rewrite cfg but keep unknown lines (incl. setting.* we don't own here) */
+    char lines[32][256]; int nl=0, k;
+    FILE *f;
+    if(i<0||i>=e->nplugs||!e->plugs[i].cfg[0]) return;
+    f=fopen(e->plugs[i].cfg,"r");
+    if(f){
+        while(nl<32&&fgets(lines[nl],sizeof lines[0],f)){
+            size_t n=strlen(lines[nl]);
+            while(n>0&&(lines[nl][n-1]=='\n'||lines[nl][n-1]=='\r')) lines[nl][--n]=0;
+            if(!strncmp(lines[nl],"name=",5)||!strncmp(lines[nl],"author=",7)||
+               !strncmp(lines[nl],"desc=",5)||!strncmp(lines[nl],"enabled=",8)||
+               !strncmp(lines[nl],"locked=",7)||!strncmp(lines[nl],"setting.",8))
+                continue;   /* rewritten below */
+            nl++;
+        }
+        fclose(f);
+    }
+    f=fopen(e->plugs[i].cfg,"w");
+    if(!f) return;
+    fprintf(f,"name=%s\nauthor=%s\ndesc=%s\nenabled=%d\nlocked=%d\n",
+        e->plugs[i].name,e->plugs[i].author,e->plugs[i].desc,
+        e->plugs[i].enabled?1:0,e->plugs[i].locked?1:0);
+    for(k=0;k<nl;k++) fprintf(f,"%s\n",lines[k]);
+    for(k=0;k<e->plugs[i].nset;k++)
+        fprintf(f,"setting.%s=%s|%d\n",e->plugs[i].set_id[k],
+            e->plugs[i].set_label[k],e->plugs[i].set_val[k]?1:0);
+    fclose(f);
+}
+/* A plugin setting value by id (dflt when absent) */
+static int ed_plug_setting(Editor *e,const char *plug,const char *id,int dflt){
+    int i, k;
+    for(i=0;i<e->nplugs;i++){
+        if(strcmp(e->plugs[i].name,plug)) continue;
+        for(k=0;k<e->plugs[i].nset;k++)
+            if(!strcmp(e->plugs[i].set_id[k],id)) return e->plugs[i].set_val[k];
+        return dflt;
+    }
+    return dflt;
+}
+
+/* Suggestions: LUC keywords + builtins + words from the buffer */
+static const char *SUG_KW[]={
+    "create","function","command","repeat","if","else","elseif","end","while",
+    "do","then","return","break","for","in","import","as","make","get","pack",
+    "run","and","or","not","true","false","nil",NULL};
+static const char *SUG_BI[]={
+    "print","tostring","tonumber","type","len","pairs","ipairs","require",
+    "unpack","next","select","error","assert","pcall","xpcall","rawget",
+    "rawset","setmetatable","getmetatable","collectgarbage","list","table",
+    "string","math","io","os","task","buffer","window","self",NULL};
+static int ed_is_ident(unsigned char c){
+    return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_';
+}
+static void ed_sug_add(Editor *e,const char *w,const char *tag){
+    int i;
+    if(e->sug_n>=6) return;
+    for(i=0;i<e->sug_n;i++) if(!strcmp(e->sug_items[i],w)) return;
+    snprintf(e->sug_items[e->sug_n],sizeof e->sug_items[0],"%s",w);
+    snprintf(e->sug_tag[e->sug_n],sizeof e->sug_tag[0],"%s",tag);
+    e->sug_n++;
+}
+/* Rebuild the list from the identifier before the cursor */
+static void ed_sug_update(Editor *e){
+    char *b; size_t L, k, s, i, j;
+    e->sug_on=0; e->sug_n=0; e->sug_sel=0;
+    if(!e->path[0]||e->focus!=0) return;
+    if(!ed_plug_luc_on(e)) return;
+    if(!ed_plug_setting(e,"luc","suggestions",1)) return;
+    ed_clamp(e);
+    b=e->ln[e->cy].b; L=e->ln[e->cy].len; k=e->cx; s=k;
+    while(s>0&&ed_is_ident((unsigned char)b[s-1])) s--;
+    if(k-s<1||k-s>=sizeof e->sug_px) return;
+    memcpy(e->sug_px,b+s,k-s); e->sug_px[k-s]=0;
+    for(i=0;SUG_KW[i];i++)
+        if(!strncmp(SUG_KW[i],e->sug_px,k-s)&&strcmp(SUG_KW[i],e->sug_px))
+            ed_sug_add(e,SUG_KW[i],"Keyword");
+    for(i=0;SUG_BI[i];i++)
+        if(!strncmp(SUG_BI[i],e->sug_px,k-s)&&strcmp(SUG_BI[i],e->sug_px))
+            ed_sug_add(e,SUG_BI[i],"Function");
+    for(i=0;i<e->n&&e->sug_n<6;i++){
+        char *lb=e->ln[i].b; size_t LL=e->ln[i].len;
+        for(j=0;j<LL&&e->sug_n<6;){
+            size_t t=j;
+            if(!ed_is_ident((unsigned char)lb[j])){ j++; continue; }
+            while(j<LL&&ed_is_ident((unsigned char)lb[j])) j++;
+            if(lb[t]>='0'&&lb[t]<='9') continue;   /* number, not a word */
+            if(j-t==(k-s)&&!memcmp(lb+t,e->sug_px,k-s)) continue;
+            if(j-t>k-s&&!memcmp(lb+t,e->sug_px,k-s)){
+                char w[64]; size_t n=j-t;
+                if(n>=sizeof w) continue;
+                memcpy(w,lb+t,n); w[n]=0;
+                ed_sug_add(e,w,"Text");
+            }
+        }
+    }
+    if(e->sug_n) e->sug_on=1;
+}
+/* Replace the prefix with the chosen word */
+static void ed_sug_accept(Editor *e){
+    size_t plen;
+    EdLine *l;
+    if(!e->sug_on||e->sug_sel>=e->sug_n){ e->sug_on=0; return; }
+    plen=strlen(e->sug_px);
+    if(e->cx<plen){ e->sug_on=0; return; }
+    l=&e->ln[e->cy];
+    memmove(l->b+e->cx-plen,l->b+e->cx,l->len-e->cx+1);
+    l->len-=plen; e->cx-=plen;
+    ed_insert_bytes(e,e->sug_items[e->sug_sel],strlen(e->sug_items[e->sug_sel]));
+    e->sug_on=0; e->status[0]=0;
+}
+
+/* Popup geometry: under the cursor, flipped above when crowded */
+static void ed_sug_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
+    size_t dc=0, col=0, k=0, plen;
+    int maxw=0, i, bw, bh;
+    char *b;
+    ed_clamp(e);
+    b=e->ln[e->cy].b;
+    while(k<e->cx){ int w0=ed_chw((unsigned char)b[k],(int)col); dc+=(size_t)w0; col+=(size_t)w0; k++; }
+    plen=strlen(e->sug_px);
+    for(i=0;i<e->sug_n;i++){
+        int L=(int)strlen(e->sug_items[i])+6;
+        if(L>maxw) maxw=L;
+    }
+    bw=maxw; if(bw>W-4) bw=W-4; if(bw<34) bw=34;
+    bh=e->sug_n; if(bh>H-1) bh=H-1; if(bh<1) bh=1;
+    *x0=(int)(e->show_ex?ED_EXW:0)+e->numw+(int)dc-(int)e->dleft-(int)plen;
+    if(*x0<0) *x0=0;
+    if(*x0+bw>W) *x0=W-bw;
+    *y0=(int)(e->cy-e->top+1)+1;   /* 0-indexed row right below the cursor */
+    if(*y0+bh>H-1){ *y0=(int)(e->cy-e->top+1)-bh; if(*y0<1) *y0=1; }
+    *w=bw; *h=bh;
+}
+static void ed_sug_draw(Editor *e,int W,int H){
+    int x0,y0,bw,bh,i;
+    if(!e->sug_on||!e->sug_n) return;
+    ed_sug_geom(e,W,H,&x0,&y0,&bw,&bh);
+    for(i=0;i<e->sug_n&&i<bh;i++){
+        int yy=y0+i;
+        printf("\x1b[%d;%dH",yy+1,x0+1);
+        if(i==e->sug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+        else printf("\x1b[48;2;28;28;28m\x1b[97m");
+        fputc(' ',stdout);
+        if(!strcmp(e->sug_tag[i],"Keyword")) printf("\x1b[38;2;197;134;192m");
+        else if(!strcmp(e->sug_tag[i],"Function")) printf("\x1b[38;2;220;220;170m");
+        else printf("\x1b[38;2;150;150;150m");
+        fputs("\xe2\x97\x8f ",stdout);
+        if(i==e->sug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+        else printf("\x1b[48;2;28;28;28m\x1b[97m");
+        { int k2, L=(int)strlen(e->sug_items[i]), maxl=bw-3;
+          if(maxl<1) maxl=1;
+          for(k2=0;k2<L&&k2<maxl;k2++) fputc(e->sug_items[i][k2],stdout);
+          for(;k2<maxl;k2++) fputc(' ',stdout); }
+        printf("\x1b[0m");
+    }
+}
+
+/* Log panel: ring of recent messages (panel shows the tail) */
+static void ed_log(Editor *e,const char *fmt,...){    char b[240]; va_list ap;
+    va_start(ap,fmt); vsnprintf(b,sizeof b,fmt,ap); va_end(ap);
+    if(e->logn>=ED_LOGMAX){
+        memmove(e->logs[0],e->logs[1],sizeof e->logs[0]*(ED_LOGMAX-1));
+        e->logn=ED_LOGMAX-1;
+    }
+    snprintf(e->logs[e->logn++],sizeof e->logs[0],"%s",b);
+    e->log_scroll=0;   /* new output tails the view */
+}
+
 static void ed_popup_draw(Editor *e,int W,int H);
+static void ed_plug_draw(Editor *e,int W,int H);
+static void ed_set_draw(Editor *e,int W,int H);
+static void ed_set_click(Editor *e,int x,int y,int W,int H);
+static int ed_set_nrows(Editor *e,int tab);
+/* Modal-only repaint: background is frozen while a modal owns input,
+   so only the box is redrawn (no full-frame strobe over text) */
+static void ed_draw_modal(Editor *e){
+    int W=e->vw>0?e->vw:80, H=e->vh>0?e->vh:24, sync=0;
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO bi;
+    if(GetConsoleScreenBufferInfo(h,&bi)) sync=1;
+    printf("\x1b[?25l");
+    if(sync) printf("\x1b[?2026h");
+    if(e->menu||e->naming) ed_popup_draw(e,W,H);
+    else if(e->show_plugins) ed_plug_draw(e,W,H);
+    else if(e->show_settings) ed_set_draw(e,W,H);
+    if(sync) printf("\x1b[?2026l");
+    fflush(stdout);
+}
 static void ed_menu_open(Editor *e,int kind,int ax,int ay);
 static void ed_naming_start(Editor *e,int mode);
 
 static void ed_draw(Editor *e){
-    int W=80,H=24,r;
+    int W=80,H=24,r,CROWS=1,LOGSHOW=1,sync=0;
     int digits=1;
     size_t CW;
     HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
@@ -5061,8 +6060,10 @@ static void ed_draw(Editor *e){
     if(GetConsoleScreenBufferInfo(h,&bi)){
         W=bi.srWindow.Right-bi.srWindow.Left+1;
         H=bi.srWindow.Bottom-bi.srWindow.Top+1;
+        sync=1;   /* real console: wrap the frame so it paints atomically */
     }
     if(H<6) H=6; if(W<40) W=40;
+    CROWS=ed_crows(H,e);   /* code+explorer rows: title(1) + log + shell(1) take the rest */
     { size_t t=e->n>0?e->n:1; while(t>=10){ digits++; t/=10; } if(digits<2) digits=2; }
     e->numw=digits+4;               /* " 12    " (space gap, no bar) */
     int EXW=e->show_ex?ED_EXW:0;
@@ -5072,14 +6073,21 @@ static void ed_draw(Editor *e){
     ed_clamp(e);
     ed_clamp_view(e,H);
     if(e->cy<e->top) e->top=e->cy;
-    if(e->cy>=e->top+(size_t)(H-2)) e->top=e->cy-(H-3);
+    if(e->cy>=e->top+(size_t)CROWS) e->top=e->cy-(CROWS-1);
     if(e->exn>0 && e->exsel>=e->exn) e->exsel=e->exn-1;
     if(e->exsel<e->extop) e->extop=e->exsel;
-    if(e->exsel>=e->extop+(size_t)(H-2) && H-2>0) e->extop=e->exsel-(H-3);
+    if(e->exsel>=e->extop+(size_t)CROWS && CROWS>0) e->extop=e->exsel-(CROWS-1);
     { size_t dc=ed_dcol(e);
       if(dc<e->dleft) e->dleft=dc;
       if(dc>=e->dleft+CW-1) e->dleft=dc-(CW-2);
-      printf("\x1b[?25l\x1b[H");
+      if(e->last_expand!=e->log_expand){
+          /* Layout height changed: wipe once so no stale rows survive */
+          printf("\x1b[2J");
+          e->last_expand=e->log_expand;
+      }
+      printf("\x1b[?25l");
+      if(sync) printf("\x1b[?2026h");
+      printf("\x1b[H");
       { char title[256];
         const char *b1=strrchr(e->path,'/'), *b2=strrchr(e->path,'\\');
         const char *b=b1; if(b2&&(!b||b2>b)) b=b2;
@@ -5087,24 +6095,28 @@ static void ed_draw(Editor *e){
         else if(e->path[0]) snprintf(title,sizeof title,"%s - lcode",e->path);
         else snprintf(title,sizeof title,"lcode");
         title[W-4]=0;
-        printf(EC_TOPBG "\x1b[97m  %s",title);
+        printf("%s%s  %s",EC_TOPBG,TH_TCUR,title);
         printf("\x1b[K\x1b[0m\n"); }
-      /* .luc gets full highlight, others generic */
-      { int is_luc=0;
-        const char *dd=strrchr(e->path,'.');
-        if(dd&&(!strcmp(dd,".luc")||!strcmp(dd,".LUC"))) is_luc=1;
+      /* Language drives keywords/comments (plugin off: LUC only, rest generic) */
+      { int lang=L_NONE;
+        if(ed_plug_luc_on(e)){
+            if(ed_plug_setting(e,"luc","syntax",1)) lang=ed_lang(e->path);
+        } else {
+            const char *dd=strrchr(e->path,'.');
+            if(dd&&(!strcmp(dd,".luc")||!strcmp(dd,".LUC"))) lang=L_LUC;
+        }
         /* Block state from line 0 to view */
         int pcm=-1, pst=-1;
         { size_t pre; for(pre=0;pre<e->top&&pre<e->n;pre++)
-            ed_scan_state(e->ln[pre].b,e->ln[pre].len,&pcm,&pst); }
-        for(r=0;r<H-2;r++){
+            ed_scan_state(e->ln[pre].b,e->ln[pre].len,&pcm,&pst,lang); }
+        for(r=0;r<CROWS;r++){
           size_t li=e->top+r;
           printf("\x1b[K");
           /* Explorer cell: header, then entries */
           if(EXW){
           printf(EC_EXBG);
           if(r==0){
-              printf("\x1b[90mEXPLORER");
+              printf("%sEXPLORER",TH_TDIM);
               { int kk; for(kk=8;kk<EXW-3;kk++) fputc(' ',stdout); }
               printf("...");
               printf("\x1b[0m");
@@ -5127,17 +6139,40 @@ static void ed_draw(Editor *e){
                 const char *nm=e->ex[ei].name;
                 int cw=0, kk=0, i, isd=e->ex[ei].isdir;
                 int dep=e->ex[ei].depth; if(dep<1) dep=1; if(dep>5) dep=5;
-                /* Dirty names yellow, else extension color */
-                int col=isd ? (ed_dir_dirty(e,e->ex[ei].full)?33:0)
+                /* Nerd mode: colored glyph, white name (dirty stays yellow) */
+                const DevIcon *ndi=NULL;
+                if(!isd&&e->icons_nerd){
+                    ndi=ed_devicon(nm);
+                    if(!ndi) ndi=&DEVICON_DEF;
+                }
+                /* Dirty names yellow, otherwise plain (names stay white) */
+                int col=isd||e->icons_nerd
+                            ? ((ed_dir_dirty(e,e->ex[ei].full)||
+                                (!isd&&ed_path_dirty(e,e->ex[ei].full)))?33:0)
                             : (ed_path_dirty(e,e->ex[ei].full)?33:ed_ex_color(nm,isd));
                 int sel=(e->focus==1&&ei==e->exsel);
-                if(sel) printf("\x1b[7m");
+                if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
                 else if(col) printf("\x1b[%dm",col);
-                for(i=0;i<dep*2&&cw<EXW-6;i++){ fputc(' ',stdout); cw++; }
+                if(e->opt_guides){
+                    for(i=1;i<dep&&cw<EXW-6;i++){ fputs("\x1b[90m\xe2\x94\x82\x1b[0m ",stdout); cw+=2; }
+                    if(cw<EXW-6){ fputc(' ',stdout); fputc(' ',stdout); cw+=2; }
+                    if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+                    else if(col) printf("\x1b[%dm",col);
+                } else {
+                    for(i=0;i<dep*2&&cw<EXW-6;i++){ fputc(' ',stdout); cw++; }
+                }
                 if(isd){ fputs(e->ex[ei].expanded?"\xe2\x96\xbe":"\xe2\x96\xb8",stdout); cw++; }
                 else { fputc(' ',stdout); cw++; }
                 fputc(' ',stdout); cw++;
                 if(isd){ fputs(e->ex[ei].expanded?"\xf0\x9f\x93\x82":"\xf0\x9f\x93\x81",stdout); cw+=2; }
+                else if(ndi){ char ib[4]; int m=ed_cp_utf8(ndi->cp,ib);
+                    if(!sel) printf("\x1b[38;2;%u;%u;%um",
+                        (ndi->rgb>>16)&255,(ndi->rgb>>8)&255,ndi->rgb&255);
+                    fwrite(ib,1,(size_t)m,stdout);
+                    printf("\x1b[0m");
+                    if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+                    else if(col) printf("\x1b[%dm",col);
+                    cw+=1; }
                 else { fputc(' ',stdout); fputc(' ',stdout); cw+=2; }
                 fputc(' ',stdout); cw++;
                 while(nm[kk]&&cw<EXW){ fputc(nm[kk],stdout); cw++; kk++; }
@@ -5156,50 +6191,90 @@ static void ed_draw(Editor *e){
               size_t dd=0;
               int iscur=(li==e->cy && e->focus==0);
               printf(iscur?EC_LINEBG:EC_CODEBG);
-              if(iscur) printf("\x1b[97m%*d    ",digits,(int)li+1);
-              else printf("\x1b[90m%*d    ",digits,(int)li+1);
+              if(iscur) printf("%s%*d    ",TH_TCUR,digits,(int)li+1);
+              else printf("%s%*d    ",TH_TDIM,digits,(int)li+1);
               while(kk<LL&&dd<e->dleft){ int w0=ed_chw((unsigned char)lb[kk],col); dd+=(size_t)w0; col+=w0; kk++; }
               while(kk<LL&&ed_is_cont((unsigned char)lb[kk])) kk++;
               ed_hl_bg=iscur?2:1;
-              ed_hl_line(lb,LL,kk,(int)CW,is_luc,pcm+1,pst+1);
+              { int has_sel=0; size_t sel_s=0, sel_e=0;
+                if(!ed_sel_empty(e)){
+                    size_t sy,sx,ey,ex;
+                    ed_sel_norm(e,&sy,&sx,&ey,&ex);
+                    if(li>=sy&&li<=ey){
+                        has_sel=1;
+                        sel_s=(li==sy)?sx:0;
+                        sel_e=(li==ey)?ex:(size_t)-1;
+                    }
+                }
+                ed_hl_line(lb,LL,kk,(int)CW,lang,pcm+1,pst+1,has_sel,sel_s,sel_e); }
               ed_hl_bg=0;
-              ed_scan_state(lb,LL,&pcm,&pst);
+              ed_scan_state(lb,LL,&pcm,&pst,lang);
               printf(iscur?EC_LINEBG:EC_CODEBG);
               printf("\x1b[K\x1b[0m");
-          } else { printf(EC_CODEBG "\x1b[K\x1b[0m"); }
-          { int total=(int)e->n, rows=H-2, isthumb=0;
+          } else { printf("%s\x1b[K\x1b[0m",EC_CODEBG); }
+          { int total=(int)e->n, rows=CROWS, isthumb=0;
             if(total>rows){ int a=(int)((long long)r*total/rows), b=(int)((long long)(r+1)*total/rows);
               int v0=(int)e->top, v1=(int)(e->top+rows); if(v1>total) v1=total;
               if(a<v1&&b>v0) isthumb=1; }
             printf("\x1b[%d;%dH",r+2,W);
-            if(isthumb) printf("\x1b[97;7m \x1b[0m"); else printf("\x1b[90m|\x1b[0m");
+            if(isthumb) printf("\x1b[48;2;110;110;110m \x1b[0m"); else printf("%s|\x1b[0m",TH_TDIM);
             printf("\x1b[%d;1H",r+3); }
       }
-      { /* Bottom strip: message or unsaved count */
-        int u=0;
-        if(e->status[0]){
-            char msg[256];
-            snprintf(msg,sizeof msg,"  %s",e->status);
-            msg[W-1]=0;
-            printf(EC_TOPBG "\x1b[97m%s",msg);
-        } else if((u=ed_unsaved_count(e))>0){
-            char ub[64];
-            snprintf(ub,sizeof ub,"  \xe2\x97\x8f %d unsaved",u);
-            printf(EC_TOPBG "\x1b[97m%s",ub);
-        } else {
-            printf(EC_TOPBG "  ");
+      /* Status snapshot: every message also lands in the log panel */
+      if(e->status[0] && strcmp(e->status,e->lastlog)!=0){
+          ed_log(e,"%s",e->status);
+          snprintf(e->lastlog,sizeof e->lastlog,"%s",e->status);
+      }
+      { /* Log panel: tail window, Up/Down scrolls it while expanded */
+        int k;
+        int max=e->logn-LOGSHOW; if(max<0) max=0;
+        if(e->log_scroll>max) e->log_scroll=max;
+        if(e->log_scroll<0) e->log_scroll=0;
+        for(k=0;k<LOGSHOW;k++){
+            int idx=e->logn-LOGSHOW-e->log_scroll+k;
+            printf("\x1b[%d;1H\x1b[K",H-LOGSHOW+k);
+            printf(EC_LOGBG);
+            if(idx<0){
+                if(k==0) printf("%slog: status messages and shell output appear here",TH_TDIM);
+            } else if(idx==e->logn-1) printf("%s%.*s",TH_TCUR,W-2,e->logs[idx]);
+            else printf("%s%.*s",TH_TDIM,W-2,e->logs[idx]);
+            printf("\x1b[0m");
+        } }
+      { /* Shell input row (click to focus, Enter runs, Up/Down history) */
+        const char *dd=e->exdir, *bb=dd;
+        char pr[64]; int pc;
+        while(*bb){ if(*bb=='\\'||*bb=='/') dd=bb+1; bb++; }
+        if(!*dd) dd=e->exdir;
+        snprintf(pr,sizeof pr,"%.*s>",(int)sizeof pr-2,dd);
+        printf("\x1b[%d;1H\x1b[K",H);
+        printf("%s%s%s ",EC_TOPBG,TH_TCUR,pr);
+        pc=(int)strlen(pr)+1;
+        if(e->shlen) fwrite(e->shbuf,1,e->shlen,stdout);
+        else {
+            int u=ed_unsaved_count(e);
+            if(u>0) printf("%s(%d unsaved)",TH_TDIM,u);
+            else if(!ed_sel_empty(e)) printf("%s(sel ^C copies)",TH_TDIM);
+            else printf("%s(type a command)",TH_TDIM);
         }
-        printf("\x1b[K\x1b[0m"); }
+        printf("\x1b[K\x1b[0m");
+        e->sh_promptw=(size_t)pc;
+      }
       /* Popup draws last, owns cursor */
+      if(e->sug_on&&e->focus==0) ed_sug_draw(e,W,H);
       if(e->menu||e->naming) ed_popup_draw(e,W,H);
+      if(e->show_plugins) ed_plug_draw(e,W,H);
+      if(e->show_settings) ed_set_draw(e,W,H);
       /* Cursor hidden with no file or open menu */
       { size_t dc2=ed_dcol(e);
-        if(e->menu) { /* hidden */ }
+        if(e->menu||e->show_plugins||e->show_settings) { /* hidden */ }
         else if(e->naming) { /* positioned by ed_popup_draw */ }
+        else if(e->focus==2)
+            printf("\x1b[%d;%dH\x1b[?25h",H,(int)(e->sh_promptw+e->shcur+1));
         else if(e->focus==1)
             printf("\x1b[%d;%dH\x1b[?25h",(int)(e->exsel-e->extop+4),2);
         else if(e->path[0])
             printf("\x1b[%d;%dH\x1b[?25h",(int)(e->cy-e->top+2),(int)(EXW+e->numw+dc2-e->dleft+1)); }
+      if(sync) printf("\x1b[?2026l");
       fflush(stdout); } }
 }
 
@@ -5241,6 +6316,26 @@ static void ex_refresh(Editor *e){
     FindClose(fh);
     qsort(e->ex,e->exn,sizeof(ExItem),ex_cmp);
     if(e->exsel>=e->exn && e->exn>0) e->exsel=e->exn-1;
+}
+
+/* Re-list the folder but keep expansions + selection (picks up outside changes) */
+static void ex_expand(Editor *e,size_t idx);
+static void ex_refresh_keep(Editor *e){
+    char sel[1120]={0};
+    char exp[128][1120]; int nexp=0;
+    size_t i, j;
+    if(e->exsel<e->exn) snprintf(sel,sizeof sel,"%s",e->ex[e->exsel].full);
+    for(i=0;i<e->exn && nexp<128;i++)
+        if(e->ex[i].isdir&&e->ex[i].expanded)
+            snprintf(exp[nexp++],sizeof exp[0],"%s",e->ex[i].full);
+    ex_refresh(e);
+    for(i=0;i<(size_t)nexp;i++)
+        for(j=0;j<e->exn;j++)
+            if(e->ex[j].isdir&&!e->ex[j].expanded&&!strcmp(e->ex[j].full,exp[i])){
+                ex_expand(e,j); break;
+            }
+    e->exsel=0;
+    for(j=0;j<e->exn;j++) if(!strcmp(e->ex[j].full,sel)){ e->exsel=j; break; }
 }
 
 /* Join exdir/name, .. goes up */
@@ -5401,7 +6496,7 @@ static void ed_menu_open(Editor *e,int kind,int ax,int ay){
         return;
     }
     if(e->exsel>=e->exn){ e->menu=0; return; }
-    snprintf(e->menutitle,sizeof e->menutitle,"%s",e->ex[e->exsel].name);
+    /* No filename title: the bar shows just the 4 options */
     if(e->ex[e->exsel].isdir){
         ed_menu_add(e,"open",MA_OPEN);
         ed_menu_add(e,"new file",MA_NEWFILE);
@@ -5539,6 +6634,7 @@ static void ed_forget_path(Editor *e,const char *full,int isdir){
         for(k=0;k<e->n;k++) free(e->ln[k].b);
         free(e->ln); e->ln=NULL; e->n=0; e->cap=0;
         e->cx=0; e->cy=0; e->top=0; e->dleft=0; e->dirty=0; e->path[0]=0;
+        e->is_binary=0;
     }
     i=0;
     while(i<e->nstash){
@@ -5658,13 +6754,11 @@ static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
         *x0=(W-bw)/2; *y0=H/2-2; *w=bw; *h=5;
         return;
     }
-    { int tl=e->menutitle[0]?(int)strlen(e->menutitle):4;
+    { int tl=e->menutitle[0]?(int)strlen(e->menutitle):0;
       if(tl>maxw) maxw=tl; }
     for(i=0;i<e->nitems;i++){ int L=(int)strlen(e->mitems[i].label); if(L>maxw) maxw=L; }
-    { const char *ft="Esc / click outside to close";
-      int fl=(int)strlen(ft); if(fl>maxw) maxw=fl; }
-    bw=maxw+6; if(bw>W-4) bw=W-4; if(bw<26) bw=26;
-    bh=e->nitems+4; if(bh>H-1) bh=H-1; if(bh<5) bh=5;
+    bw=maxw+4; if(bw>W-4) bw=W-4; if(bw<16) bw=16;
+    bh=(e->menutitle[0]?1:0)+e->nitems; if(bh>H-1) bh=H-1; if(bh<1) bh=1;
     if(e->menu_anch){
         int ax=e->menu_ax, ay=e->menu_ay;
         if(ax<0) ax=0; if(ay<1) ay=1;
@@ -5702,54 +6796,205 @@ static void ed_popup_draw(Editor *e,int W,int H){
         printf("\x1b[?25h");
         return;
     }
-    /* Modern context menu: rounded box, title, highlight, footer hint */
-    { int inner=bw-2, k;
-      /* top border */
-      printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x95\xad",y0+1,x0+1);
-      for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
-      fputs("\xe2\x95\xae\x1b[0m",stdout);
-      /* title */
-      { char tb[256]; const char *tt=e->menutitle[0]?e->menutitle:"menu";
-        snprintf(tb,sizeof tb,"%.200s",tt);
-        printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",y0+2,x0+1);
-        printf("\x1b[48;2;28;28;28m\x1b[97m %-.*s",inner-1,tb);
-        { int tl=(int)strlen(tb); if(tl>inner-1) tl=inner-1;
-          for(k=tl;k<inner-1;k++) fputc(' ',stdout); }
-        printf("\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m"); }
-      /* items: │ marker+label │, left/right borders stay dim */
-      for(i=0;i<e->nitems;i++){
-          int yy=y0+3+i;
-          if(yy>=y0+bh-2) break;
-          printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",yy+1,x0+1);
-          if(i==e->msel)
-              printf("\x1b[48;2;0;120;215m\x1b[97m");
-          else
-              printf("\x1b[48;2;28;28;28m\x1b[37m");
+    /* Borderless context menu: plain block, blue selection, title only for confirm */
+    { int inner=bw, k, base=e->menutitle[0]?1:0, n;
+      if(e->menutitle[0]){
+          printf("\x1b[%d;%dH\x1b[48;2;28;28;28m",y0+1,x0+1);
+          { int tl=(int)strlen(e->menutitle);
+            if(tl>inner) tl=inner;
+            printf("\x1b[90m%.*s",tl,e->menutitle);
+            for(k=tl;k<inner;k++) fputc(' ',stdout); }
+          printf("\x1b[0m");
+      }
+      n=e->nitems; if(n>bh-base) n=bh-base;
+      for(i=0;i<n;i++){
+          int yy=y0+base+i;
+          printf("\x1b[%d;%dH",yy+1,x0+1);
+          if(i==e->msel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+          else printf("\x1b[48;2;28;28;28m\x1b[37m");
           fputs(i==e->msel?"\xe2\x96\xb8 ":"  ",stdout);
           { int k2, L=(int)strlen(e->mitems[i].label);
-            int maxl=inner-3;
+            int maxl=inner-2;
             for(k2=0;k2<L&&k2<maxl;k2++) fputc(e->mitems[i].label[k2],stdout);
             for(;k2<maxl;k2++) fputc(' ',stdout); }
-          fputc(' ',stdout);
-          printf("\x1b[0m\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m");
+          printf("\x1b[0m");
       }
-      /* footer hint */
-      { int fy=y0+3+e->nitems;
-        if(fy<y0+bh-1){
-            printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m",fy+1,x0+1);
-            printf("\x1b[48;2;28;28;28m\x1b[90m %-.*s",inner-1,"Esc / click outside to close");
-            { const char *ft="Esc / click outside to close"; int fl=(int)strlen(ft);
-              if(fl>inner-1) fl=inner-1;
-              for(k=fl;k<inner-1;k++) fputc(' ',stdout); }
-            printf("\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x94\x82\x1b[0m");
-        } }
-      /* bottom border */
-      printf("\x1b[%d;%dH\x1b[48;2;28;28;28m\x1b[38;2;90;90;90m\xe2\x95\xb0",y0+bh,x0+1);
-      for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
-      fputs("\xe2\x95\xaf\x1b[0m",stdout);
     }
 }
 
+/* :plugin modal: borderless block, light-black header + up to 5 rows, scrollable */
+#define ED_PLUGSHOW 5
+static void ed_plug_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
+    int bw=44, bh=1+ED_PLUGSHOW;
+    int n=e->nplugs<ED_PLUGSHOW?e->nplugs:ED_PLUGSHOW;
+    if(n<1) n=1;
+    bh=1+n;
+    if(bw>W-4) bw=W-4; if(bw<24) bw=24;
+    if(bh>H-2) bh=H-2; if(bh<2) bh=2;
+    *x0=(W-bw)/2; *y0=(H-bh)/2; if(*y0<1) *y0=1;
+    *w=bw; *h=bh;
+}
+static void ed_plug_draw(Editor *e,int W,int H){
+    int x0,y0,bw,bh,i,inner,n;
+    ed_plug_geom(e,W,H,&x0,&y0,&bw,&bh);
+    inner=bw;
+    n=e->nplugs<ED_PLUGSHOW?e->nplugs:ED_PLUGSHOW;
+    if(n<1) n=1;
+    if(e->plug_sel>=e->plug_top+n) e->plug_top=e->plug_sel-n+1;
+    if(e->plug_sel<e->plug_top) e->plug_top=e->plug_sel;
+    /* header: light black */
+    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m",y0+1,x0+1);
+    { char hb[128];
+      snprintf(hb,sizeof hb," plugins (%d)",e->nplugs);
+      printf("%-*.*s",inner,inner,hb); }
+    printf("\x1b[0m");
+    for(i=0;i<n;i++){
+        int yy=y0+1+i, pi=e->plug_top+i;
+        Plug *p=&e->plugs[pi];
+        printf("\x1b[%d;%dH",yy+1,x0+1);
+        if(pi==e->plug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+        else if(!p->enabled) printf("\x1b[48;2;36;36;36m\x1b[90m");
+        else printf("\x1b[48;2;36;36;36m\x1b[97m");
+        { char row[128];
+          snprintf(row,sizeof row,"  %-.12s  %-.12s",p->name,p->author);
+          printf("%-*.*s",inner,inner,row); }
+        printf("\x1b[0m");
+    }
+}
+static void ed_plug_click(Editor *e,int x,int y,int W,int H){
+    int x0,y0,bw,bh,i,n;
+    if(!e->show_plugins) return;
+    ed_plug_geom(e,W,H,&x0,&y0,&bw,&bh);
+    if(x<x0||x>=x0+bw||y<y0||y>=y0+bh){ e->show_plugins=0; return; }
+    n=e->nplugs<ED_PLUGSHOW?e->nplugs:ED_PLUGSHOW;
+    for(i=0;i<n;i++){
+        int pi=e->plug_top+i;
+        if(y==y0+1+i&&x>=x0&&x<x0+bw){
+            e->plug_sel=pi;
+            e->plugs[pi].enabled=!e->plugs[pi].enabled;
+            ed_plug_write(e,pi);
+            return;
+        }
+    }
+}
+/* :setting modal: dark index tabs on the left, gray content on the right */
+#define ED_SETW 18   /* index column width */
+static int ed_set_ntabs(Editor *e){ return 1+e->nplugs; }
+static int ed_set_nrows(Editor *e,int tab){
+    if(tab==0) return 3;   /* guides, icons, theme */
+    if(tab-1<e->nplugs) return e->plugs[tab-1].nset>0?e->plugs[tab-1].nset:1;
+    return 1;
+}
+static void ed_set_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
+    int bw=56, i, rows=0;
+    for(i=0;i<ed_set_ntabs(e);i++){
+        int r=ed_set_nrows(e,i);
+        if(r>rows) rows=r;
+    }
+    if(bw>W-4) bw=W-4; if(bw<40) bw=40;
+    { int bh=1+rows;
+      if(bh>H-2) bh=H-2; if(bh<3) bh=3;
+      *x0=(W-bw)/2; *y0=(H-bh)/2; if(*y0<1) *y0=1;
+      *w=bw; *h=bh; }
+}
+static void ed_set_row_text(Editor *e,int tab,int row,char *out,size_t cap,int *on){
+    *on=1;
+    if(tab==0){
+        if(row==0){ snprintf(out,cap,"Tree guides"); *on=e->opt_guides; }
+        else if(row==1){ snprintf(out,cap,"File icons"); *on=e->icons_nerd; }
+        else { snprintf(out,cap,"Theme (%s)",ed_theme_cur); *on=1; }
+        return;
+    }
+    { Plug *p=&e->plugs[tab-1];
+      if(row<p->nset){ snprintf(out,cap,"%s",p->set_label[row]); *on=p->set_val[row]; }
+      else snprintf(out,cap,"(no settings)"); }
+}
+/* Activate the focused content row (toggle/cycle + persist) */
+static void ed_set_activate(Editor *e){
+    int tab=e->set_tab, row=e->set_row;
+    if(tab==0){
+        if(row==0){ e->opt_guides=!e->opt_guides; ed_cfg_save(e); }
+        else if(row==1){ e->icons_nerd=!e->icons_nerd; ed_cfg_save(e); }
+        else { ed_theme_apply(strcmp(ed_theme_cur,"dark")?"dark":"light"); ed_cfg_save(e); }
+        return;
+    }
+    if(tab-1<e->nplugs){
+        Plug *p=&e->plugs[tab-1];
+        if(row<p->nset){ p->set_val[row]=!p->set_val[row]; ed_plug_write(e,tab-1); }
+    }
+}
+static void ed_set_draw(Editor *e,int W,int H){
+    int x0,y0,bw,bh,i;
+    int ntabs, nrows, cw;
+    if(!e->show_settings) return;
+    ed_set_geom(e,W,H,&x0,&y0,&bw,&bh);
+    ntabs=ed_set_ntabs(e);
+    nrows=ed_set_nrows(e,e->set_tab);
+    if(e->set_tab>=ntabs) e->set_tab=ntabs-1;
+    if(e->set_row>=nrows) e->set_row=nrows-1;
+    /* header */
+    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m",y0+1,x0+1);
+    printf("%-*s",bw," settings");
+    printf("\x1b[0m");
+    cw=bw-ED_SETW;
+    for(i=0;i<bh-1;i++){
+        int yy=y0+1+i;
+        /* index cell: deep black */
+        printf("\x1b[%d;%dH\x1b[48;2;17;17;17m",yy+1,x0+1);
+        if(i<ntabs){
+            const char *t=i==0?"Appearance":e->plugs[i-1].name;
+            int cur=e->set_left&&i==e->set_tab;
+            if(cur) printf("\x1b[48;2;0;120;215m\x1b[97m");
+            else printf("\x1b[97m");
+            printf(" %-*.*s",ED_SETW-2,ED_SETW-2,t);
+        } else {
+            int k; for(k=0;k<ED_SETW;k++) fputc(' ',stdout);
+        }
+        /* content cell: gray like code */
+        printf("\x1b[48;2;30;30;30m");
+        if(i<nrows){
+            char label[96]; int on=1, L, Ll, k2;
+            int cur=!e->set_left&&i==e->set_row;
+            int noset=0;
+            ed_set_row_text(e,e->set_tab,i,label,sizeof label,&on);
+            if(!strcmp(label,"(no settings)")) noset=1;
+            if(cur) printf("\x1b[48;2;0;120;215m\x1b[97m");
+            else printf("\x1b[97m");
+            fputc(' ',stdout);
+            L=(int)strlen(label); Ll=L;
+            { int maxl=cw-1-1-3-1; if(maxl<1) maxl=1; if(Ll>maxl) Ll=maxl; }
+            fwrite(label,1,(size_t)Ll,stdout);
+            if(!noset){
+                fputc(' ',stdout);
+                if(on) printf("\x1b[32m on");
+                else printf("\x1b[90m off");
+            }
+            { int used=1+Ll+(noset?0:4);
+              for(k2=used;k2<cw;k2++) fputc(' ',stdout); }
+        } else {
+            int k; for(k=0;k<cw;k++) fputc(' ',stdout);
+        }
+        printf("\x1b[0m");
+    }
+}
+static void ed_set_click(Editor *e,int x,int y,int W,int H){
+    int x0,y0,bw,bh,i,nrows;
+    if(!e->show_settings) return;
+    ed_set_geom(e,W,H,&x0,&y0,&bw,&bh);
+    if(x<x0||x>=x0+bw||y<y0||y>=y0+bh){ e->show_settings=0; return; }
+    if(y==y0) return;   /* header */
+    nrows=ed_set_nrows(e,e->set_tab);
+    if(x<x0+ED_SETW){
+        int t=y-y0-1;
+        if(t>=0&&t<ed_set_ntabs(e)){ e->set_tab=t; e->set_row=0; e->set_left=1; }
+        return;
+    }
+    i=y-y0-1;
+    if(i>=0&&i<nrows){
+        e->set_row=i; e->set_left=0;
+        ed_set_activate(e);
+    }
+}
 /* Menu pick */
 static void ed_menu_pick(Editor *e,int id){
     char dir[1024];
@@ -5833,42 +7078,237 @@ static void ed_popup_click(Editor *e,int x,int y,int W,int H){
     if(e->naming){ return; }   /* Outside clicks cancel, handled by caller */
     /* click outside -> dismiss (no action, like Cancel) */
     if(x<x0||x>=x0+bw||y<y0||y>=y0+bh){ e->menu=0; return; }
-    /* items start at y0+2 (after top border + title) */
+    /* items start at y0 (+1 when the confirm title is shown) */
     for(i=0;i<e->nitems;i++){
-        if(y==y0+2+i && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
+        int yy=y0+(e->menutitle[0]?1:0)+i;
+        if(y==yy && x>=x0 && x<x0+bw){ e->msel=i; ed_menu_pick(e,e->mitems[i].id); return; }
     }
-    /* clicks on border/title/footer do nothing (stay open) */
 }
 
 /* Wait for key after run */
-static void wait_key(HANDLE hin){    INPUT_RECORD ir; DWORD n=0;
-    for(;;){
-        if(!ReadConsoleInputW(hin,&ir,1,&n)) return;
-        if(ir.EventType==KEY_EVENT && ir.Event.KeyEvent.bKeyDown) return;
-    }
+/* Bottom shell: powershell when present, else COMSPEC; output goes to the log panel */
+static void ed_console_raw(void){
+    /* Child shells clobber console mode on exit (mouse dies, keys live).
+       Re-assert editor mode from whatever is currently set. */
+    HANDLE hin=GetStdHandle(STD_INPUT_HANDLE);
+    DWORD m=0;
+    if(!hin||hin==INVALID_HANDLE_VALUE||!GetConsoleMode(hin,&m)) return;
+    SetConsoleMode(hin,(m|ENABLE_MOUSE_INPUT|ENABLE_EXTENDED_FLAGS)
+        & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT|ENABLE_QUICK_EDIT_MODE));
 }
-
-/* Run .luc: save, show output, wait key, redraw */
-static void ed_run(Editor *e,HANDLE hin,DWORD oldmode){
-    const char *dot=strrchr(e->path,'.');
-    if(!dot||(strcmp(dot,".luc")&&strcmp(dot,".LUC"))){
-        snprintf(e->status,sizeof e->status,"only .luc files run here");
+static int ed_shell_has_ps(void){
+    static int st=-1;
+    if(st<0){
+        char p[1024];
+        st=(SearchPathA(NULL,"powershell.exe",NULL,sizeof p,p,NULL)>0)?1:0;
+    }
+    return st;
+}
+static void ed_shell_hist_push(Editor *e,const char *line){
+    if(e->shn>=ED_SHHIST){
+        memmove(e->shhist[0],e->shhist[1],sizeof e->shhist[0]*(ED_SHHIST-1));
+        e->shn=ED_SHHIST-1;
+    }
+    snprintf(e->shhist[e->shn++],sizeof e->shhist[0],"%s",line);
+    e->shpos=e->shn;
+}
+/* Strip ANSI escapes + control junk so child output can't wreck the TUI */
+static void ed_sanitize(char *d,size_t cap,const char *s){
+    size_t r=0, w=0;
+    if(cap==0) return;
+    while(s[r]&&w+1<cap){
+        unsigned char c=(unsigned char)s[r];
+        if(c==0x1B){
+            r++;
+            if(s[r]=='['){   /* CSI ... final byte */
+                r++;
+                while(s[r]&&!((s[r]>='@'&&s[r]<='~'))) r++;
+                if(s[r]) r++;
+            } else if(s[r]==']'){   /* OSC ... BEL or ST */
+                r++;
+                while(s[r]&&s[r]!='\x07'&&!(s[r]=='\\'&&r>0&&s[r-1]==0x1B)) r++;
+                if(s[r]=='\x07') r++;
+                else if(s[r]) r++;
+            } else if(s[r]) r++;
+            continue;
+        }
+        if(c=='\t'){ if(w+4<cap){ d[w++]=' '; d[w++]=' '; d[w++]=' '; d[w++]=' '; } r++; continue; }
+        if(c<32||c==127){ d[w++]='?'; r++; continue; }
+        d[w++]=s[r++];
+    }
+    d[w]=0;
+}
+/* :commands run inside the shell instead of a subprocess */
+static void ed_cmd_run(Editor *e,const char *cmd){
+    while(*cmd==' '||*cmd=='\t') cmd++;
+    if(!strcmp(cmd,"plugin")||!strcmp(cmd,"plugins")){
+        ed_plug_scan(e);
+        e->show_plugins=1; e->plug_sel=0;
         return;
     }
-    if(e->dirty && !ed_save(e)) return;
-    if(!g_exepath[0]){ snprintf(e->status,sizeof e->status,"cannot find luc"); return; }
-    SetConsoleMode(hin,oldmode);
-    printf("\x1b[?7h\x1b[2J\x1b[H--- lcode run: %s ---\n",e->path);
-    fflush(stdout);
-    { const char *av[3]; av[0]=g_exepath; av[1]=e->path; av[2]=NULL;
-      intptr_t rc=_spawnv(_P_WAIT,g_exepath,av);
-      printf("\n--- exit %d --- press any key\n",(int)rc); }
-    fflush(stdout);
-    printf("\x1b[?7l");
-    fflush(stdout);
-    SetConsoleMode(hin,oldmode & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT));
-    wait_key(hin);
-    e->status[0]=0;
+    if(!strcmp(cmd,"setting")||!strcmp(cmd,"settings")){
+        ed_plug_scan(e);
+        e->show_settings=1; e->set_tab=0; e->set_row=0; e->set_left=1;
+        return;
+    }
+    if(!strcmp(cmd,"help")||!strcmp(cmd,"?")){
+        ed_log(e,":plugin - plugin list (Enter toggles)");
+        ed_log(e,":setting - settings (Appearance + plugins)");
+        ed_log(e,":theme [dark|light] - editor colors");
+        ed_log(e,":help - this list");
+        e->log_expand=1; e->log_scroll=0;
+        return;
+    }
+    if(!strncmp(cmd,"theme",5)&&(cmd[5]==0||cmd[5]==' '||cmd[5]=='\t')){
+        const char *a=cmd+5;
+        while(*a==' '||*a=='\t') a++;
+        if(!*a){ ed_log(e,"theme: %s (dark|light)",ed_theme_cur); return; }
+        if(ed_theme_apply(a)){ ed_cfg_save(e); ed_log(e,"theme: %s",ed_theme_cur); }
+        else ed_log(e,"theme: unknown '%s' (dark|light)",a);
+        return;
+    }
+    ed_log(e,"unknown command ':%s' (try :help)",cmd);
+}
+static void ed_shell_run(Editor *e){
+    char line[1024], cmd[1280], buf[512];
+    FILE *p;
+    int nlines=0, rc=0;
+    size_t a=0, b;
+    if(!e->shlen) return;
+    memcpy(line,e->shbuf,e->shlen); line[e->shlen]=0;
+    /* exit/quit leaves the editor (anything else runs as a shell command) */
+    while(line[a]==' '||line[a]=='\t') a++;
+    b=strlen(line);
+    while(b>a&&(line[b-1]==' '||line[b-1]=='\t'||line[b-1]=='\r')) b--;
+    line[b]=0;
+    if(!strcmp(line+a,"exit")||!strcmp(line+a,"quit")||
+       !strcmp(line+a,"EXIT")||!strcmp(line+a,"QUIT")){
+        e->sh_quit=1; return;
+    }
+    ed_shell_hist_push(e,line);
+    if(line[a]==':'){ ed_cmd_run(e,line+a+1); return; }
+    ed_log(e,"$ %s",line);
+    e->log_expand=1; e->log_scroll=0;   /* open the 3-row view for the output */
+    ed_console_raw();   /* heal mode in case it was already clobbered */
+    /* <NUL stdin: interactive programs get EOF instead of stealing keys */
+    if(ed_shell_has_ps()) snprintf(cmd,sizeof cmd,"powershell -NoProfile -NonInteractive -Command %s 2>&1 <NUL",line);
+    else snprintf(cmd,sizeof cmd,"cmd.exe /C %s 2>&1 <NUL",line);
+    /* Run inside the open folder so relative paths (luc core.luc) work */
+    { char back[1024];
+      GetCurrentDirectoryA(sizeof back,back);
+      if(e->exdir[0]) SetCurrentDirectoryA(e->exdir);
+      p=_popen(cmd,"r");
+      SetCurrentDirectoryA(back);
+    }
+    if(!p){ ed_log(e,"shell: cannot start"); }
+    else {
+        char clean[256];
+        while(fgets(buf,sizeof buf,p)){
+            size_t n=strlen(buf);
+            while(n>0&&(buf[n-1]=='\n'||buf[n-1]=='\r')) buf[--n]=0;
+            ed_sanitize(clean,sizeof clean,buf);
+            if(nlines<200) ed_log(e,"%s",clean);
+            nlines++;
+        }
+        if(nlines>=200) ed_log(e,"... truncated");
+        rc=_pclose(p);
+        if(rc) ed_log(e,"[exit %d]",rc);
+    }
+    ed_console_raw();   /* child shells leave cooked mode behind: fix it */
+    ex_refresh_keep(e);   /* the command may have created/deleted files */
+    e->shlen=0; e->shcur=0; e->status[0]=0;
+}
+/* Shell line keys; returns 1 when the key was consumed */
+static int ed_shell_key(Editor *e,WORD vk,WCHAR ch){
+    if(ch==27){   /* Esc: shrink log first, then leave the shell */
+        if(e->log_expand){ e->log_expand=0; e->log_scroll=0; return 0; }
+        e->focus=0; return 0;
+    }
+    if(ch==13){ ed_shell_run(e); return e->sh_quit; }
+    if(ch==8){                            /* Backspace */
+        if(e->shcur>0){
+            e->shcur--;
+            memmove(&e->shbuf[e->shcur],&e->shbuf[e->shcur+1],e->shlen-e->shcur);
+            if(e->shlen>0) e->shlen--;
+            e->shbuf[e->shlen]=0;
+        }
+        return 0;
+    }
+    if(ch==3){   /* ^C stops the shell cold: clear, collapse, leave */
+        e->shlen=0; e->shcur=0; e->shbuf[0]=0;
+        e->log_expand=0; e->log_scroll=0; e->focus=0;
+        return 0;
+    }
+    if(ch==22){   /* ^V pastes: system clipboard first, code clipboard next */
+        size_t slen=0; char *st=ed_sys_paste(&slen);
+        const char *s=st?st:e->clip;
+        size_t m=st?slen:e->cliplen, k=0;
+        char clean[1024]; size_t cn=0;
+        /* shell takes one line: cut at the first newline */
+        while(k<m&&cn+1<sizeof clean){
+            if(s[k]=='\n'||s[k]=='\r') break;
+            clean[cn++]=s[k++];
+        }
+        if(st) free(st);
+        if(cn==0) return 0;
+        if(e->shlen+cn>=sizeof e->shbuf) cn=sizeof e->shbuf-e->shlen-1;
+        if(cn==0) return 0;
+        memmove(&e->shbuf[e->shcur+cn],&e->shbuf[e->shcur],e->shlen-e->shcur+1);
+        memcpy(&e->shbuf[e->shcur],clean,cn);
+        e->shcur+=cn; e->shlen+=cn;
+        return 0;
+    }
+    if(ch==0){
+        if(vk==VK_LEFT&&e->shcur>0){ e->shcur--; return 0; }
+        if(vk==VK_RIGHT&&e->shcur<e->shlen){ e->shcur++; return 0; }
+        if(vk==VK_HOME){ e->shcur=0; return 0; }
+        if(vk==VK_END){ e->shcur=e->shlen; return 0; }
+        if(vk==VK_UP||vk==VK_DOWN){
+            int show=e->log_expand?3:1;
+            int max=e->logn-show; if(max<0) max=0;
+            if(e->log_expand){   /* look up through the output */
+                if(vk==VK_UP&&e->log_scroll<max) e->log_scroll++;
+                if(vk==VK_DOWN&&e->log_scroll>0) e->log_scroll--;
+                return 0;
+            }
+        }
+        if(vk==VK_UP&&e->shn>0){
+            if(e->shpos>0) e->shpos--;
+            snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
+            e->shlen=strlen(e->shbuf); e->shcur=e->shlen;
+            return 0;
+        }
+        if(vk==VK_DOWN){
+            if(e->shpos+1<e->shn){
+                e->shpos++;
+                snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
+            } else { e->shpos=e->shn; e->shbuf[0]=0; }
+            e->shlen=strlen(e->shbuf); e->shcur=e->shlen;
+            return 0;
+        }
+        if(vk==VK_F5){ ex_refresh_keep(e); return 0; }
+        if(vk==VK_F8){ ed_icons_toggle(e); return 0; }
+        return 0;
+    }
+    if(ch>=32){
+        unsigned long cp;
+        char tmp[4]; int m=0;
+        if(ch>=0xD800&&ch<=0xDBFF){ e->surr_hi=ch; return 0; }
+        if(ch>=0xDC00&&ch<=0xDFFF&&e->surr_hi){
+            cp=0x10000UL+(((unsigned long)(e->surr_hi-0xD800))<<10)+(unsigned long)(ch-0xDC00);
+            e->surr_hi=0;
+        } else { e->surr_hi=0; cp=(unsigned long)ch; }
+        if(cp<0x80) tmp[m++]=(char)cp;
+        else if(cp<0x800){ tmp[m++]=(char)(0xC0|(cp>>6)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+        else if(cp<0x10000){ tmp[m++]=(char)(0xE0|(cp>>12)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+        else { tmp[m++]=(char)(0xF0|(cp>>18)); tmp[m++]=(char)(0x80|((cp>>12)&0x3F)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
+        if(e->shlen+(size_t)m>=sizeof e->shbuf) return 0;
+        memmove(&e->shbuf[e->shcur+m],&e->shbuf[e->shcur],e->shlen-e->shcur+1);
+        memcpy(&e->shbuf[e->shcur],tmp,(size_t)m);
+        e->shcur+=(size_t)m; e->shlen+=(size_t)m;
+        return 0;
+    }
+    return 0;
 }
 
 /* Insert codepoint as UTF-8 */
@@ -5885,10 +7325,12 @@ static void ed_insert_cp(Editor *e,unsigned long cp){
 static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
     int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
     int alt=(ctl&(LEFT_ALT_PRESSED|RIGHT_ALT_PRESSED))!=0;
+    (void)hin; (void)old;
+    if(e->focus==2) return ed_shell_key(e,vk,ch);   /* bottom shell owns keys */
     if(alt&&!ctrl) return 0;   /* Ignore menu keys */
     if(ch==2){ e->show_ex=!e->show_ex; return 0; }   /* ^B toggles tree */
     if(e->focus==1){
-        if(ch==27||ch==5){ e->focus=0; return 0; }        /* Esc back to code */
+        if(ch==27||ch==5){ e->focus=0; ed_sug_update(e); return 0; }   /* Esc back to code */
         if(ch==13){ ex_open_idx(e,e->exsel); return 0; }
         if(ch==8){ ex_join(e,".."); return 0; }
         if(!ctrl&&(ch=='n'||ch=='N')){ ex_target_dir(e,e->namdir,sizeof e->namdir); ed_naming_start(e,1); return 0; }
@@ -5929,10 +7371,14 @@ static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
                 else ex_open_idx(e,e->exsel);
                 e->status[0]=0;
             }
+            else if(vk==VK_F5){ ex_refresh_keep(e); snprintf(e->status,sizeof e->status,"refreshed"); }
+            else if(vk==VK_F8){ ed_icons_toggle(e); }
         }
         return 0;
     }
     if(ch==27){
+        if(e->sug_on){ e->sug_on=0; return 0; }
+        if(!ed_sel_empty(e)){ e->sel_on=0; e->status[0]=0; return 0; }
         int u=ed_unsaved_count(e);
         if(u>0&&!e->quit_arm){ snprintf(e->status,sizeof e->status,"%d unsaved - Esc again quits (loses them)",u); e->quit_arm=1; return 0; }
         return 1;
@@ -5943,34 +7389,80 @@ static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
         return 0;
     }
     if(ch==0){
+        if(e->sug_on&&(vk==VK_UP||vk==VK_DOWN)){
+            if(vk==VK_UP) e->sug_sel=(e->sug_sel+e->sug_n-1)%e->sug_n;
+            else e->sug_sel=(e->sug_sel+1)%e->sug_n;
+            return 0;
+        }
+        if(vk==VK_UP||vk==VK_DOWN||vk==VK_LEFT||vk==VK_RIGHT){
+            e->sug_on=0;
+            if(ctl&SHIFT_PRESSED){
+                if(!e->sel_on){ e->sel_on=1; e->sel_ay=e->cy; e->sel_ax=e->cx; }
+            } else e->sel_on=0;
+        }
         if(vk==VK_UP&&e->cy>0){ e->cy--; e->status[0]=0; }
         else if(vk==VK_DOWN&&e->cy+1<e->n){ e->cy++; e->status[0]=0; }
         else if(vk==VK_LEFT){ ed_move_left(e); e->status[0]=0; }
         else if(vk==VK_RIGHT){ ed_move_right(e); e->status[0]=0; }
-        else if(vk==VK_OEM_3&&ctrl) ed_run(e,hin,old);   /* ^` runs */
+        else if(vk==VK_F5){ ex_refresh_keep(e); snprintf(e->status,sizeof e->status,"refreshed"); }
+        else if(vk==VK_OEM_3&&ctrl){ e->focus=2; e->status[0]=0; return 0; }   /* ^` jumps to shell */
         return 0;
     }
-    if(ch==13){ ed_newline(e); return 0; }
-    if(ch==8){ ed_backspace(e); return 0; }
-    if(ch==9){ ed_insert_bytes(e,"    ",4); return 0; }
+    if(ch==13){ if(e->sug_on){ ed_sug_accept(e); return 0; } ed_newline(e); return 0; }
+    if(ch==8){ ed_backspace(e); ed_sug_update(e); return 0; }
+    if(ch==9){ if(e->sug_on){ ed_sug_accept(e); return 0; } ed_insert_bytes(e,"    ",4); ed_sug_update(e); return 0; }
     if(ctrl){
-        if(ch==3){ ed_copy_line(e); return 0; }
-        if(ch==22){ if(e->clip) ed_insert_bytes(e,e->clip,e->cliplen);
-            else snprintf(e->status,sizeof e->status,"clipboard empty (^C copies the line)"); return 0; }
+        if(ch==3){ if(!ed_sel_empty(e)) ed_copy_sel(e); else ed_copy_line(e); return 0; }
+        if(ch==22){
+            size_t slen=0; char *st=ed_sys_paste(&slen);
+            if(st){ ed_insert_bytes(e,st,slen); free(st); }
+            else if(e->clip) ed_insert_bytes(e,e->clip,e->cliplen);
+            else snprintf(e->status,sizeof e->status,"clipboard empty (^C copies first)");
+            e->sug_on=0;
+            return 0;
+        }
+        if(ch==14&&e->sug_on){ e->sug_sel=(e->sug_sel+1)%e->sug_n; return 0; }
+        if(ch==16&&e->sug_on){ e->sug_sel=(e->sug_sel+e->sug_n-1)%e->sug_n; return 0; }
         if(ch==19){ ed_save(e); return 0; }
-        if(ch==18){ ed_run(e,hin,old); return 0; }
-        if(ch==5){ e->focus=1; e->status[0]=0; return 0; }
+        if(ch==26){ ed_undo(e); e->sug_on=0; return 0; }
+        if(ch==25){ ed_redo(e); e->sug_on=0; return 0; }
+        if(ch==5){ e->focus=1; ex_refresh_keep(e); e->status[0]=0; return 0; }
         return 0;
     }
     if(ch>=32){
+        if(e->sug_on){
+            int ident=(ch>='A'&&ch<='Z')||(ch>='a'&&ch<='z')||(ch>='0'&&ch<='9')||ch=='_';
+            if(!ident){ if(ch=='(') ed_sug_accept(e); else e->sug_on=0; }
+        }
         if(ch>=0xD800&&ch<=0xDBFF){ e->surr_hi=ch; return 0; }
         { unsigned long cp;
           if(ch>=0xDC00&&ch<=0xDFFF&&e->surr_hi){ cp=0x10000UL+(((unsigned long)(e->surr_hi-0xD800))<<10)+(unsigned long)(ch-0xDC00); e->surr_hi=0; }
           else { e->surr_hi=0; cp=(unsigned long)ch; }
           ed_insert_cp(e,cp); }
+        ed_sug_update(e);
         return 0;
     }
     return 0;
+}
+
+/* Move the code cursor to window-relative (x,y); clamps into view */
+static void ed_set_cursor_xy(Editor *e,int x,int y){
+    int H=e->vh>0?e->vh:24;
+    int EXW=e->show_ex?ED_EXW:0;
+    int rows=ed_crows(H,e);
+    long li=(long)e->top+(y-1);
+    if(li<0) li=0;
+    if(li>=(long)e->top+rows) li=(long)e->top+rows-1;
+    if(li>=(long)e->n) li=(long)e->n-1;
+    if(li<0) li=0;
+    e->focus=0; e->status[0]=0;
+    e->cy=(size_t)li; ed_clamp(e);
+    { size_t want=(x>=EXW+e->numw)?(size_t)(x-EXW-e->numw):0;
+      char *b=e->ln[e->cy].b; size_t L=e->ln[e->cy].len;
+      size_t k=0,d=0,col=0;
+      while(k<L&&d<e->dleft+want){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
+      while(k<L&&ed_is_cont((unsigned char)b[k])) k++;
+      e->cx=k; }
 }
 
 /* Click/wheel in buffer coords */
@@ -5984,7 +7476,7 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
         int x=(int)m->dwMousePosition.X-wx;
         int H=e->vh>0?e->vh:24;
         int EXW=e->show_ex?ED_EXW:0;
-        int rows=H>2?H-2:1;
+        int rows=ed_crows(H,e);
         if(EXW&&x<EXW){
             if(up){ if(e->extop>=3) e->extop-=3; else e->extop=0; }
             else e->extop+=3;
@@ -6018,15 +7510,41 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
         }
         return;
     }
+    if(m->dwEventFlags==MOUSE_MOVED){
+        /* drag-select: extend the code cursor while left is held */
+        if(e->sel_armed && (m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED) && e->focus==0){
+            int x=(int)m->dwMousePosition.X-wx, y=(int)m->dwMousePosition.Y-wy;
+            int EXW2=e->show_ex?ED_EXW:0;
+            if(EXW2==0||x>=EXW2) ed_set_cursor_xy(e,x,y);
+        }
+        return;
+    }
     if(m->dwEventFlags!=0 && m->dwEventFlags!=DOUBLE_CLICK) return;
     { int x=(int)m->dwMousePosition.X-wx, y=(int)m->dwMousePosition.Y-wy;
-      int H=e->vh>0?e->vh:24, W=e->vw>0?e->vw:80;
+      int H=e->vh>0?e->vh:24;
       int EXW=e->show_ex?ED_EXW:0;
-      size_t CW=(size_t)(W-EXW)-e->numw; if((int)CW<8) CW=8;
-      if(y<1||y>H-2||x<0) return;
+      int LOGSHOW=ed_logshow(e);
+      int CROWS=ed_crows(H,e);
+      if(y<1||y>H-1||x<0) return;
+      if(y>=H-1-LOGSHOW&&y<=H-2){   /* log panel: click leaves the shell */
+          if(e->focus==2){ e->focus=0; e->log_expand=0; e->log_scroll=0; }
+          return;
+      }
+      if(y==H-1){                  /* shell row: focus it, place the cursor */
+          int pc=(int)e->sh_promptw;
+          e->focus=2; e->status[0]=0;
+          if(x>=pc+1){ size_t want=(size_t)(x-pc-1);
+              size_t k=0,d=0;
+              while(k<e->shlen&&d<want){ int w0=ed_chw((unsigned char)e->shbuf[k],(int)d); d+=(size_t)w0; k++; }
+              e->shcur=k;
+          } else e->shcur=0;
+          return;
+      }
+      if(y>CROWS) return;          /* below the code area */
       if(m->dwButtonState&RIGHTMOST_BUTTON_PRESSED){
           /* Right-click: file menu anchored at mouse, else nothing */
           if(EXW&&x<EXW){
+              ex_refresh_keep(e);
               int r=y-1;
               e->focus=1;
               if(r==1||(r>=2 && e->extop+(r-2)<e->exn)){
@@ -6036,8 +7554,16 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
           }
           return;
       }
-      if(!(m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)) return;
+      if(!(m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)){
+          /* Left release: finish a drag (plain click clears the selection) */
+          if(e->sel_armed){
+              e->sel_armed=0;
+              if(e->sel_ay==e->cy && e->sel_ax==e->cx) e->sel_on=0;
+          }
+          return;
+      }
       if(EXW&&x<EXW){
+          ex_refresh_keep(e);
           int r=y-1;
           if(r==0){
               e->focus=1;
@@ -6049,16 +7575,18 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
           if(idx<e->exn){ e->focus=1; ex_open_idx(e,idx); }
           return;
       }
-      { size_t li=e->top+(y-1);
-        if(li>=e->n) return;
-        e->focus=0; e->status[0]=0;
-        e->cy=li; ed_clamp(e);
-        { size_t want=(x>=EXW+e->numw)?(size_t)(x-EXW-e->numw):0;
-          char *b=e->ln[li].b; size_t L=e->ln[li].len;
-          size_t k=0,d=0,col=0;
-          while(k<L&&d<e->dleft+want){ int w=ed_chw((unsigned char)b[k],(int)col); d+=(size_t)w; col+=(size_t)w; k++; }
-          while(k<L&&ed_is_cont((unsigned char)b[k])) k++;
-          e->cx=k; } } }
+      if(e->sug_on&&e->focus==0){
+          int x0,y0,bw,bh,i;
+          int W=e->vw>0?e->vw:80, H2=e->vh>0?e->vh:24;
+          ed_sug_geom(e,W,H2,&x0,&y0,&bw,&bh);
+          for(i=0;i<e->sug_n&&i<bh;i++){
+              if(y==y0+i&&x>=x0&&x<x0+bw){ e->sug_sel=i; ed_sug_accept(e); return; }
+          }
+      }
+      ed_set_cursor_xy(e,x,y);
+      e->sel_on=1; e->sel_ay=e->cy; e->sel_ax=e->cx; e->sel_armed=1;
+      ed_sug_update(e);
+    }
 }
 
 static int ed_isdir(const char *p){
@@ -6135,6 +7663,21 @@ static void lc_code(const char *start){
         & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT|ENABLE_QUICK_EDIT_MODE));
     memset(&e,0,sizeof e);
     e.show_ex=1;
+    ed_cfg_load(&e);   /* icons (-1 unset) + saved theme */
+    if(e.icons_nerd<0) e.icons_nerd=ed_console_has_nerd_font();
+    if(e.icons_nerd){
+        ed_font_ensure();   /* switch conhost to the bundled font when idle */
+        if(ed_in_wt())
+            ed_log(&e,"icons on - boxes instead of glyphs? set WT profile font to FiraCode Nerd Font Mono");
+        else if(!ed_console_has_nerd_font()){
+            /* Session-only downgrade (conhost only: the legacy check is
+               meaningless on Windows Terminal, where a save/F8 rules).
+               Tofu boxes are worse than no icons; the save is kept. */
+            e.icons_nerd=0;
+            ed_log(&e,"terminal font is not a Nerd Font - icons off (F8 forces them on)");
+        }
+    }
+    ed_plug_scan(&e);   /* built-in luc + plugin/ folders */
     if(start&&*start){
         if(ed_isdir(start)){
             snprintf(e.exdir,sizeof e.exdir,"%s",start);
@@ -6203,6 +7746,7 @@ static void lc_code(const char *start){
                                     (int)ir.Event.MouseEvent.dwMousePosition.Y-wy,
                                     e.vw>0?e.vw:80, e.vh>0?e.vh:24);
                                 if(!e.menu) e.click_eat=1;
+                                if(e.menu||e.naming){ ed_draw_modal(&e); continue; }
                                 break;
                             }
                         }
@@ -6214,11 +7758,113 @@ static void lc_code(const char *start){
                 if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
                 ed_popup_key(&e,ir.Event.KeyEvent.wVirtualKeyCode,
                              ir.Event.KeyEvent.uChar.UnicodeChar);
+                if(e.menu||e.naming){ ed_draw_modal(&e); continue; }
+                break;
+            }
+            if(e.show_plugins){
+                /* :plugin modal owns input until dismissed */                if(ir.EventType==MOUSE_EVENT){
+                    WORD f=ir.Event.MouseEvent.dwEventFlags;
+                    if(f==MOUSE_MOVED) continue;
+                    if(f==0||f==DOUBLE_CLICK){
+                        DWORD bs=ir.Event.MouseEvent.dwButtonState;
+                        HANDLE hh=GetStdHandle(STD_OUTPUT_HANDLE);
+                        CONSOLE_SCREEN_BUFFER_INFO bb;
+                        int wx=0,wy=0;
+                        if(GetConsoleScreenBufferInfo(hh,&bb)){ wx=bb.srWindow.Left; wy=bb.srWindow.Top; }
+                        if(bs&FROM_LEFT_1ST_BUTTON_PRESSED){
+                            ed_plug_click(&e,
+                                (int)ir.Event.MouseEvent.dwMousePosition.X-wx,
+                                (int)ir.Event.MouseEvent.dwMousePosition.Y-wy,
+                                e.vw>0?e.vw:80, e.vh>0?e.vh:24);
+                            if(!e.show_plugins) e.click_eat=1;
+                        } else e.show_plugins=0;
+                        if(e.show_plugins){ ed_draw_modal(&e); continue; }
+                        break;
+                    }
+                    continue;
+                }
+                if(ir.EventType==WINDOW_BUFFER_SIZE_EVENT) break;
+                if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
+                { WORD vk=ir.Event.KeyEvent.wVirtualKeyCode;
+                  WCHAR ch=ir.Event.KeyEvent.uChar.UnicodeChar;
+                  if(ch==27){ e.show_plugins=0; }
+                  else if(ch==13||ch==32){
+                      if(e.plug_sel<e.nplugs){
+                          e.plugs[e.plug_sel].enabled=!e.plugs[e.plug_sel].enabled;
+                          ed_plug_write(&e,e.plug_sel);
+                      }
+                  }
+                  else if(ch==0){
+                      int n=e.nplugs<ED_PLUGSHOW?e.nplugs:ED_PLUGSHOW;
+                      if(vk==VK_UP&&e.plug_sel>0) e.plug_sel--;
+                      else if(vk==VK_DOWN&&e.plug_sel+1<e.nplugs) e.plug_sel++;
+                      if(e.plug_sel<e.plug_top) e.plug_top=e.plug_sel;
+                      if(e.plug_sel>=e.plug_top+n) e.plug_top=e.plug_sel-n+1;
+                  } }
+                if(e.show_plugins){ ed_draw_modal(&e); continue; }
+                break;
+            }
+            if(e.show_settings){
+                /* :setting modal owns input until dismissed */
+                if(ir.EventType==MOUSE_EVENT){
+                    WORD f=ir.Event.MouseEvent.dwEventFlags;
+                    if(f==MOUSE_MOVED) continue;
+                    if(f==0||f==DOUBLE_CLICK){
+                        DWORD bs=ir.Event.MouseEvent.dwButtonState;
+                        HANDLE hh=GetStdHandle(STD_OUTPUT_HANDLE);
+                        CONSOLE_SCREEN_BUFFER_INFO bb;
+                        int wx=0,wy=0;
+                        if(GetConsoleScreenBufferInfo(hh,&bb)){ wx=bb.srWindow.Left; wy=bb.srWindow.Top; }
+                        if(bs&FROM_LEFT_1ST_BUTTON_PRESSED){
+                            ed_set_click(&e,
+                                (int)ir.Event.MouseEvent.dwMousePosition.X-wx,
+                                (int)ir.Event.MouseEvent.dwMousePosition.Y-wy,
+                                e.vw>0?e.vw:80, e.vh>0?e.vh:24);
+                            if(!e.show_settings) e.click_eat=1;
+                        } else e.show_settings=0;
+                        if(e.show_settings){ ed_draw_modal(&e); continue; }
+                        break;
+                    }
+                    continue;
+                }
+                if(ir.EventType==WINDOW_BUFFER_SIZE_EVENT) break;
+                if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
+                { WORD vk=ir.Event.KeyEvent.wVirtualKeyCode;
+                  WCHAR ch=ir.Event.KeyEvent.uChar.UnicodeChar;
+                  int ntabs=1+e.nplugs, nrows=ed_set_nrows(&e,e.set_tab);
+                  if(ch==27){ e.show_settings=0; }
+                  else if(ch==13||ch==32){
+                      if(e.set_left){ e.set_left=0; }
+                      else ed_set_activate(&e);
+                  }
+                  else if(ch==9){ e.set_left=!e.set_left; }
+                  else if(ch==0){
+                      if(vk==VK_LEFT||vk==VK_RIGHT){ e.set_left=!e.set_left; }
+                      else if(vk==VK_UP||vk==VK_DOWN){
+                          if(e.set_left){
+                              if(vk==VK_UP&&e.set_tab>0){ e.set_tab--; e.set_row=0; }
+                              else if(vk==VK_DOWN&&e.set_tab+1<ntabs){ e.set_tab++; e.set_row=0; }
+                          } else {
+                              if(vk==VK_UP&&e.set_row>0) e.set_row--;
+                              else if(vk==VK_DOWN&&e.set_row+1<nrows) e.set_row++;
+                          }
+                      }
+                  } }
+                if(e.show_settings){ ed_draw_modal(&e); continue; }
                 break;
             }
             if(ir.EventType==MOUSE_EVENT){
                 WORD f=ir.Event.MouseEvent.dwEventFlags;
-                if(f==MOUSE_MOVED) continue;   /* Hover redraw flickers */
+                if(f==MOUSE_MOVED){
+                    /* Only drag-select redraws on move; plain hover stays cheap */
+                    if(e.sel_armed &&
+                       (ir.Event.MouseEvent.dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)){
+                        e.click_eat=0;
+                        ed_mouse(&e,&ir.Event.MouseEvent);
+                        break;
+                    }
+                    continue;
+                }
                 if((f==0||f==DOUBLE_CLICK)
                    && (ir.Event.MouseEvent.dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)
                    && e.click_eat){ e.click_eat=0; continue; }
@@ -6239,6 +7885,7 @@ done:
     SetConsoleMode(hin,old);
     ex_free(&e);
     ed_free(&e);
+    ed_undo_clear(&e);
     { size_t si; for(si=0;si<e.nstash;si++){ size_t k; for(k=0;k<e.stash[si].n;k++) free(e.stash[si].ln[k].b); free(e.stash[si].ln); }
       free(e.stash); e.stash=NULL; e.nstash=0; }
     printf("\x1b[?25h\x1b[?7h\x1b[?1049l\n");
