@@ -1,0 +1,32 @@
+import libs
+
+create function is_english_letter(c)
+    return (c >= "A" and c <= "Z") or (c >= "a" and c <= "z")
+end
+
+create function letter_to_binary(letter)
+    if not is_english_letter(letter) then
+        error("letter_to_binary: expected an English letter, got " .. tostring(letter), 2)
+    end
+    create code = string.byte(letter)
+    create bits = ""
+    repeat -1, 7 as i do
+        bits = bits .. tostring(math.floor(code / (2 ^ i)) % 2)
+    end
+    return bits
+end
+
+create function english_to_binary(text)
+    create out = {}
+    repeat 1, len(text) as i do
+        create pos = i + 1
+        create ch = string.sub(text, pos, pos)
+        if is_english_letter(ch) then
+            out[len(out) + 1] = letter_to_binary(ch)
+        end
+    end
+    return table.concat(out, " ")
+end
+
+print(letter_to_binary("A"))
+print(english_to_binary("Hello"))

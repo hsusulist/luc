@@ -3,6 +3,9 @@
 #if defined(_WIN32) && !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN      /* lean windows.h (net uses winsock2) */
 #endif
+#if defined(_WIN32) && !defined(_CRT_RAND_S)
+#define _CRT_RAND_S
+#endif
 #include "luc.h"
 
 
@@ -1773,7 +1776,8 @@ LFN(f_b_rshift){ UNUSED_SELF;
     RET(0,mknum((double)(uint32_t)(n<=-32||n>=32?0:(n>=0? a>>n : a<<(-n))))); return 1; }
 LFN(f_b_arshift){ UNUSED_SELF;
     uint32_t a=checku32(L,base,nargs,0,"arshift"); int n=checkint(L,base,nargs,1,"arshift");
-    if(n<0){ RET(0,mknum((double)(uint32_t)(-n>=32?0:a<<(-n)))); return 1; }
+    if(n==0){ RET(0,mknum((double)a)); return 1; }
+    if(n<0){ int m=-n; RET(0,mknum((double)(uint32_t)(m>=32?0:a<<m))); return 1; }
     if(n>=32){ RET(0,mknum((double)(uint32_t)((a&0x80000000u)?0xFFFFFFFFu:0u))); return 1; }
     uint32_t r=a>>n;
     if(a&0x80000000u) r|=(uint32_t)(0xFFFFFFFFu<<(32-n));
@@ -1790,7 +1794,7 @@ LFN(f_b_extract){ UNUSED_SELF;
     uint32_t a=checku32(L,base,nargs,0,"extract");
     int f=checkint(L,base,nargs,1,"extract");
     int w=nargs>=3?checkint(L,base,nargs,2,"extract"):1;
-    if(f<0||w<1||f+w>32) luc_error("bit32.extract: field out of range");
+    if(f<0||w<1||f>31||w>32||f>32-w) luc_error("bit32.extract: field out of range");
     uint32_t mask = (w==32)?0xFFFFFFFFu:((1u<<w)-1u);
     RET(0,mknum((double)((a>>f)&mask))); return 1; }
 LFN(f_b_replace){ UNUSED_SELF;
@@ -1798,7 +1802,7 @@ LFN(f_b_replace){ UNUSED_SELF;
     uint32_t v=checku32(L,base,nargs,1,"replace");
     int f=checkint(L,base,nargs,2,"replace");
     int w=nargs>=4?checkint(L,base,nargs,3,"replace"):1;
-    if(f<0||w<1||f+w>32) luc_error("bit32.replace: field out of range");
+    if(f<0||w<1||f>31||w>32||f>32-w) luc_error("bit32.replace: field out of range");
     uint32_t mask=((w==32)?0xFFFFFFFFu:((1u<<w)-1u))<<f;
     RET(0,mknum((double)((a&~mask)|((v<<f)&mask)))); return 1; }
 LFN(f_m_tointeger){ UNUSED_SELF;
@@ -4877,7 +4881,13 @@ static int ws_send_frame(TLSSession *tls,sock_t fd,const char *p,size_t n,
     unsigned char h[10]; size_t hl=2;
     h[0]=0x81;   /* FIN + text */
     unsigned char mask[4];
-    unsigned rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+    unsigned rnd;
+#if defined(_WIN32)
+rand_s(&rnd);
+rnd=rnd*2654435761u ^ (unsigned)luc_now();
+#else
+rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+#endif
     mask[0]=(unsigned char)(rnd>>24); mask[1]=(unsigned char)(rnd>>16);
     mask[2]=(unsigned char)(rnd>>8); mask[3]=(unsigned char)rnd;
     if(n<126){ h[1]=(unsigned char)(0x80|n); }
@@ -4984,7 +4994,13 @@ static int ws_build_frame(const char *p,size_t n,char **out,size_t *outlen){
     char *f=(char*)malloc(hl+4+n);
     if(!f) return -1;
     unsigned char mask[4];
-    unsigned rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+    unsigned rnd;
+#if defined(_WIN32)
+rand_s(&rnd);
+rnd=rnd*2654435761u ^ (unsigned)luc_now();
+#else
+rnd=(unsigned)rand()*2654435761u ^ (unsigned)luc_now();
+#endif
     mask[0]=(unsigned char)(rnd>>24); mask[1]=(unsigned char)(rnd>>16);
     mask[2]=(unsigned char)(rnd>>8); mask[3]=(unsigned char)rnd;
     f[0]=(char)0x81;
@@ -5063,7 +5079,13 @@ LFN(f_net_ws_connect){
         }
         /* handshake */
         unsigned char nonce[16];
-        for(int i=0;i<16;i++) nonce[i]=(unsigned char)(rand()&255);
+        for(int i=0;i<16;i++){ unsigned int _r;
+#if defined(_WIN32)
+            rand_s(&_r);
+#else
+            _r=(unsigned int)rand();
+#endif
+            nonce[i]=(unsigned char)(_r&255); }
         char key[32]; ws_b64(nonce,16,key);
         char hs[1024];
         int hn=snprintf(hs,sizeof hs,

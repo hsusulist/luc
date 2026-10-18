@@ -185,7 +185,8 @@ static unsigned val_hash(Value v){
         case LT_BOOL: return v.u.b?1u:2u;
         case LT_NUM: {
             double d=v.u.n;
-            if(d==(double)(long long)d) return (unsigned)((long long)d)*2654435761u;
+            if(isfinite(d) && d >= -0x1p63 && d < 0x1p63 && d == (double)(long long)d)
+                return (unsigned)((long long)d)*2654435761u;
             unsigned char *p=(unsigned char*)&d; return strhash((char*)p,(int)sizeof d);
         }
         case LT_STR:  return AS_STR(v)->hash;
@@ -224,8 +225,14 @@ static void hash_set(Table *t,Value k,Value v){
     t->ents[i].k=k; t->ents[i].v=v; t->ecount++;
 }
 static void hash_grow(Table *t){
-    int nc = t->ecap? t->ecap*2 : 8;
+    int nc;
+    if(t->ecap==0) nc=8;
+    else {
+        if(t->ecap > INT_MAX/2) luc_error("out of memory");
+        nc=t->ecap*2;
+    }
     Entry *old=t->ents; int oc=t->ecap;
+    if((size_t)nc > ((size_t)-1)/sizeof(Entry)) luc_error("out of memory");
     t->ents=(Entry*)lcalloc(sizeof(Entry)*(size_t)nc);
     t->ecap=nc; t->ecount=0;
     for(int i=0;i<oc;i++)
@@ -241,7 +248,18 @@ static int arr_index(Value k,int *out){
 }
 static void arr_reserve(Table *t,int n){
     if(n<=t->acap) return;
-    int nc=t->acap? t->acap*2 : 8; while(nc<n) nc*=2;
+    if(n<0) luc_error("out of memory");
+    int nc;
+    if(t->acap==0) nc=8;
+    else {
+        if(t->acap > INT_MAX/2) luc_error("out of memory");
+        nc=t->acap*2;
+    }
+    while(nc < n){
+        if(nc > INT_MAX/2) luc_error("out of memory");
+        nc *= 2;
+    }
+    if((size_t)nc > ((size_t)-1)/sizeof(Value)) luc_error("out of memory");
     t->arr=(Value*)lrealloc(t->arr,sizeof(Value)*(size_t)nc);
     for(int i=t->acap;i<nc;i++) t->arr[i]=NIL;
     t->acap=nc;
@@ -665,23 +683,36 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
     if(isdigit((unsigned char)c)||(c=='.'&&lx->p+1<lx->end&&isdigit((unsigned char)lx->p[1]))){
         const char *s=lx->p;
         if(c=='0'&&lx->p+1<lx->end&&(lx->p[1]=='x'||lx->p[1]=='X')){
+            const char *hex=s+2;
             lx->p+=2;
+            if(lx->p>=lx->end||!isxdigit((unsigned char)*lx->p))
+                lex_error(lx,"malformed hex number");
             while(lx->p<lx->end&&isxdigit((unsigned char)*lx->p)) lx->p++;
-            *num=(double)strtoull(s+2,NULL,16);
+            errno=0;
+            char *hend=NULL;
+            unsigned long long hv=strtoull(hex,&hend,16);
+            if(hend!=lx->p) lex_error(lx,"malformed hex number");
+            if(errno==ERANGE) lex_error(lx,"hex number out of range");
+            *num=(double)hv;
             return TK_NUMBER;
         }
         while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++;
         if(lx->p<lx->end&&*lx->p=='.'){ lx->p++;
             while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++; }
         if(lx->p<lx->end&&(*lx->p=='e'||*lx->p=='E')){
+            const char *es=lx->p;
             lx->p++;
             if(lx->p<lx->end&&(*lx->p=='+'||*lx->p=='-')) lx->p++;
-            while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++;
+            int hasdig=0;
+            while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)){ lx->p++; hasdig=1; }
+            if(!hasdig) lex_error(lx,"malformed number");
         }
         char tmp[64]; int len=(int)(lx->p-s);
         if(len>=(int)sizeof tmp) lex_error(lx,"malformed number");
         memcpy(tmp,s,(size_t)len); tmp[len]=0;
-        *num=strtod(tmp,NULL);
+        char *tnumend=NULL;
+        *num=strtod(tmp,&tnumend);
+        if(tnumend!=tmp+len) lex_error(lx,"malformed number");
         return TK_NUMBER;
     }
 /* short strings */
@@ -991,14 +1022,20 @@ static Expr *parse_postfix(Parser *ps,Expr *e){
                 if(ps->lx.t==':'){                  /* t[:n] */
                     lx_next(&ps->lx);
                     Expr *sl=new_expr(E_SLICE,line); sl->a=e; sl->b=NULL;
+                    ps->inkey=1;
                     if(ps->lx.t!=']') sl->c=parse_expr(ps);
+                    ps->inkey=0;
                     expect(ps,']'); e=sl; break;
                 }
+                ps->inkey=1;
                 Expr *k=parse_expr(ps);
+                ps->inkey=0;
                 if(ps->lx.t==':'){                  /* t[a:b] */
                     lx_next(&ps->lx);
                     Expr *sl=new_expr(E_SLICE,line); sl->a=e; sl->b=k;
+                    ps->inkey=1;
                     if(ps->lx.t!=']') sl->c=parse_expr(ps);
+                    ps->inkey=0;
                     expect(ps,']'); e=sl; break;
                 }
                 expect(ps,']');
@@ -2472,7 +2509,8 @@ static Value vm_index(Value t,Value k){
         case LT_LIST:
             if(k.t==LT_NUM){
                 double d=k.u.n;
-                if(d!=d || d!=floor(d)) return NIL;
+                if(!isfinite(d) || d!=floor(d)) return NIL;
+                if(d < (double)INT_MIN || d > (double)INT_MAX) return NIL;
                 int i=(int)d, n=AS_TAB(t)->alen;
                 if(i<0) i+=n;
                 if(i>=0 && i<n) return AS_TAB(t)->arr[i];
@@ -2488,7 +2526,8 @@ static Value vm_index(Value t,Value k){
         case LT_STR:
             if(k.t==LT_NUM){
                 double d=k.u.n;
-                if(d!=d || d!=floor(d)) return NIL;
+                if(!isfinite(d) || d!=floor(d)) return NIL;
+                if(d < (double)INT_MIN || d > (double)INT_MAX) return NIL;
                 int i=(int)d, n=AS_STR(t)->len;
                 if(i<0) i+=n;
                 if(i>=0 && i<n) return strv(AS_STR(t)->s+i,1);
@@ -2523,10 +2562,11 @@ static Value vm_index(Value t,Value k){
 static void vm_setindex(Value t,Value k,Value v){
     if(t.t==LT_LIST && k.t==LT_NUM){
         double d=k.u.n;
-        if(d!=d || d!=floor(d)) luc_error("list index is not an integer");
+        if(!isfinite(d) || d!=floor(d)) luc_error("list index is not an integer");
+        if(d < (double)INT_MIN || d > (double)INT_MAX) luc_error("list index out of range");
         int i=(int)d, n=AS_TAB(t)->alen;
         if(i<0) i+=n;
-        if(i<0) luc_error("list index out of range");
+        if(i<0 || i>n || i==INT_MAX) luc_error("list index out of range");
         tab_set(AS_TAB(t),mknum((double)(i+1)),v);
         return;
     }
@@ -3347,7 +3387,10 @@ double checknum(LucState *L,int base,int nargs,int i,const char *fn){
     return 0;
 }
 int checkint(LucState *L,int base,int nargs,int i,const char *fn){
-    return (int)checknum(L,base,nargs,i,fn);
+    double d=checknum(L,base,nargs,i,fn);
+    if(!isfinite(d) || d!=floor(d) || d < (double)INT_MIN || d > (double)INT_MAX)
+        luc_error("%s: integer expected", fn);
+    return (int)d;
 }
 Str *checkstr(LucState *L,int base,int nargs,int i,const char *fn){
     Value v=AR(i);
@@ -3370,7 +3413,9 @@ Buffer *checkbuf(LucState *L,int base,int nargs,int i,const char *fn){
 }
 uint32_t checku32(LucState *L,int base,int nargs,int i,const char *fn){
     double d=checknum(L,base,nargs,i,fn);
-    return (uint32_t)(int64_t)d;
+    if(!isfinite(d) || d < 0.0 || d > 4294967295.0)
+        luc_error("%s: value out of uint32 range", fn);
+    return (uint32_t)d;
 }
 /* module system */
 
@@ -3719,17 +3764,17 @@ static int pkg_http_get(const char *url,const char *outpath,long *outsize){
                         ok=1;
                         for(;;){
                             DWORD avail=0, rd=0;
-                            if(!WinHttpQueryDataAvailable(hr,&avail)||!avail) break;
+                            if(!WinHttpQueryDataAvailable(hr,&avail)){ ok=0; break; }
+                            if(avail==0) break;
                             char *buf=(char*)malloc(avail);
                             if(!buf){ ok=0; break; }
-                            if(WinHttpReadData(hr,buf,avail,&rd)&&rd){
-                                if(fwrite(buf,1,rd,f)!=rd){ ok=0; free(buf); break; }
-                                if(outsize) *outsize+=rd;
-                            }
+                            if(!WinHttpReadData(hr,buf,avail,&rd)){ ok=0; free(buf); break; }
+                            if(rd==0) break;
+                            if(fwrite(buf,1,rd,f)!=rd){ ok=0; free(buf); break; }
+                            if(outsize) *outsize+=rd;
                             free(buf);
-                            if(!rd) break;
                         }
-                        fclose(f);
+                        if(fclose(f)!=0) ok=0;
                         if(!ok) remove(outpath);
                     }
                 }
@@ -3907,26 +3952,33 @@ static int pkg_unpack_bundle(const char *path,const char *outdir){
         size_t wl=ll;                          /* write length w/o CR */
         if(wl>0 && line[wl-1]=='\r') wl--;
         if(wl>=11 && !strncmp(line,"#=lucfile: ",11)){
-            if(cur){ fclose(cur); cur=NULL; }
+            if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
             char name[256];
             size_t n2=wl-11;
-            if(n2>=sizeof name) n2=sizeof name-1;
+            if(n2==0 || n2>=sizeof name){ free(src); if(cur) fclose(cur); return -1; }
             memcpy(name,line+11,n2); name[n2]=0;
+            if(strchr(name,'/')||strchr(name,'\\')||strchr(name,':')||
+               !strcmp(name,".")||!strcmp(name,"..")){
+                free(src); if(cur) fclose(cur); return -1; }
             char out[1400];
             snprintf(out,sizeof out,"%s/%s",outdir,name);
             cur=fopen(out,"wb");
-            if(cur) count++;
+            if(!cur){ free(src); return -1; }
+            count++;
         } else if(wl>=8 && !strncmp(line,"#=endpkg",8)){
-            if(cur){ fclose(cur); cur=NULL; }
+            if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
         } else if(wl>=9 && !strncmp(line,"#=lucpkg:",9)){
 /* header, ignore */
         } else if(cur){
-            fwrite(line,1,wl,cur);
-            fputc('\n',cur);
+            if(fwrite(line,1,wl,cur)!=wl || fputc('\n',cur)==EOF){ /* track error */
+                /* close and mark failure */
+                fclose(cur); cur=NULL;
+                free(src); return -1;
+            }
         }
         i+=ll+(nl?1:0);
     }
-    if(cur) fclose(cur);
+    if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
     free(src);
     return count;
 }
@@ -4175,6 +4227,7 @@ static void luc_win_attach_console(void){
 }
 #else
 #define luc_win_attach_console() ((void)0)
+#define luc_win_utf8_console() ((void)0)
 #endif
 
 /* full Apache-2.0 text (root LICENCE) for the `license` help topic */
@@ -6371,14 +6424,16 @@ static void ex_expand(Editor *e,size_t idx){
     char pat[1120];
     WIN32_FIND_DATAA fd;
     HANDLE fh;
-    ExItem tmp[512]; size_t tn=0, i;
+    ExItem *tmp=NULL; size_t tcap=0, tn=0, i;
+    int truncated=0;
     if(idx>=e->exn || !e->ex[idx].isdir || e->ex[idx].expanded) return;
     snprintf(pat,sizeof pat,"%s\\*",e->ex[idx].full);
     fh=FindFirstFileA(pat,&fd);
     if(fh==INVALID_HANDLE_VALUE) return;
     do{
         if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
-        if(tn>=512) break;
+        if(tn>=4096){ truncated=1; break; }
+        if(tn==tcap){ tcap=tcap?tcap*2:64; tmp=(ExItem*)lrealloc(tmp,sizeof(ExItem)*tcap); }
         tmp[tn].name=(char*)lmalloc(strlen(fd.cFileName)+1);
         memcpy(tmp[tn].name,fd.cFileName,strlen(fd.cFileName)+1);
         { char fb[1120]; snprintf(fb,sizeof fb,"%s\\%s",e->ex[idx].full,fd.cFileName);
@@ -6392,6 +6447,7 @@ static void ex_expand(Editor *e,size_t idx){
     qsort(tmp,tn,sizeof(ExItem),ex_cmp);
     if(e->exn+tn>ED_EX_MAX){
         for(i=0;i<tn;i++){ free(tmp[i].name); free(tmp[i].full); }
+        free(tmp);
         snprintf(e->status,sizeof e->status,"too many files (showing %d)",(int)e->exn);
         return;
     }
@@ -6399,8 +6455,10 @@ static void ex_expand(Editor *e,size_t idx){
         e->ex=(ExItem*)lrealloc(e->ex,sizeof(ExItem)*e->excap); }
     memmove(&e->ex[idx+1+tn],&e->ex[idx+1],(e->exn-idx-1)*sizeof(ExItem));
     memcpy(&e->ex[idx+1],tmp,tn*sizeof(ExItem));
+    free(tmp);
     e->exn+=tn;
-    e->ex[idx].expanded=1;
+    if(truncated){ e->ex[idx].expanded=0; snprintf(e->status,sizeof e->status,"folder truncated at %d items",(int)tn); }
+    else e->ex[idx].expanded=1;
     e->root_shut=0;
 }
 
@@ -6559,7 +6617,7 @@ static int ed_copy_tree(const char *src,const char *dst,int depth){
     { char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
       snprintf(pat,sizeof pat,"%s\\*",src);
       fh=FindFirstFileA(pat,&fd);
-      if(fh==INVALID_HANDLE_VALUE) return 1;
+      if(fh==INVALID_HANDLE_VALUE) return 0;
       i=0;
       do{
           if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
@@ -6567,8 +6625,9 @@ static int ed_copy_tree(const char *src,const char *dst,int depth){
             snprintf(s2,sizeof s2,"%s\\%s",src,fd.cFileName);
             snprintf(d2,sizeof d2,"%s\\%s",dst,fd.cFileName);
             if(!ed_copy_tree(s2,d2,depth+1)){ FindClose(fh); return 0; } }
-          if(++i>2000) break;
+          if(++i>2000){ FindClose(fh); return 0; }
       }while(FindNextFileA(fh,&fd));
+      if(GetLastError()!=ERROR_NO_MORE_FILES){ FindClose(fh); return 0; }
       FindClose(fh); }
     return 1;
 }

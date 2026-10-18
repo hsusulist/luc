@@ -43,9 +43,12 @@ Start-Sleep -Milliseconds 300
 New-Item -ItemType Directory -Force -Path $AppDir | Out-Null
 
 function Test-LucExe {
-    # Smoke test: the exe must start AND load SDL2.dll (where present).
-    # A missing/unblocked-failed DLL gives a huge negative exit code.
+    # Smoke test: the exe must start, report the current version, and run
+    # a basic feature. An old/mismatched binary fails the version check.
     param([string]$Exe)
+    $ver = & $Exe --version 2>&1
+    if ($LASTEXITCODE -ne 0) { return $false }
+    if ($ver -notmatch '0\.2-beta1') { return $false }
     & $Exe -e 'print(1)' | Out-Null
     return ($LASTEXITCODE -eq 0)
 }
