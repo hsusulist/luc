@@ -2446,6 +2446,15 @@ void lucL_open_string(void){
 #  define W_LIB_OPEN(n)  dlopen(n,RTLD_NOW)
 #  define W_LIB_SYM(h,n) dlsym(h,n)
 #endif
+
+/* pixel/size args: accept fractional numbers (x+vx*dt) and floor them;
+   NaN/inf/out-of-range still error. */
+static int w_checkpx(LucState *L,int base,int nargs,int i,const char *fn){
+    double d=checknum(L,base,nargs,i,fn);
+    if(!isfinite(d) || d < (double)INT_MIN || d > (double)INT_MAX)
+        luc_error("%s: bad number for argument #%d",fn,i+1);
+    return (int)floor(d);
+}
 #ifndef LUC_NO_TTF
 typedef int (*w_TTF_Init_t)(void);
 typedef TTF_Font TTF_Font_opaque;
@@ -3102,8 +3111,8 @@ static void w_start_impl(const char *title,int ww,int hh){
 LFN(f_w_start){ UNUSED_SELF;
     if(W.started) luc_error("window: already started");
     const char *title = nargs>=1? checkstr(L,base,nargs,0,"start")->s : "LUC";
-    int ww = nargs>=2? checkint(L,base,nargs,1,"start") : 800;
-    int hh = nargs>=3? checkint(L,base,nargs,2,"start") : 600;
+    int ww = nargs>=2? w_checkpx(L,base,nargs,1,"start") : 800;
+    int hh = nargs>=3? w_checkpx(L,base,nargs,2,"start") : 600;
     w_start_impl(title,ww,hh);
     RET(0,mkbool(1)); return 1;
 }
@@ -3230,8 +3239,8 @@ LFN(f_w_update){ UNUSED_SELF; (void)base;(void)nargs;(void)L;
 /* go(title,w,h,draw): run 60fps loop until exit. */
 LFN(f_w_go){ UNUSED_SELF;
     const char *title = nargs>=1? checkstr(L,base,nargs,0,"go")->s : "LUC";
-    int ww = nargs>=2? checkint(L,base,nargs,1,"go") : 800;
-    int hh = nargs>=3? checkint(L,base,nargs,2,"go") : 600;
+    int ww = nargs>=2? w_checkpx(L,base,nargs,1,"go") : 800;
+    int hh = nargs>=3? w_checkpx(L,base,nargs,2,"go") : 600;
     Value fn = nargs>=4? AR(3) : NIL;
     if(fn.t!=LT_FUNC && fn.t!=LT_CFUNC)
         luc_error("window.go: argument #4 must be a function like function(dt) ... end");
@@ -3263,7 +3272,7 @@ LFN(f_w_size){ UNUSED_SELF; (void)nargs;
 }
 LFN(f_w_resize){ UNUSED_SELF;
     w_need();
-    int ww=checkint(L,base,nargs,0,"resize"), hh=checkint(L,base,nargs,1,"resize");
+    int ww=w_checkpx(L,base,nargs,0,"resize"), hh=w_checkpx(L,base,nargs,1,"resize");
     if(ww<1)ww=1; if(hh<1)hh=1;
     SDL_SetWindowSize(W.win,ww,hh); W.w=ww; W.h=hh;
     return 0;
@@ -3284,32 +3293,32 @@ LFN(f_w_clear){ UNUSED_SELF;
 }
 LFN(f_w_pixel){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"pixel"), y=checkint(L,base,nargs,1,"pixel");
+    int x=w_checkpx(L,base,nargs,0,"pixel"), y=w_checkpx(L,base,nargs,1,"pixel");
     w_setcolor(w_color(w_argc(L,base,nargs,2)));
     SDL_RenderDrawPoint(W.ren,x,y); return 0;
 }
 LFN(f_w_line){ UNUSED_SELF;
     w_need();
-    int x1=checkint(L,base,nargs,0,"line"), y1=checkint(L,base,nargs,1,"line");
-    int x2=checkint(L,base,nargs,2,"line"), y2=checkint(L,base,nargs,3,"line");
+    int x1=w_checkpx(L,base,nargs,0,"line"), y1=w_checkpx(L,base,nargs,1,"line");
+    int x2=w_checkpx(L,base,nargs,2,"line"), y2=w_checkpx(L,base,nargs,3,"line");
     w_setcolor(w_color(w_argc(L,base,nargs,4)));
     SDL_RenderDrawLine(W.ren,x1,y1,x2,y2); return 0;
 }
 LFN(f_w_rect){ UNUSED_SELF;
     w_need();
     SDL_Rect r;
-    r.x=checkint(L,base,nargs,0,"rect"); r.y=checkint(L,base,nargs,1,"rect");
-    r.w=checkint(L,base,nargs,2,"rect"); r.h=checkint(L,base,nargs,3,"rect");
+    r.x=w_checkpx(L,base,nargs,0,"rect"); r.y=w_checkpx(L,base,nargs,1,"rect");
+    r.w=w_checkpx(L,base,nargs,2,"rect"); r.h=w_checkpx(L,base,nargs,3,"rect");
     w_setcolor(w_color(w_argc(L,base,nargs,4)));
     SDL_RenderFillRect(W.ren,&r); return 0;
 }
 LFN(f_w_rect_outline){ UNUSED_SELF;
     w_need();
     SDL_Rect r;
-    r.x=checkint(L,base,nargs,0,"rect_outline"); r.y=checkint(L,base,nargs,1,"rect_outline");
-    r.w=checkint(L,base,nargs,2,"rect_outline"); r.h=checkint(L,base,nargs,3,"rect_outline");
+    r.x=w_checkpx(L,base,nargs,0,"rect_outline"); r.y=w_checkpx(L,base,nargs,1,"rect_outline");
+    r.w=w_checkpx(L,base,nargs,2,"rect_outline"); r.h=w_checkpx(L,base,nargs,3,"rect_outline");
     w_setcolor(w_color(w_argc(L,base,nargs,4)));
-    int th = nargs>=6? checkint(L,base,nargs,5,"rect_outline") : 1;
+    int th = nargs>=6? w_checkpx(L,base,nargs,5,"rect_outline") : 1;
     for(int i=0;i<(th<1?1:th);i++){
         SDL_Rect q; q.x=r.x+i; q.y=r.y+i; q.w=r.w-2*i; q.h=r.h-2*i;
         if(q.w<=0||q.h<=0) break;
@@ -3319,45 +3328,45 @@ LFN(f_w_rect_outline){ UNUSED_SELF;
 }
 LFN(f_w_circle){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"circle"), y=checkint(L,base,nargs,1,"circle");
-    int r=checkint(L,base,nargs,2,"circle");
+    int x=w_checkpx(L,base,nargs,0,"circle"), y=w_checkpx(L,base,nargs,1,"circle");
+    int r=w_checkpx(L,base,nargs,2,"circle");
     w_setcolor(w_color(w_argc(L,base,nargs,3)));
     w_fill_circle(x,y,r); return 0;
 }
 LFN(f_w_circle_outline){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"circle_outline"), y=checkint(L,base,nargs,1,"circle_outline");
-    int r=checkint(L,base,nargs,2,"circle_outline");
+    int x=w_checkpx(L,base,nargs,0,"circle_outline"), y=w_checkpx(L,base,nargs,1,"circle_outline");
+    int r=w_checkpx(L,base,nargs,2,"circle_outline");
     w_setcolor(w_color(w_argc(L,base,nargs,3)));
     w_circle_outline(x,y,r); return 0;
 }
 LFN(f_w_arc){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"arc"), y=checkint(L,base,nargs,1,"arc");
-    int r=checkint(L,base,nargs,2,"arc");
+    int x=w_checkpx(L,base,nargs,0,"arc"), y=w_checkpx(L,base,nargs,1,"arc");
+    int r=w_checkpx(L,base,nargs,2,"arc");
     double a1=checknum(L,base,nargs,3,"arc"), a2=checknum(L,base,nargs,4,"arc");
     w_setcolor(w_color(w_argc(L,base,nargs,5)));
     w_fill_arc(x,y,r,a1,a2); return 0;
 }
 LFN(f_w_arc_outline){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"arc_outline"), y=checkint(L,base,nargs,1,"arc_outline");
-    int r=checkint(L,base,nargs,2,"arc_outline");
+    int x=w_checkpx(L,base,nargs,0,"arc_outline"), y=w_checkpx(L,base,nargs,1,"arc_outline");
+    int r=w_checkpx(L,base,nargs,2,"arc_outline");
     double a1=checknum(L,base,nargs,3,"arc_outline"), a2=checknum(L,base,nargs,4,"arc_outline");
     w_setcolor(w_color(w_argc(L,base,nargs,5)));
     w_arc_outline(x,y,r,a1,a2); return 0;
 }
 LFN(f_w_ellipse){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"ellipse"), y=checkint(L,base,nargs,1,"ellipse");
-    int rx=checkint(L,base,nargs,2,"ellipse"), ry=checkint(L,base,nargs,3,"ellipse");
+    int x=w_checkpx(L,base,nargs,0,"ellipse"), y=w_checkpx(L,base,nargs,1,"ellipse");
+    int rx=w_checkpx(L,base,nargs,2,"ellipse"), ry=w_checkpx(L,base,nargs,3,"ellipse");
     w_setcolor(w_color(w_argc(L,base,nargs,4)));
     w_fill_ellipse(x,y,rx,ry); return 0;
 }
 LFN(f_w_ellipse_outline){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"ellipse_outline"), y=checkint(L,base,nargs,1,"ellipse_outline");
-    int rx=checkint(L,base,nargs,2,"ellipse_outline"), ry=checkint(L,base,nargs,3,"ellipse_outline");
+    int x=w_checkpx(L,base,nargs,0,"ellipse_outline"), y=w_checkpx(L,base,nargs,1,"ellipse_outline");
+    int rx=w_checkpx(L,base,nargs,2,"ellipse_outline"), ry=w_checkpx(L,base,nargs,3,"ellipse_outline");
     w_setcolor(w_color(w_argc(L,base,nargs,4)));
     w_ellipse_outline(x,y,rx,ry); return 0;
 }
@@ -3393,9 +3402,9 @@ LFN(f_w_polygon){ UNUSED_SELF;
 LFN(f_w_text){ UNUSED_SELF;
     w_need();
     Str *s=checkstr(L,base,nargs,0,"text");
-    int x=checkint(L,base,nargs,1,"text"), y=checkint(L,base,nargs,2,"text");
+    int x=w_checkpx(L,base,nargs,1,"text"), y=w_checkpx(L,base,nargs,2,"text");
     SDL_Color c=w_color(w_argc(L,base,nargs,3));
-    int size = nargs>=5? checkint(L,base,nargs,4,"text") : 16;
+    int size = nargs>=5? w_checkpx(L,base,nargs,4,"text") : 16;
 #ifndef LUC_NO_TTF
     if(nargs<5) size=W.fontsize;
 #endif
@@ -3412,7 +3421,7 @@ static void w_measure(const char *s,int len,int size,int *ow,int *oh){
 }
 LFN(f_w_text_size){ UNUSED_SELF;
     Str *s=checkstr(L,base,nargs,0,"text_size");
-    int size = nargs>=2? checkint(L,base,nargs,1,"text_size") : 16;
+    int size = nargs>=2? w_checkpx(L,base,nargs,1,"text_size") : 16;
 #ifndef LUC_NO_TTF
     if(nargs<2) size=W.fontsize;
 #endif
@@ -3424,9 +3433,9 @@ LFN(f_w_text_size){ UNUSED_SELF;
 LFN(f_w_text_center){ UNUSED_SELF;
     w_need();
     Str *s=checkstr(L,base,nargs,0,"text_center");
-    int y=checkint(L,base,nargs,1,"text_center");
+    int y=w_checkpx(L,base,nargs,1,"text_center");
     SDL_Color c=w_color(w_argc(L,base,nargs,2));
-    int size = nargs>=4? checkint(L,base,nargs,3,"text_center") : 16;
+    int size = nargs>=4? w_checkpx(L,base,nargs,3,"text_center") : 16;
 #ifndef LUC_NO_TTF
     if(nargs<4) size=W.fontsize;
 #endif
@@ -3448,9 +3457,9 @@ LFN(f_w_font){ UNUSED_SELF;
         w_drop_fonts(); w_drop_text_cache();
         snprintf(W.fontpath,sizeof W.fontpath,"%s",p->s);
     }
-    if(nargs>=2) W.fontsize=checkint(L,base,nargs,1,"font");
+    if(nargs>=2) W.fontsize=w_checkpx(L,base,nargs,1,"font");
     else if(nargs==1 && w_argc(L,base,nargs,0).t==LT_NUM)
-        W.fontsize=checkint(L,base,nargs,0,"font");
+        W.fontsize=w_checkpx(L,base,nargs,0,"font");
     if(W.fontsize<4) W.fontsize=4;
     RET(0,mkbool(1)); return 1;
 #endif
@@ -3458,7 +3467,7 @@ LFN(f_w_font){ UNUSED_SELF;
 LFN(f_w_image){ UNUSED_SELF;
     w_need();
     Str *p=checkstr(L,base,nargs,0,"image");
-    int x=checkint(L,base,nargs,1,"image"), y=checkint(L,base,nargs,2,"image");
+    int x=w_checkpx(L,base,nargs,1,"image"), y=w_checkpx(L,base,nargs,2,"image");
     int iw=0,ih=0;
     SDL_Texture *t=w_image(p->s,&iw,&ih);
     if(!t){
@@ -3472,8 +3481,8 @@ LFN(f_w_image){ UNUSED_SELF;
 #endif
     }
     SDL_Rect d; d.x=x; d.y=y;
-    d.w = nargs>=4? checkint(L,base,nargs,3,"image") : iw;
-    d.h = nargs>=5? checkint(L,base,nargs,4,"image") : ih;
+    d.w = nargs>=4? w_checkpx(L,base,nargs,3,"image") : iw;
+    d.h = nargs>=5? w_checkpx(L,base,nargs,4,"image") : ih;
     if(nargs>=6){
         double ang=checknum(L,base,nargs,5,"image");
         SDL_RenderCopyEx(W.ren,t,NULL,&d,ang,NULL,SDL_FLIP_NONE);
@@ -3505,7 +3514,7 @@ LFN(f_w_sprite){ UNUSED_SELF;
 LFN(f_w_draw){ UNUSED_SELF;
     w_need();
     Table *t=checktab(L,base,nargs,0,"draw");
-    int x=checkint(L,base,nargs,1,"draw"), y=checkint(L,base,nargs,2,"draw");
+    int x=w_checkpx(L,base,nargs,1,"draw"), y=w_checkpx(L,base,nargs,2,"draw");
     Value pv=tab_get(t,cstrv("path"));
     if(pv.t!=LT_STR)
         luc_error("window.draw: argument #1 is not a sprite (make one with window.sprite(path))");
@@ -3555,8 +3564,8 @@ LFN(f_w_clip){ UNUSED_SELF;
     w_need();
     if(nargs==0){ SDL_RenderSetClipRect(W.ren,NULL); return 0; }
     SDL_Rect r;
-    r.x=checkint(L,base,nargs,0,"clip"); r.y=checkint(L,base,nargs,1,"clip");
-    r.w=checkint(L,base,nargs,2,"clip"); r.h=checkint(L,base,nargs,3,"clip");
+    r.x=w_checkpx(L,base,nargs,0,"clip"); r.y=w_checkpx(L,base,nargs,1,"clip");
+    r.w=w_checkpx(L,base,nargs,2,"clip"); r.h=w_checkpx(L,base,nargs,3,"clip");
     SDL_RenderSetClipRect(W.ren,&r); return 0;
 }
 
@@ -3615,7 +3624,7 @@ LFN(f_w_mouse_grab){ UNUSED_SELF;
 }
 LFN(f_w_mouse_set){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"mouse_set"), y=checkint(L,base,nargs,1,"mouse_set");
+    int x=w_checkpx(L,base,nargs,0,"mouse_set"), y=w_checkpx(L,base,nargs,1,"mouse_set");
     SDL_WarpMouseInWindow(W.win,x,y); return 0;
 }
 
@@ -3646,19 +3655,19 @@ LFN(f_w_pad_count){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
 }
 static SDL_Joystick *w_pad_at(LucState *L,int base,int nargs,int i,const char *fn){
     w_need(); w_pad_ensure();
-    int p=checkint(L,base,nargs,i,fn);
+    int p=w_checkpx(L,base,nargs,i,fn);
     if(p<0||p>=W.npads) luc_error("window.%s: pad #%d out of range (have %d)",fn,p,W.npads);
     return W.pads[p];
 }
 LFN(f_w_pad_button){ UNUSED_SELF;
     SDL_Joystick *j=w_pad_at(L,base,nargs,0,"pad_button");
-    int b=checkint(L,base,nargs,1,"pad_button");
+    int b=w_checkpx(L,base,nargs,1,"pad_button");
     if(b<0||b>=SDL_JoystickNumButtons(j)){ RET(0,mkbool(0)); return 1; }
     RET(0,mkbool(SDL_JoystickGetButton(j,b))); return 1;
 }
 LFN(f_w_pad_axis){ UNUSED_SELF;
     SDL_Joystick *j=w_pad_at(L,base,nargs,0,"pad_axis");
-    int a=checkint(L,base,nargs,1,"pad_axis");
+    int a=w_checkpx(L,base,nargs,1,"pad_axis");
     if(a<0||a>=SDL_JoystickNumAxes(j)){ RET(0,mknum(0)); return 1; }
     RET(0,mknum((double)SDL_JoystickGetAxis(j,a)/32767.0)); return 1;
 }
@@ -3671,7 +3680,7 @@ LFN(f_w_pad_name){ UNUSED_SELF;
 /* timing */
 LFN(f_w_fps){ UNUSED_SELF;
     if(nargs==0){ RET(0,mknum(W.delta>0?1.0/W.delta:0)); return 1; }
-    int n=checkint(L,base,nargs,0,"fps");
+    int n=w_checkpx(L,base,nargs,0,"fps");
     W.target_fps = n>0? n : 0;
     return 0;
 }
@@ -3762,14 +3771,14 @@ LFN(f_w_window_pos){ UNUSED_SELF; (void)nargs;
 }
 LFN(f_w_move_window){ UNUSED_SELF;
     w_need();
-    int x=checkint(L,base,nargs,0,"move_window"), y=checkint(L,base,nargs,1,"move_window");
+    int x=w_checkpx(L,base,nargs,0,"move_window"), y=w_checkpx(L,base,nargs,1,"move_window");
     SDL_SetWindowPosition(W.win,x,y); return 0;
 }
 LFN(f_w_display_count){ UNUSED_SELF; (void)L;(void)base;(void)nargs;
     int n=SDL_GetNumVideoDisplays(); RET(0,mknum(n<0?0:n)); return 1;
 }
 LFN(f_w_display_size){ UNUSED_SELF;
-    int i = nargs>=1? checkint(L,base,nargs,0,"display_size") : 0;
+    int i = nargs>=1? w_checkpx(L,base,nargs,0,"display_size") : 0;
     SDL_Rect r;
     if(SDL_GetDisplayBounds(i,&r)!=0){ RET(0,mkbool(0)); RET(1,cstrv(SDL_GetError())); return 2; }
     RET(0,mknum(r.w)); RET(1,mknum(r.h)); return 2;
@@ -3998,7 +4007,7 @@ LFN(f_w_resume_music){ UNUSED_SELF;
     return 0;
 }
 LFN(f_w_music_volume){ UNUSED_SELF;
-    int v=nargs>=1? checkint(L,base,nargs,0,"music_volume") : 100;
+    int v=nargs>=1? w_checkpx(L,base,nargs,0,"music_volume") : 100;
     if(v<0)v=0; if(v>100)v=100;
 #ifndef LUC_NO_MIXER
     if(W.mix_ok) pMix_VolumeMusic(v*128/100);
@@ -4006,7 +4015,7 @@ LFN(f_w_music_volume){ UNUSED_SELF;
     return 0;
 }
 LFN(f_w_sound_volume){ UNUSED_SELF;
-    int v=nargs>=1? checkint(L,base,nargs,0,"sound_volume") : 100;
+    int v=nargs>=1? w_checkpx(L,base,nargs,0,"sound_volume") : 100;
     if(v<0)v=0; if(v>100)v=100;
 #ifndef LUC_NO_MIXER
     if(W.mix_ok) pMix_Volume(-1,v*128/100);
@@ -4209,6 +4218,11 @@ Value lucL_window_module(void){
 #else
 #  include <sys/types.h>
 #  include <sys/socket.h>
+#  include <sys/select.h>
+#  include <sys/time.h>
+#  include <netinet/in.h>
+#  include <netinet/tcp.h>
+#  include <arpa/inet.h>
 #  include <netdb.h>
 #  include <unistd.h>
 #  include <fcntl.h>
@@ -4285,7 +4299,7 @@ static void sock_set_blocking(sock_t fd,int blocking){
 static void net_errmsg(char *buf,size_t sz,const char *what){
     snprintf(buf,sz,"%s (network error %d)",what,sock_errcode());
 }
-/* TLS via Schannel (Windows only), blocking+validated. */
+/* TLS: Schannel on Windows, OpenSSL elsewhere; blocking+validated. */
 #if defined(_WIN32)
 #  ifndef SECURITY_WIN32
 #  define SECURITY_WIN32
@@ -4477,6 +4491,107 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
         }
     }
 }
+#elif !defined(LUC_NO_TLS)
+/* TLS via OpenSSL (Linux / POSIX), certificate + hostname validated.
+   Build with -lssl -lcrypto, or -DLUC_NO_TLS to drop https/wss. */
+#  include <openssl/ssl.h>
+#  include <openssl/err.h>
+#  include <openssl/x509v3.h>
+typedef struct { SSL *ssl; } TLSSession;
+static SSL_CTX *tls_ctx=NULL;
+static SSL_CTX *tls_get_ctx(char *err,size_t errcap){
+    if(tls_ctx) return tls_ctx;
+    OPENSSL_init_ssl(0,NULL);
+    SSL_CTX *c=SSL_CTX_new(TLS_client_method());
+    if(!c){ snprintf(err,errcap,"tls: cannot create OpenSSL context"); return NULL; }
+    SSL_CTX_set_min_proto_version(c,TLS1_2_VERSION);
+    SSL_CTX_set_verify(c,SSL_VERIFY_PEER,NULL);
+    const char *bundle=getenv("SSL_CERT_FILE");
+    if(!(bundle && *bundle && SSL_CTX_load_verify_locations(c,bundle,NULL)==1))
+        SSL_CTX_set_default_verify_paths(c);
+    SSL_CTX_set_mode(c,SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    tls_ctx=c;
+    return c;
+}
+static void tls_free_session(TLSSession *s){
+    if(!s) return;
+    if(s->ssl){ SSL_shutdown(s->ssl); SSL_free(s->ssl); }
+    free(s);
+}
+/* blocking handshake; 0 ok, -1 error. */
+static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
+                          char *err,size_t errcap){
+    *out=NULL;
+    SSL_CTX *c=tls_get_ctx(err,errcap);
+    if(!c) return -1;
+    TLSSession *s=(TLSSession*)calloc(1,sizeof(TLSSession));
+    if(!s){ snprintf(err,errcap,"out of memory"); return -1; }
+    s->ssl=SSL_new(c);
+    if(!s->ssl){ snprintf(err,errcap,"tls: SSL_new failed"); free(s); return -1; }
+    SSL_set_fd(s->ssl,fd);
+    SSL_set_tlsext_host_name(s->ssl,hostname);          /* SNI */
+    SSL_set1_host(s->ssl,hostname);                     /* hostname check */
+    ERR_clear_error();
+    int r=SSL_connect(s->ssl);
+    if(r!=1){
+        long vr=SSL_get_verify_result(s->ssl);
+        if(vr!=X509_V_OK)
+            snprintf(err,errcap,"tls: certificate check failed (%s)",X509_verify_cert_error_string(vr));
+        else {
+            unsigned long e=ERR_get_error();
+            char eb[160]; ERR_error_string_n(e,eb,sizeof eb);
+            snprintf(err,errcap,"tls: handshake failed (%s)",e?eb:"connection closed");
+        }
+        tls_free_session(s); return -1;
+    }
+    *out=s;
+    return 0;
+}
+/* 0 ok, -1 error (socket is blocking while sending). */
+static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
+    (void)fd;
+    while(n>0){
+        int k=n>65536?65536:(int)n;
+        int r=SSL_write(s->ssl,p,k);
+        if(r<=0){
+            int e=SSL_get_error(s->ssl,r);
+            if(e==SSL_ERROR_WANT_WRITE||e==SSL_ERROR_WANT_READ){
+                sock_wait_writable(fd,1.0); continue;
+            }
+            return -1;
+        }
+        p+=r; n-=(size_t)r;
+    }
+    return 0;
+}
+/* >0 bytes, 0 close, -1 error, -2 would block */
+static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
+    (void)fd;
+    if(max>0x7fffffff) max=0x7fffffff;
+    int r=SSL_read(s->ssl,out,(int)max);
+    if(r>0) return r;
+    int e=SSL_get_error(s->ssl,r);
+    if(e==SSL_ERROR_ZERO_RETURN) return 0;
+    if(e==SSL_ERROR_WANT_READ||e==SSL_ERROR_WANT_WRITE) return -2;
+    if(e==SSL_ERROR_SYSCALL && r==0) return 0;     /* peer closed w/o close_notify */
+    return -1;
+}
+#else
+typedef struct { int unused; } TLSSession;
+static void tls_free_session(TLSSession *s){ (void)s; }
+static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
+                          char *err,size_t errcap){
+    (void)fd; (void)hostname; (void)out;
+    snprintf(err,errcap,"tls: this build has no TLS (rebuild without LUC_NO_TLS)");
+    return -1;
+}
+static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
+    (void)s; (void)fd; (void)p; (void)n; return -1;
+}
+static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
+    (void)s; (void)fd; (void)out; (void)max; return -1;
+}
+#endif
 static Socket *sock_wrap(sock_t fd,int isserver){
     return sock_new((intptr_t)fd,isserver);
 }
@@ -4494,22 +4609,6 @@ void net_socket_close_fd(Socket *s){
     free(s->rbuf); s->rbuf=NULL; s->rlen=s->rcap=0;
     free(s->frag); s->frag=NULL; s->fraglen=s->fragcap=0;
 }
-#else
-typedef struct { int unused; } TLSSession;
-static void tls_free_session(TLSSession *s){ (void)s; }
-static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
-                          char *err,size_t errcap){
-    (void)fd; (void)hostname; (void)out;
-    snprintf(err,errcap,"tls: https needs a Windows build in this version");
-    return -1;
-}
-static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
-    (void)s; (void)fd; (void)p; (void)n; return -1;
-}
-static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
-    (void)s; (void)fd; (void)out; (void)max; return -1;
-}
-#endif
 /* scheduler-pumped connect with timeout. */
 static sock_t net_connect_to(const char *host,int port,double timeout,char *err,size_t errcap){
     char ports[16]; snprintf(ports,sizeof ports,"%d",port);

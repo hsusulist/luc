@@ -3449,6 +3449,21 @@ static char *try_dir(const char *dir,const char *rel,int *len,char *found,size_t
     return NULL;
 }
 
+static char *try_file(const char *dir,const char *filename,int *len,char *found,size_t fcap);
+/* Install fallback: <exe dir>/luc_modules and <exe dir>/../share/luc/luc_modules
+   so `luc install ai` works without LUC_PATH (Linux has no installer). */
+static int luc_exe_dir_path(char *out,size_t cap);
+static char *try_exe_moddirs(const char *rel,int *len,char *found,size_t fcap,
+                             char *(*tryfn)(const char*,const char*,int*,char*,size_t)){
+    char ed[1024], d[1200]; char *src;
+    if(!luc_exe_dir_path(ed,sizeof ed)) return NULL;
+    snprintf(d,sizeof d,"%s/luc_modules",ed);
+    if((src=tryfn(d,rel,len,found,fcap))) return src;
+    snprintf(d,sizeof d,"%s/../share/luc/luc_modules",ed);
+    if((src=tryfn(d,rel,len,found,fcap))) return src;
+    return NULL;
+}
+
 char *find_module(const char *name,int *len,char *found,size_t fcap){
     char rel[512]; modname_to_path(name,rel,sizeof rel);
     char *src;
@@ -3473,6 +3488,7 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
             p = *q? q+1 : q;
         }
     }
+    if((src=try_exe_moddirs(rel,len,found,fcap,try_dir))) return src;
     return NULL;
 }
 
@@ -3496,6 +3512,7 @@ char *find_module(const char *name,int *len,char *found,size_t fcap){
             p = *q? q+1 : q;
         }
     }
+    if((src=try_exe_moddirs(rel,len,found,fcap,try_dir))) return src;
     return NULL;
 }
 
@@ -3563,6 +3580,7 @@ char *find_pack(const char *name,int *len,char *found,size_t fcap){
             p = *q? q+1 : q;
         }
     }
+    if((src=try_exe_moddirs(rel,len,found,fcap,try_file))) return src;
     return NULL;
 }
 
@@ -3715,6 +3733,8 @@ static int pkg_exe_dir(char *out,size_t cap){
     return 1;
 }
 
+static int luc_exe_dir_path(char *out,size_t cap){ return pkg_exe_dir(out,cap); }
+
 static void pkg_fmt_size(long bytes,char *out,size_t cap){
     if(bytes>=1024*1024) snprintf(out,cap,"%.1f MB",(double)bytes/(1024.0*1024.0));
     else if(bytes>=1024) snprintf(out,cap,"%.1f KB",(double)bytes/1024.0);
@@ -3827,6 +3847,28 @@ static int pkg_put_file(const char *tmp,const char *dest){
 #endif
 }
 
+#if !defined(_WIN32)
+/* POSIX: window support is compiled in (make WINDOW=1), not downloaded. */
+static int pkg_install_window(int force){
+    (void)force;
+#ifdef LUC_WINDOW
+    printf("window support is built into this luc binary (SDL2).\n");
+    printf("optional extras: SDL2_ttf (text), SDL2_image (PNG/JPG), SDL2_mixer (sound)\n");
+    printf("  Debian/Ubuntu: sudo apt install libsdl2-2.0-0 libsdl2-ttf-2.0-0 libsdl2-image-2.0-0 libsdl2-mixer-2.0-0\n");
+    printf("try: luc demos/window_libaries/pong.luc\n");
+    return 0;
+#else
+    printf("this luc binary was built without window support.\n");
+    printf("on Linux/macOS, rebuild it with SDL2:\n");
+    printf("  Debian/Ubuntu: sudo apt install libsdl2-dev libsdl2-ttf-dev libsdl2-image-dev libsdl2-mixer-dev\n");
+    printf("  Fedora:        sudo dnf install SDL2-devel SDL2_ttf-devel SDL2_image-devel SDL2_mixer-devel\n");
+    printf("  Arch:          sudo pacman -S sdl2 sdl2_ttf sdl2_image sdl2_mixer\n");
+    printf("  macOS:         brew install sdl2 sdl2_ttf sdl2_image sdl2_mixer\n");
+    printf("then: make WINDOW=1 && sudo make install\n");
+    return 1;
+#endif
+}
+#else
 static int pkg_install_window(int force){
     char dll[1200],dlltmp[1250],newexe[1250],exetmp[1300],oldexe[1250],url[1200];
     char pd[1200],pdll[1250],pexe[1250];
@@ -3938,6 +3980,8 @@ static int pkg_install_window(int force){
     return 0;
 }
 
+#endif /* _WIN32 pkg_install_window */
+
 /* Unpack bundle: '#=lucfile:' switches files, CRLF normalized */
 static int pkg_unpack_bundle(const char *path,const char *outdir){
     int len; char *src=read_file(path,&len);
@@ -4001,7 +4045,7 @@ static int pkg_install_ai(void){
         printf("downloading %s\n",url);
         if(!pkg_http_get(url,tmp,&sz)){
             fprintf(stderr,"luc install: download failed (no internet, and no\n");
-            fprintf(stderr,"  packages/ai.lucpkg folder next to luc.exe)\n");
+            fprintf(stderr,"  packages/ai.lucpkg folder next to the luc binary)\n");
             remove(tmp); return 1;
         }
         char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
@@ -4036,7 +4080,7 @@ static int pkg_install_discord(void){
         printf("downloading %s\n",url);
         if(!pkg_http_get(url,tmp,&sz)){
             fprintf(stderr,"luc install: download failed (no internet, and no\n");
-            fprintf(stderr,"  packages/discord.lucpkg folder next to luc.exe)\n");
+            fprintf(stderr,"  packages/discord.lucpkg folder next to the luc binary)\n");
             remove(tmp); return 1;
         }
         char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
@@ -4063,10 +4107,18 @@ static int cmd_install(int argc,char **argv){
             char p[1200];
             int inst=0;
             if(have){
-                if(!strcmp(PKGS[k].name,"window")) snprintf(p,sizeof p,"%s/SDL2.dll",dir);
+                if(!strcmp(PKGS[k].name,"window")){
+#if defined(_WIN32)
+                    snprintf(p,sizeof p,"%s/SDL2.dll",dir);
+#elif defined(LUC_WINDOW)
+                    snprintf(p,sizeof p,"/proc/self/exe");     /* compiled in */
+#else
+                    p[0]=0;
+#endif
+                }
                 else if(!strcmp(PKGS[k].name,"ai")) snprintf(p,sizeof p,"%s/luc_modules/ai.luc",dir);
                 else snprintf(p,sizeof p,"%s/luc_modules/discord.luc",dir);
-                inst=pkg_file_exists(p);
+                inst=p[0] && pkg_file_exists(p);
             }
             printf("  %-8s %-58s [%s]\n",PKGS[k].name,PKGS[k].desc,inst?"installed":"not installed");
         }
@@ -4581,8 +4633,16 @@ static void repl_help_loop(void){
     }
 }
 
-#if defined(_WIN32)
-/* Tiny editor (`edit file.luc`); .luc/.lua/.py, UTF-8 safe */
+/* Tiny editor (`edit file.luc`); .luc/.lua/.py, UTF-8 safe.
+   Win32 console API; on Linux/macOS luc_posix_console.h provides it. */
+#if !defined(_WIN32)
+#  include "luc_posix_console.h"
+#  define ED_SEP  "/"
+#  define ED_SEPC '/'
+#else
+#  define ED_SEP  "\\"
+#  define ED_SEPC '\\'
+#endif
 
 typedef struct { char *b; size_t len, cap; } EdLine;
 
@@ -4886,6 +4946,7 @@ static void ed_sel_delete(Editor *e){
     if(e->clip) ed_sys_copy(e->clip,e->cliplen);
 }
 
+#if defined(_WIN32)
 /* Windows clipboard (UTF-8); lets ^C/^V cross into other apps */
 static int ed_sys_copy(const char *s,size_t len){
     int wlen;
@@ -4922,6 +4983,55 @@ static char *ed_sys_paste(size_t *outlen){
     *outlen=(size_t)(n-1);
     return s;
 }
+
+#else
+/* POSIX clipboard: wl-copy / xclip / xsel / pbcopy when present */
+static const char *ed_clip_tool(int paste){
+    static const char *cp[]={"wl-copy","xclip -selection clipboard -in","xsel --clipboard --input","pbcopy",NULL};
+    static const char *ps[]={"wl-paste --no-newline","xclip -selection clipboard -out","xsel --clipboard --output","pbpaste",NULL};
+    static const char *bin[]={"wl-copy","xclip","xsel","pbcopy"};
+    static int pick=-2;
+    if(pick==-2){
+        int k; pick=-1;
+        for(k=0;k<4;k++){
+            char t[96];
+            if(k==0 && !getenv("WAYLAND_DISPLAY")) continue;
+            if((k==1||k==2) && !getenv("DISPLAY")) continue;
+            snprintf(t,sizeof t,"command -v %s >/dev/null 2>&1",bin[k]);
+            if(system(t)==0){ pick=k; break; }
+        }
+    }
+    if(pick<0) return NULL;
+    return paste?ps[pick]:cp[pick];
+}
+static int ed_sys_copy(const char *s,size_t len){
+    const char *t=ed_clip_tool(0); FILE *p; char cmd[128];
+    if(!t||len==0) return 0;
+    snprintf(cmd,sizeof cmd,"%s 2>/dev/null",t);
+    p=popen(cmd,"w"); if(!p) return 0;
+    fwrite(s,1,len,p);
+    return pclose(p)==0;
+}
+static char *ed_sys_paste(size_t *outlen){
+    const char *t=ed_clip_tool(1); FILE *p; char *buf=NULL; size_t n=0,cap=0; char cmd[128];
+    *outlen=0;
+    if(!t) return NULL;
+    snprintf(cmd,sizeof cmd,"%s 2>/dev/null",t);
+    p=popen(cmd,"r"); if(!p) return NULL;
+    for(;;){
+        if(n+4096>cap){ char *nb; cap=cap?cap*2:8192; nb=(char*)realloc(buf,cap); if(!nb){ free(buf); pclose(p); return NULL; } buf=nb; }
+        size_t r=fread(buf+n,1,4096,p);
+        if(r==0) break;
+        n+=r;
+    }
+    pclose(p);
+    if(n==0){ free(buf); return NULL; }
+    { size_t i,w=0; for(i=0;i<n;i++) if(buf[i]!='\r') buf[w++]=buf[i]; n=w; }   /* CRLF -> LF */
+    buf[n]=0; *outlen=n;
+    return buf;
+}
+
+#endif
 
 /* Undo/redo: whole-buffer snapshots, typing coalesced by time */
 static void ed_undo_ser(Editor *e,EdUndo *u){
@@ -5582,6 +5692,7 @@ static int ed_ex_color(const char *nm,int isdir){
       return 0; }
 }
 
+#if defined(_WIN32)
 /* 1 when the console font looks like a Nerd Font (auto-picks nerd icons) */
 static int ed_console_has_nerd_font(void){
     HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
@@ -5632,6 +5743,16 @@ static void ed_font_ensure(void){
     SetCurrentConsoleFontEx(h,FALSE,&fi);
 }
 
+#else
+/* POSIX: the terminal font cannot be queried; use the saved choice / F8.
+   LCODE_NERD=1 forces icons on. */
+static int ed_console_has_nerd_font(void){
+    const char *v=getenv("LCODE_NERD");
+    return v && *v && *v!='0';
+}
+static void ed_font_ensure(void){}
+
+#endif
 /* Nerd Font devicons (nvim-web-devicons codepoints + colors); 1 cell each */
 typedef struct { const char *ext; unsigned cp; unsigned rgb; } DevIcon;
 static const DevIcon DEVICONS[] = {
@@ -5726,9 +5847,9 @@ static void ed_cfg_path(char *out,size_t cap){
     char base[1024]; DWORD n;
     out[0]=0;
     n=GetEnvironmentVariableA("APPDATA",base,sizeof base);
-    if(n>0&&n<sizeof base){ snprintf(out,cap,"%s\\LUC\\lcode.cfg",base); return; }
+    if(n>0&&n<sizeof base){ snprintf(out,cap,"%s" ED_SEP "LUC" ED_SEP "lcode.cfg",base); return; }
     n=GetEnvironmentVariableA("USERPROFILE",base,sizeof base);
-    if(n>0&&n<sizeof base) snprintf(out,cap,"%s\\.lcode.cfg",base);
+    if(n>0&&n<sizeof base) snprintf(out,cap,"%s" ED_SEP ".lcode.cfg",base);
 }
 /* Saved icon mode: 1 nerd, 0 none, -1 no save yet */
 static int ed_cfg_get_icons(void){
@@ -5819,11 +5940,11 @@ static void ed_plug_dir(Editor *e,char *out,size_t cap){
         while(k>0&&exe[k-1]!='\\'&&exe[k-1]!='/') k--;
         if(k>0&&k+8<cap){
             memcpy(out,exe,k); out[k]=0;
-            snprintf(out+k,cap-k,"\\plugin");
+            snprintf(out+k,cap-k,ED_SEP "plugin");
             if(GetFileAttributesA(out)!=INVALID_FILE_ATTRIBUTES) return;
         }
     }
-    snprintf(out,cap,".\\plugin");
+    snprintf(out,cap,"." ED_SEP "plugin");
     if(GetFileAttributesA(out)==INVALID_FILE_ATTRIBUTES) out[0]=0;
     (void)e;
 }
@@ -5875,7 +5996,7 @@ static void ed_plug_scan(Editor *e){
       p->enabled=1; p->locked=1; p->cfg[0]=0; }
     ed_plug_dir(e,e->plugdir,sizeof e->plugdir);
     if(!e->plugdir[0]) return;
-    snprintf(pat,sizeof pat,"%s\\*",e->plugdir);
+    snprintf(pat,sizeof pat,"%s" ED_SEP "*",e->plugdir);
     fh=FindFirstFileA(pat,&fd);
     if(fh==INVALID_HANDLE_VALUE) return;
     do{
@@ -5883,8 +6004,8 @@ static void ed_plug_scan(Editor *e){
         size_t j;
         if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
         if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) continue;
-        snprintf(sub,sizeof sub,"%s\\%s",e->plugdir,fd.cFileName);
-        snprintf(cfg,sizeof cfg,"%s\\plugin.cfg",sub);
+        snprintf(sub,sizeof sub,"%s" ED_SEP "%s",e->plugdir,fd.cFileName);
+        snprintf(cfg,sizeof cfg,"%s" ED_SEP "plugin.cfg",sub);
         if(GetFileAttributesA(cfg)==INVALID_FILE_ATTRIBUTES) continue;
         /* same name overrides (e.g. plugin/luc tunes the built-in) */
         { Plug tmp; size_t j;
@@ -6350,7 +6471,7 @@ static void ex_refresh(Editor *e){
     WIN32_FIND_DATAA fd;
     HANDLE fh;
     ex_free(e);
-    snprintf(pat,sizeof pat,"%s\\*",e->exdir[0]?e->exdir:".");
+    snprintf(pat,sizeof pat,"%s" ED_SEP "*",e->exdir[0]?e->exdir:".");
     fh=FindFirstFileA(pat,&fd);
     if(fh==INVALID_HANDLE_VALUE){ e->exsel=0; e->extop=0; return; }
     do{
@@ -6359,7 +6480,7 @@ static void ex_refresh(Editor *e){
             e->ex=(ExItem*)lrealloc(e->ex,sizeof(ExItem)*e->excap); }
         e->ex[e->exn].name=(char*)lmalloc(strlen(fd.cFileName)+1);
         memcpy(e->ex[e->exn].name,fd.cFileName,strlen(fd.cFileName)+1);
-        { char fb[1088]; snprintf(fb,sizeof fb,"%s\\%s",e->exdir[0]?e->exdir:".",fd.cFileName);
+        { char fb[1088]; snprintf(fb,sizeof fb,"%s" ED_SEP "%s",e->exdir[0]?e->exdir:".",fd.cFileName);
           e->ex[e->exn].full=(char*)lmalloc(strlen(fb)+1); memcpy(e->ex[e->exn].full,fb,strlen(fb)+1); }
         e->ex[e->exn].isdir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
         /* Top-level entries sit inside the root header (VSCode-style), so depth starts at 1. */
@@ -6404,7 +6525,7 @@ static void ex_join(Editor *e,const char *name){
     } else {
         size_t n=strlen(e->exdir);
         if(n+1+strlen(name)+1>=sizeof e->exdir) return;
-        if(n>0 && e->exdir[n-1]!='\\' && e->exdir[n-1]!='/') e->exdir[n++]='\\';
+        if(n>0 && e->exdir[n-1]!='\\' && e->exdir[n-1]!='/') e->exdir[n++]=ED_SEPC;
         memcpy(e->exdir+n,name,strlen(name)+1);
     }
     e->exsel=0; e->extop=0;
@@ -6415,7 +6536,7 @@ static void ex_full(Editor *e,const char *name,char *out,size_t cap){
     size_t n=strlen(e->exdir);
     if(n+1+strlen(name)+1>cap){ out[0]=0; return; }
     memcpy(out,e->exdir,n);
-    if(n>0 && out[n-1]!='\\' && out[n-1]!='/') out[n++]='\\';
+    if(n>0 && out[n-1]!='\\' && out[n-1]!='/') out[n++]=ED_SEPC;
     memcpy(out+n,name,strlen(name)+1);
 }
 
@@ -6427,7 +6548,7 @@ static void ex_expand(Editor *e,size_t idx){
     ExItem *tmp=NULL; size_t tcap=0, tn=0, i;
     int truncated=0;
     if(idx>=e->exn || !e->ex[idx].isdir || e->ex[idx].expanded) return;
-    snprintf(pat,sizeof pat,"%s\\*",e->ex[idx].full);
+    snprintf(pat,sizeof pat,"%s" ED_SEP "*",e->ex[idx].full);
     fh=FindFirstFileA(pat,&fd);
     if(fh==INVALID_HANDLE_VALUE) return;
     do{
@@ -6436,7 +6557,7 @@ static void ex_expand(Editor *e,size_t idx){
         if(tn==tcap){ tcap=tcap?tcap*2:64; tmp=(ExItem*)lrealloc(tmp,sizeof(ExItem)*tcap); }
         tmp[tn].name=(char*)lmalloc(strlen(fd.cFileName)+1);
         memcpy(tmp[tn].name,fd.cFileName,strlen(fd.cFileName)+1);
-        { char fb[1120]; snprintf(fb,sizeof fb,"%s\\%s",e->ex[idx].full,fd.cFileName);
+        { char fb[1120]; snprintf(fb,sizeof fb,"%s" ED_SEP "%s",e->ex[idx].full,fd.cFileName);
           tmp[tn].full=(char*)lmalloc(strlen(fb)+1); memcpy(tmp[tn].full,fb,strlen(fb)+1); }
         tmp[tn].isdir=(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
         tmp[tn].depth=e->ex[idx].depth+1;
@@ -6615,15 +6736,15 @@ static int ed_copy_tree(const char *src,const char *dst,int depth){
     if(depth>32) return 0;
     if(!CreateDirectoryA(dst,NULL) && GetLastError()!=ERROR_ALREADY_EXISTS) return 0;
     { char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
-      snprintf(pat,sizeof pat,"%s\\*",src);
+      snprintf(pat,sizeof pat,"%s" ED_SEP "*",src);
       fh=FindFirstFileA(pat,&fd);
       if(fh==INVALID_HANDLE_VALUE) return 0;
       i=0;
       do{
           if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
           { char s2[1120], d2[1120];
-            snprintf(s2,sizeof s2,"%s\\%s",src,fd.cFileName);
-            snprintf(d2,sizeof d2,"%s\\%s",dst,fd.cFileName);
+            snprintf(s2,sizeof s2,"%s" ED_SEP "%s",src,fd.cFileName);
+            snprintf(d2,sizeof d2,"%s" ED_SEP "%s",dst,fd.cFileName);
             if(!ed_copy_tree(s2,d2,depth+1)){ FindClose(fh); return 0; } }
           if(++i>2000){ FindClose(fh); return 0; }
       }while(FindNextFileA(fh,&fd));
@@ -6643,7 +6764,7 @@ static void ed_unique(char *out,size_t cap,const char *dir,const char *name,int 
     for(k=0;k<1000;k++){
         if(k==0) snprintf(cand,sizeof cand,"%s - copy%s",stem,ext);
         else snprintf(cand,sizeof cand,"%s - copy (%d)%s",stem,k+1,ext);
-        { char full[1120]; snprintf(full,sizeof full,"%s\\%s",dir,cand);
+        { char full[1120]; snprintf(full,sizeof full,"%s" ED_SEP "%s",dir,cand);
           if(GetFileAttributesA(full)==INVALID_FILE_ATTRIBUTES){
               snprintf(out,cap,"%s",cand); return; } }
     }
@@ -6667,13 +6788,13 @@ static int ed_delete_tree(const char *path,int depth){
         if(!(a&FILE_ATTRIBUTE_REPARSE_POINT)){
             char pat[1120]; WIN32_FIND_DATAA fd; HANDLE fh;
             if(depth>32) return 0;
-            snprintf(pat,sizeof pat,"%s\\*",path);
+            snprintf(pat,sizeof pat,"%s" ED_SEP "*",path);
             fh=FindFirstFileA(pat,&fd);
             if(fh!=INVALID_HANDLE_VALUE){
                 do{
                     char sub[1120];
                     if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
-                    snprintf(sub,sizeof sub,"%s\\%s",path,fd.cFileName);
+                    snprintf(sub,sizeof sub,"%s" ED_SEP "%s",path,fd.cFileName);
                     if(!ed_delete_tree(sub,depth+1)){ FindClose(fh); return 0; }
                 }while(FindNextFileA(fh,&fd));
                 FindClose(fh);
@@ -6777,7 +6898,7 @@ static void ed_naming_confirm(Editor *e){
     memcpy(name,e->namb+a,b-a); name[b-a]=0;
     { size_t k; for(k=0;name[k];k++) if(name[k]=='/'||name[k]=='\\'){ snprintf(e->status,sizeof e->status,"bad name"); e->naming=0; return; }
       if(!strcmp(name,".")||!strcmp(name,"..")){ snprintf(e->status,sizeof e->status,"bad name"); e->naming=0; return; } }
-    snprintf(dest,sizeof dest,"%s\\%s",e->namdir,name);
+    snprintf(dest,sizeof dest,"%s" ED_SEP "%s",e->namdir,name);
     if(e->naming==1){
         FILE *f=fopen(dest,"wb");
         if(!f){ snprintf(e->status,sizeof e->status,"cannot create '%s'",dest); e->naming=0; return; }
@@ -7080,7 +7201,7 @@ static void ed_menu_pick(Editor *e,int id){
         b=e->fcb; { const char *p=b, *l=NULL; while(*p){ if(*p=='\\'||*p=='/') l=p; p++; } if(l) b=l+1; }
         snprintf(base,sizeof base,"%s",b);
         ed_unique(cand,sizeof cand,dir,base,e->fcb_dir);
-        snprintf(dest,sizeof dest,"%s\\%s",dir,cand);
+        snprintf(dest,sizeof dest,"%s" ED_SEP "%s",dir,cand);
         if(ed_copy_tree(e->fcb,dest,0)){ ex_reveal(e,dest); snprintf(e->status,sizeof e->status,"pasted '%s'",cand); }
         else snprintf(e->status,sizeof e->status,"paste failed");
     }
@@ -7155,6 +7276,7 @@ static void ed_console_raw(void){
     SetConsoleMode(hin,(m|ENABLE_MOUSE_INPUT|ENABLE_EXTENDED_FLAGS)
         & ~(DWORD)(ENABLE_LINE_INPUT|ENABLE_ECHO_INPUT|ENABLE_PROCESSED_INPUT|ENABLE_QUICK_EDIT_MODE));
 }
+#if defined(_WIN32)
 static int ed_shell_has_ps(void){
     static int st=-1;
     if(st<0){
@@ -7163,6 +7285,7 @@ static int ed_shell_has_ps(void){
     }
     return st;
 }
+#endif
 static void ed_shell_hist_push(Editor *e,const char *line){
     if(e->shn>=ED_SHHIST){
         memmove(e->shhist[0],e->shhist[1],sizeof e->shhist[0]*(ED_SHHIST-1));
@@ -7250,8 +7373,13 @@ static void ed_shell_run(Editor *e){
     e->log_expand=1; e->log_scroll=0;   /* open the 3-row view for the output */
     ed_console_raw();   /* heal mode in case it was already clobbered */
     /* <NUL stdin: interactive programs get EOF instead of stealing keys */
+#if defined(_WIN32)
     if(ed_shell_has_ps()) snprintf(cmd,sizeof cmd,"powershell -NoProfile -NonInteractive -Command %s 2>&1 <NUL",line);
     else snprintf(cmd,sizeof cmd,"cmd.exe /C %s 2>&1 <NUL",line);
+#else
+    /* POSIX: run through /bin/sh as a group so 2>&1 covers every command */
+    snprintf(cmd,sizeof cmd,"{ %s\n} 2>&1 </dev/null",line);
+#endif
     /* Run inside the open folder so relative paths (luc core.luc) work */
     { char back[1024];
       GetCurrentDirectoryA(sizeof back,back);
@@ -7409,7 +7537,7 @@ static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
               for(p=b;*p;p++) if(*p=='\\'||*p=='/') l=p;
               snprintf(base,sizeof base,"%s",l?l+1:b);
               ed_unique(cand,sizeof cand,dir,base,e->fcb_dir);
-              snprintf(dest,sizeof dest,"%s\\%s",dir,cand);
+              snprintf(dest,sizeof dest,"%s" ED_SEP "%s",dir,cand);
               if(ed_copy_tree(e->fcb,dest,0)){ ex_reveal(e,dest); snprintf(e->status,sizeof e->status,"pasted '%s'",cand); }
               else snprintf(e->status,sizeof e->status,"paste failed"); }
             return 0;
@@ -7951,12 +8079,6 @@ done:
     fflush(stdout);
     setvbuf(stdout,NULL,_IONBF,0);
 }
-#else
-static void lc_code(const char *start){
-    (void)start;
-    printf("lcode needs a Windows console for now.\n");
-}
-#endif
 
 static void lcode_cmd(const char *line);
 
