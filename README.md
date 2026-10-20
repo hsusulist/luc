@@ -30,3 +30,18 @@
 
 <p align="center">Made with ❤️ by <a href="https://github.com/hsusulist">hsusulist</a></p>
 
+## Install without the GUI installer (Windows)
+
+Download the setup script, then run it in PowerShell:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/hsusulist/luc/main/install.ps1 -OutFile .\install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+The setup prints the LUC banner and latest version, then prompts for optional
+components and an install folder. It downloads `luc-portable.zip` and its
+SHA-256 file from the latest GitHub Release, verifies the archive, and installs
+the selected files. The release must include both files; the normal release build
+creates them with `powershell -ExecutionPolicy Bypass -File .\tools\make_portable.ps1`
+(the full `build_installer.ps1` creates the portable ZIP and GUI installer).

@@ -199,6 +199,13 @@ function Get-NerdFont {
 
 Get-NerdFont
 
+$PortableBuilder = Join-Path $ProjectDir 'tools\make_portable.ps1'
+Write-Host 'Building the terminal-install portable release...'
+& powershell -NoProfile -ExecutionPolicy Bypass -File $PortableBuilder
+if ($LASTEXITCODE -ne 0) {
+    throw 'Portable release build failed.'
+}
+
 $iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $iscc) {
     $isccCandidates = @(
@@ -220,4 +227,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host 'Installer created successfully: dist\luc-installer.exe'
+Write-Host 'Portable release created: dist\luc-portable.zip (+ SHA-256 file)'
 Write-Host 'Welcome page should say "LUC 0.2-beta1" - if not, the old .iss is being used.'
