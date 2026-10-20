@@ -144,6 +144,9 @@ Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window;
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
 ; Console-only build, installed as luc.exe when "window" is unticked
 Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "luc.exe"; Check: ConsoleSelected; Flags: ignoreversion
+; Terminal installer used by "luc --install" and for updating portable builds
+Source: "..\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\installer\minisign.pub"; DestDir: "{app}"; Flags: ignoreversion
 ; Runnable example scripts (window, net, discord, ai demos in subfolders)
 Source: "..\demos\*"; DestDir: "{app}\demos"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; This setup itself, so users can reopen the maintenance dialog
@@ -475,9 +478,23 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  StateDir, AppPath, StateFile, StateJson: String;
 begin
   if (CurStep = ssInstall) and (GPrevComponents <> '') then
     RemoveDeselected(GPrevComponents, WizardSelectedComponents(False));
+  if CurStep = ssPostInstall then
+  begin
+    // Mark this installation so "luc" starts the REPL instead of the
+    // first-run installer, and so "luc --install" knows LUC is present.
+    StateDir := ExpandConstant('{localappdata}\LUC');
+    ForceDirectories(StateDir);
+    StateFile := StateDir + '\state.json';
+    AppPath := ExpandConstant('{app}');
+    StringChangeEx(AppPath, '\', '\\', True);
+    StateJson := '{"version":"{#SetupSetting("AppVersion")}","installPath":"' + AppPath + '","source":"inno","installedAt":"' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', #0, #0) + '"}';
+    SaveStringToFile(StateFile, StateJson, False);
+  end;
 end;
 
 function ContainsPath(Path: string): Boolean;

@@ -4088,6 +4088,7 @@ static void print_banner_tail(void){
 "\n"
 "  luc <file>      run a LUC script\n"
 "  luc -e \"...\"    run code from the command line\n"
+"  luc --install   open the installer (components, license, folder)\n"
 "  luc install     packages (window, ai, discord)\n"
 "  luc --help      full help\n");
 }
@@ -4134,6 +4135,8 @@ static void print_help(void){
     "  -e \"chunk\"          execute LUC code from the command line\n"
     "  lcode [path] / --lcode [path]  open the LCode editor\n"
     "  --edit [path]       same as --lcode (legacy alias)\n"
+    "  --install           open the interactive installer\n"
+    "  --install -c window,ai -d FOLDER -y   unattended install\n"
     "  install [pkg]       list or install a package  (window, ai, discord)\n"
     "  -v, --version       print version and exit\n"
     "  -h, --help          print this help and exit\n\n"
@@ -8956,6 +8959,205 @@ static void lcode_cmd(const char *line){
     lc_code(path);
 }
 
+#if defined(_WIN32)
+static int luc_file_is_file(const char *path){
+    DWORD attr=GetFileAttributesA(path);
+    return attr!=INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static int luc_exe_directory(char *out,size_t cap){
+    DWORD n=GetModuleFileNameA(NULL,out,(DWORD)cap);
+    if(n==0 || n>=cap){ out[0]=0; return 0; }
+    char *slash=strrchr(out,'\\');
+    char *slash2=strrchr(out,'/');
+    if(slash2 && (!slash || slash2>slash)) slash=slash2;
+    if(slash) *slash=0; else out[0]=0;
+    return 1;
+}
+
+static int luc_installer_script(char *out,size_t cap){
+    char dir[1024];
+    if(luc_exe_directory(dir,sizeof dir)){
+        snprintf(out,cap,"%s\\install.ps1",dir);
+        if(luc_file_is_file(out)) return 1;
+        snprintf(out,cap,"%s\\core\\install.ps1",dir);
+        if(luc_file_is_file(out)) return 1;
+    }
+    const char *local=getenv("LOCALAPPDATA");
+    if(local){
+        snprintf(out,cap,"%s\\Programs\\LUC\\install.ps1",local);
+        if(luc_file_is_file(out)) return 1;
+        snprintf(out,cap,"%s\\LUC\\install.ps1",local);
+        if(luc_file_is_file(out)) return 1;
+    }
+    out[0]=0;
+    return 0;
+}
+
+static int luc_state_exists(void){
+    const char *local=getenv("LOCALAPPDATA");
+    if(!local) return 0;
+    char path[1024];
+    snprintf(path,sizeof path,"%s\\LUC\\state.json",local);
+    return luc_file_is_file(path);
+}
+
+static int luc_installer_pending(void){
+    if(getenv("LUC_NO_FIRST_RUN") || getenv("LUC_NO_INSTALLER")) return 0;
+    if(luc_state_exists()) return 0;
+    if(!repl_wanted()) return 0;
+    char script[1024];
+    return luc_installer_script(script,sizeof script);
+}
+
+static int append_quoted_arg(char *dst,size_t cap,const char *arg){
+    size_t len=strlen(dst);
+    int backslashes=0;
+    if(len+2>=cap) return 0;
+    dst[len++]='"';
+    for(const char *p=arg; *p; p++){
+        if(*p=='\\'){
+            backslashes++;
+            continue;
+        }
+        if(*p=='"'){
+            for(int i=0;i<backslashes*2+1;i++){
+                if(len+1>=cap) return 0;
+                dst[len++]='\\';
+            }
+            if(len+1>=cap) return 0;
+            dst[len++]='"';
+        } else {
+            for(int i=0;i<backslashes;i++){
+                if(len+1>=cap) return 0;
+                dst[len++]='\\';
+            }
+            if(len+1>=cap) return 0;
+            dst[len++]=*p;
+        }
+        backslashes=0;
+    }
+    for(int i=0;i<backslashes*2;i++){
+        if(len+1>=cap) return 0;
+        dst[len++]='\\';
+    }
+    if(len+1>=cap) return 0;
+    dst[len++]='"';
+    dst[len]=0;
+    return 1;
+}
+
+static int run_process_wait(const char *command_line){
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si,sizeof si);
+    si.cb=sizeof si;
+    ZeroMemory(&pi,sizeof pi);
+    char *buffer=(char*)malloc(strlen(command_line)+1);
+    if(!buffer) return -1;
+    strcpy(buffer,command_line);
+    BOOL ok=CreateProcessA(NULL,buffer,NULL,NULL,TRUE,0,NULL,NULL,&si,&pi);
+    free(buffer);
+    if(!ok) return -1;
+    WaitForSingleObject(pi.hProcess,INFINITE);
+    DWORD code=1;
+    GetExitCodeProcess(pi.hProcess,&code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return (int)code;
+}
+
+static int install_option_value(const char *name,int argc,char **argv,int *index,const char **value){
+    if(*index+1>=argc){
+        fprintf(stderr,"luc --install: %s needs a value\n",name);
+        return 0;
+    }
+    *value=argv[++(*index)];
+    return 1;
+}
+
+static int cmd_installer(int argc,char **argv){
+    char script[1024];
+    if(!luc_installer_script(script,sizeof script)){
+        fprintf(stderr,
+            "luc --install: install.ps1 was not found next to luc.exe.\n"
+            "Download it from:\n"
+            "  https://raw.githubusercontent.com/hsusulist/luc/main/install.ps1\n");
+        return 1;
+    }
+    const char *ps[64];
+    int n=0;
+    ps[n++]="powershell.exe";
+    ps[n++]="-NoProfile";
+    ps[n++]="-ExecutionPolicy";
+    ps[n++]="Bypass";
+    ps[n++]="-File";
+    ps[n++]=script;
+    for(int i=2;i<argc;i++){
+        const char *a=argv[i];
+        const char *value=NULL;
+        if(!strcmp(a,"-c") || !strcmp(a,"--components")){
+            if(!install_option_value(a,argc,argv,&i,&value)) return 1;
+            ps[n++]="-Components"; ps[n++]=value;
+        } else if(!strcmp(a,"-d") || !strcmp(a,"--dir") || !strcmp(a,"--install-path")){
+            if(!install_option_value(a,argc,argv,&i,&value)) return 1;
+            ps[n++]="-InstallPath"; ps[n++]=value;
+        } else if(!strcmp(a,"--archive")){
+            if(!install_option_value(a,argc,argv,&i,&value)) return 1;
+            ps[n++]="-ArchivePath"; ps[n++]=value;
+        } else if(!strcmp(a,"--source")){
+            if(!install_option_value(a,argc,argv,&i,&value)) return 1;
+            ps[n++]="-Source"; ps[n++]=value;
+        } else if(!strcmp(a,"-y") || !strcmp(a,"--yes")){
+            ps[n++]="-Yes";
+        } else if(!strcmp(a,"--no-path")){
+            ps[n++]="-NoPath";
+        } else if(!strcmp(a,"--no-env")){
+            ps[n++]="-NoEnvironmentChanges";
+        } else if(!strcmp(a,"-f") || !strcmp(a,"--force")){
+            ps[n++]="-Force";
+        } else if(!strcmp(a,"--quiet")){
+            ps[n++]="-Quiet";
+        } else if(!strcmp(a,"--no-color")){
+            ps[n++]="-NoColor";
+        } else if(!strcmp(a,"--allow-unsigned")){
+            ps[n++]="-AllowUnsigned";
+        } else {
+            fprintf(stderr,"luc --install: unknown option '%s'\n",a);
+            return 1;
+        }
+        if(n>56){
+            fprintf(stderr,"luc --install: too many arguments\n");
+            return 1;
+        }
+    }
+    ps[n]=NULL;
+    char command[8192];
+    command[0]=0;
+    for(int i=0;i<n;i++){
+        if(i>0) strncat(command," ",sizeof(command)-strlen(command)-1);
+        if(!append_quoted_arg(command,sizeof command,ps[i])){
+            fprintf(stderr,"luc --install: command line is too long\n");
+            return 1;
+        }
+    }
+    int rc=run_process_wait(command);
+    if(rc==-1){
+        fprintf(stderr,"luc --install: could not start powershell.exe\n");
+        return 1;
+    }
+    return rc;
+}
+#else
+static int luc_state_exists(void){ return 1; }
+static int luc_installer_pending(void){ return 0; }
+static int cmd_installer(int argc,char **argv){
+    (void)argc; (void)argv;
+    fprintf(stderr,"luc --install is only available on Windows.\n");
+    return 1;
+}
+#endif
+
 int main(int argc,char **argv){
     luc_win_attach_console();
     luc_win_utf8_console();
@@ -8970,7 +9172,14 @@ int main(int argc,char **argv){
         }
     }
 
-    if(argc<2){ print_banner(); if(repl_wanted()) interactive_shell(); return 0; }
+    if(argc<2){
+        if(luc_installer_pending()){
+            int rc=cmd_installer(argc,argv);
+            if(rc!=0) return rc;
+            if(!luc_state_exists()) return 0;
+        }
+        print_banner(); if(repl_wanted()) interactive_shell(); return 0;
+    }
     
 
     if(strcmp(argv[1],"--version")==0||strcmp(argv[1],"-v")==0){
@@ -8982,6 +9191,8 @@ int main(int argc,char **argv){
         print_help();
         return 0;
     }
+    if(strcmp(argv[1],"--install")==0)
+        return cmd_installer(argc,argv);
     if(strcmp(argv[1],"-e")==0){
         if(argc<3){ fprintf(stderr,"luc: '-e' needs an argument\n"); return 1; }
         return run_chunk(argv[2],(int)strlen(argv[2]),"=(command line)",argc,argv,3);

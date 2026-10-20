@@ -62,6 +62,8 @@ try {
     Set-Content -LiteralPath (Join-Path $StageDir 'VERSION.txt') -Value $Version -Encoding ASCII
     Copy-RequiredFile (Join-Path $ProjectDir 'README.md') (Join-Path $StageDir 'README.md')
     Copy-RequiredFile (Join-Path $ProjectDir 'LICENCE') (Join-Path $StageDir 'LICENCE')
+    Copy-RequiredFile (Join-Path $ProjectDir 'install.ps1') (Join-Path $StageDir 'core\install.ps1')
+    Copy-RequiredFile (Join-Path $ProjectDir 'installer\minisign.pub') (Join-Path $StageDir 'core\minisign.pub')
     Copy-RequiredFile (Join-Path $AppDir 'luc-core.exe') (Join-Path $StageDir 'core\luc.exe')
     Copy-RequiredFile (Join-Path $AppDir 'luc-win.exe') (Join-Path $StageDir 'window\luc.exe')
 
@@ -100,6 +102,31 @@ try {
     Compress-Archive -Path (Join-Path $StageDir '*') -DestinationPath $ZipPath -CompressionLevel Optimal
     $hash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath "$ZipPath.sha256" -Value $hash -Encoding ASCII
+
+    $installerText = Get-Content -LiteralPath (Join-Path $ProjectDir 'install.ps1') -Raw
+    if ($installerText -notmatch "(?m)\`$minisignPublicKey\s*=\s*'([^']+)'") {
+        throw 'install.ps1 does not declare a minisign public key.'
+    }
+    $installerKey = $Matches[1]
+    $publicFile = Join-Path $ProjectDir 'installer\minisign.pub'
+    $publicLines = @(Get-Content -LiteralPath $publicFile | Where-Object { $_.Trim() })
+    if ($publicLines.Count -lt 2) { throw 'installer\minisign.pub is malformed.' }
+    if ($publicLines[1].Trim() -ne $installerKey) {
+        throw 'install.ps1 embeds a different public key than installer\minisign.pub.'
+    }
+
+    $signingKey = $env:LUC_SIGNING_KEY
+    if (-not $signingKey) { $signingKey = Join-Path $env:USERPROFILE '.luc\keys\luc-release.key' }
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if ((Test-Path -LiteralPath $signingKey -PathType Leaf) -and $node) {
+        & $node.Source (Join-Path $ProjectDir 'tools\lucsig.js') sign "$ZipPath.sha256" --key $signingKey
+        if ($LASTEXITCODE -ne 0) { throw 'Signing the release checksum failed.' }
+    } elseif (Test-Path -LiteralPath $signingKey -PathType Leaf) {
+        Write-Warning 'node was not found; the checksum was not signed.'
+    } else {
+        Write-Warning "Signing key not found at $signingKey; the checksum was not signed."
+    }
+
     Write-Host "Portable release created: $ZipPath"
     Write-Host "SHA-256: $hash"
 } finally {

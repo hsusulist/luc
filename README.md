@@ -30,7 +30,9 @@
 
 <p align="center">Made with ❤️ by <a href="https://github.com/hsusulist">hsusulist</a></p>
 
-## Install without the GUI installer (Windows)
+## Install (Windows)
+
+### Terminal installer
 
 Download the setup script, then run it in PowerShell:
 
@@ -39,9 +41,58 @@ Invoke-WebRequest https://raw.githubusercontent.com/hsusulist/luc/main/install.p
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The setup prints the LUC banner and latest version, then prompts for optional
-components and an install folder. It downloads `luc-portable.zip` and its
-SHA-256 file from the latest GitHub Release, verifies the archive, and installs
-the selected files. The release must include both files; the normal release build
-creates them with `powershell -ExecutionPolicy Bypass -File .\tools\make_portable.ps1`
-(the full `build_installer.ps1` creates the portable ZIP and GUI installer).
+`luc --install` opens the same installer once LUC is installed. The interactive
+UI shows the Apache 2.0 license, a component selector, the install folder and a
+**Continue** button (English). Running `luc` with no arguments also opens it on
+the first run, then starts the REPL afterwards.
+
+Unattended installs skip every prompt:
+
+```powershell
+luc --install -y --no-path
+luc --install -c window,ai -d "D:\Tools\LUC" -y
+```
+
+Components: `window`, `ai`, `discord`, `lcode`, `vscode`, `source` (the core
+interpreter is always installed). Useful flags: `--no-path`, `--no-env`,
+`--force`, `--quiet`, `--archive <zip>`, `--source github|local`.
+
+### npm
+
+```powershell
+npm install -g @hsusulist/luc
+luc --version
+```
+
+The npm package is a small launcher. It installs the runtime into
+`%LOCALAPPDATA%\Programs\LUC` and does not modify PATH.
+
+### Update, rollback and verification
+
+The installer extracts into a staging folder and only then moves files into
+place. Every replaced file is renamed to a temporary backup first; if anything
+fails, the backup is restored and the previous version is left intact. Running
+LUC processes and locked files are detected before the install starts. Selected
+files are replaced in place, so your scripts and other unmanaged files in the
+install folder are preserved.
+
+Archives are limited to 4096 entries, 2 GB uncompressed and a 200:1 compression
+ratio. Paths with `..`, drive letters, Alternate Data Streams (`:`), reserved
+Windows device names (`CON`, `NUL`, `COM1`...) and trailing dots/spaces are
+rejected.
+
+Downloads are verified in this order:
+
+1. SHA-256 from `luc-portable.zip.sha256`.
+2. Ed25519 signature of the checksum file (`luc-portable.zip.sha256.minisig`,
+   minisign legacy format) against the public key embedded in `install.ps1`.
+3. GitHub's own asset digest, when available.
+
+Local archives require a signature unless `-AllowUnsigned` is passed explicitly.
+Releases without a signature still install with a warning for compatibility;
+publish `luc-portable.zip.sha256.minisig` with `tools/lucsig.js` to make the
+signature mandatory.
+
+The public key lives in `installer/minisign.pub`; private keys are never stored
+in the repository.
+

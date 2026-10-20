@@ -1,0 +1,37 @@
+{
+  "name": "@hsusulist/luc",
+  "version": "0.2.1",
+  "description": "LUC language installer and launcher for Windows",
+  "bin": {
+    "luc": "bin/luc.js"
+  },
+  "files": [
+    "bin",
+    "scripts",
+    "install.ps1",
+    "LICENCE",
+    "README.md"
+  ],
+  "scripts": {
+    "prepack": "node scripts/prepack.js",
+    "postpack": "node scripts/postpack.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hsusulist/luc.git"
+  },
+  "keywords": [
+    "luc",
+    "language",
+    "interpreter",
+    "installer"
+  ]
+}
