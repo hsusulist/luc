@@ -1,7 +1,7 @@
 ﻿; LUC - Inno Setup script (PREBUILT, English, setup v3)
 ; update 2026-09-01: AppId, opt-in window/ai, maintenance dialog, start menu
 ; update 2026-09-02: ver 0.1, library management, offline packages
-; update 2026-09-21: ver 0.2-beta1
+; update 2026-09-21: ver 0.2.0-beta-1
 ; Setup v3 changes EVERYTHING about how window support works:
 ; the installer now ships READY-TO-RUN binaries built ahead of
 ; time on the developer's machine (build_installer.ps1):
@@ -50,7 +50,7 @@
 ; fallback produced before, so installs made without this line stay detected.
 AppId=Luc
 AppName=Luc
-AppVersion=0.2-beta1
+AppVersion=0.2.0-beta-1
 AppPublisher=hsusulist
 DefaultDirName={userpf}\LUC
 DefaultGroupName=LUC
@@ -144,6 +144,9 @@ Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window;
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
 ; Console-only build, installed as luc.exe when "window" is unticked
 Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "luc.exe"; Check: ConsoleSelected; Flags: ignoreversion
+; Terminal installer used by "luc --install" and for updating portable builds
+Source: "..\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\installer\minisign.pub"; DestDir: "{app}"; Flags: ignoreversion
 ; Runnable example scripts (window, net, discord, ai demos in subfolders)
 Source: "..\demos\*"; DestDir: "{app}\demos"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; This setup itself, so users can reopen the maintenance dialog
@@ -475,9 +478,23 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  StateDir, AppPath, StateFile, StateJson: String;
 begin
   if (CurStep = ssInstall) and (GPrevComponents <> '') then
     RemoveDeselected(GPrevComponents, WizardSelectedComponents(False));
+  if CurStep = ssPostInstall then
+  begin
+    // Mark this installation so "luc" starts the REPL instead of the
+    // first-run installer, and so "luc --install" knows LUC is present.
+    StateDir := ExpandConstant('{localappdata}\LUC');
+    ForceDirectories(StateDir);
+    StateFile := StateDir + '\state.json';
+    AppPath := ExpandConstant('{app}');
+    StringChangeEx(AppPath, '\', '\\', True);
+    StateJson := '{"version":"{#SetupSetting("AppVersion")}","installPath":"' + AppPath + '","source":"inno","installedAt":"' + GetDateTimeString('yyyy-mm-dd hh:nn:ss', #0, #0) + '"}';
+    SaveStringToFile(StateFile, StateJson, False);
+  end;
 end;
 
 function ContainsPath(Path: string): Boolean;

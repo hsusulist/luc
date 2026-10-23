@@ -1,4 +1,4 @@
-# LUC 0.2-beta1 - build the Inno Setup installer (PREBUILT binaries)
+# LUC 0.2.0-beta-1 - build the Inno Setup installer (PREBUILT binaries)
 # update 2026-09-01: -lwinhttp for both builds, no installer\sdl2 fallback
 #
 # The installer ships READY-TO-RUN exes + SDL2.dll. The USER'S PC needs
@@ -48,7 +48,7 @@ function Test-LucExe {
     param([string]$Exe)
     $ver = & $Exe --version 2>&1
     if ($LASTEXITCODE -ne 0) { return $false }
-    if ($ver -notmatch '0\.2-beta1') { return $false }
+    if ($ver -notmatch '0\.2\.0-beta-1') { return $false }
     & $Exe -e 'print(1)' | Out-Null
     return ($LASTEXITCODE -eq 0)
 }
@@ -199,6 +199,13 @@ function Get-NerdFont {
 
 Get-NerdFont
 
+$PortableBuilder = Join-Path $ProjectDir 'tools\make_portable.ps1'
+Write-Host 'Building the terminal-install portable release...'
+& powershell -NoProfile -ExecutionPolicy Bypass -File $PortableBuilder
+if ($LASTEXITCODE -ne 0) {
+    throw 'Portable release build failed.'
+}
+
 $iscc = Get-Command iscc -ErrorAction SilentlyContinue
 if (-not $iscc) {
     $isccCandidates = @(
@@ -220,4 +227,5 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host 'Installer created successfully: dist\luc-installer.exe'
-Write-Host 'Welcome page should say "LUC 0.2-beta1" - if not, the old .iss is being used.'
+Write-Host 'Portable release created: dist\luc-portable.zip (+ SHA-256 file)'
+Write-Host 'Welcome page should say "LUC 0.2.0-beta-1" - if not, the old .iss is being used.'
