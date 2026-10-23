@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define LUC_VERSION   "LUC 0.2-beta1"
+#define LUC_VERSION   "LUC 0.2.0-beta-1"
 #define LUC_MAXREG    200
 #define LUC_MAXUPVAL  60
 #define LUC_MAXCI     220

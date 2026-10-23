@@ -1,7 +1,7 @@
 ﻿; LUC - Inno Setup script (PREBUILT, English, setup v3)
 ; update 2026-09-01: AppId, opt-in window/ai, maintenance dialog, start menu
 ; update 2026-09-02: ver 0.1, library management, offline packages
-; update 2026-09-21: ver 0.2-beta1
+; update 2026-09-21: ver 0.2.0-beta-1
 ; Setup v3 changes EVERYTHING about how window support works:
 ; the installer now ships READY-TO-RUN binaries built ahead of
 ; time on the developer's machine (build_installer.ps1):
@@ -50,7 +50,7 @@
 ; fallback produced before, so installs made without this line stay detected.
 AppId=Luc
 AppName=Luc
-AppVersion=0.2-beta1
+AppVersion=0.2.0-beta-1
 AppPublisher=hsusulist
 DefaultDirName={userpf}\LUC
 DefaultGroupName=LUC
