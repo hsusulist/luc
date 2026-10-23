@@ -67,32 +67,3 @@ luc --version
 The npm package is a small launcher. It installs the runtime into
 `%LOCALAPPDATA%\Programs\LUC` and does not modify PATH.
 
-### Update, rollback and verification
-
-The installer extracts into a staging folder and only then moves files into
-place. Every replaced file is renamed to a temporary backup first; if anything
-fails, the backup is restored and the previous version is left intact. Running
-LUC processes and locked files are detected before the install starts. Selected
-files are replaced in place, so your scripts and other unmanaged files in the
-install folder are preserved.
-
-Archives are limited to 4096 entries, 2 GB uncompressed and a 200:1 compression
-ratio. Paths with `..`, drive letters, Alternate Data Streams (`:`), reserved
-Windows device names (`CON`, `NUL`, `COM1`...) and trailing dots/spaces are
-rejected.
-
-Downloads are verified in this order:
-
-1. SHA-256 from `luc-portable.zip.sha256`.
-2. Ed25519 signature of the checksum file (`luc-portable.zip.sha256.minisig`,
-   minisign legacy format) against the public key embedded in `install.ps1`.
-3. GitHub's own asset digest, when available.
-
-Local archives require a signature unless `-AllowUnsigned` is passed explicitly.
-Releases without a signature still install with a warning for compatibility;
-publish `luc-portable.zip.sha256.minisig` with `tools/lucsig.js` to make the
-signature mandatory.
-
-The public key lives in `installer/minisign.pub`; private keys are never stored
-in the repository.
-
