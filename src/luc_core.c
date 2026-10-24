@@ -4533,7 +4533,7 @@ static const HelpTopic HELP_TOPICS[] = {
  "Files: N new, D folder, F2 rename, ^C/^V copy/paste, right-click menu.\n"
  "Code gets colors. ^E switches panes, ^B hides the tree, ^F finds text.\n"
  "Drag the divider or panel title to resize. ^Shift+E moves the tree left/right.\n"
- "Bottom shell runs commands (Enter runs, Up/Down history, ^` shows/focuses/hides).\n"
+ "Bottom shell runs commands (Enter runs, Ctrl+Up/Down history, ^` shows/focuses/hides).\n"
  ":plugin lists plugins, :setting opens settings, :theme [dark|light] colors.\n"
         ":find <text> highlights every match in the open file (:find alone opens the Ctrl+F bar), :pfind searches all files, :run runs it.\n"
  ":help in the shell lists commands. Words complete with Tab as you type.\n"
@@ -4704,6 +4704,7 @@ typedef struct {
     /* Bottom shell: input line, history, and the log panel above it */
     char shbuf[1024]; size_t shlen, shcur;
     char shhist[ED_SHHIST][1024]; int shn, shpos;
+    char shdraft[1024];
     size_t sh_promptw;       /* display width of the shell prompt (for cursor) */
     int sh_quit;             /* shell asked to quit (exit/quit command) */
     char logs[ED_LOGMAX][240]; int logn;
@@ -6940,8 +6941,9 @@ static void ed_pfind_accept(Editor *e){
     snprintf(e->status,sizeof e->status,"opened %s:%d",r->file,r->line);
 }
 static int ed_pfind_rows(Editor *e){
-    int rows=e->vh>4?e->vh-4:1;
-    return rows>0?rows:1;
+    int rows=e->vh>16?e->vh-16:(e->vh>6?e->vh-6:1);
+    if(rows<1) rows=1;
+    return rows;
 }
 static void ed_pfind_scroll(Editor *e){
     int rows=ed_pfind_rows(e);
@@ -7013,96 +7015,150 @@ static int ed_pfind_put(const char *s,int maxw){
 /* print text, the query match inside it in red */
 static int ed_pfind_put_hl(const char *s,const char *q,int maxw){
     size_t ql=q?strlen(q):0,i,hl=0;
-    int w=0;
+    int w=0, matched=0;
     if(ql){
         for(i=0;s[i];i++){
             size_t k; int ok=1;
             for(k=0;k<ql;k++)
                 if(!s[i+k]||!ed_find_ch_eq((unsigned char)s[i+k],(unsigned char)q[k])){ ok=0; break; }
-            if(ok){ hl=i; break; }
+            if(ok){ hl=i; matched=1; break; }
         }
     }
     for(i=0;s[i];i++){
         int cw=ed_chw((unsigned char)s[i],w);
         if(cw<=0) cw=1;
         if(w+cw>maxw) break;
-        if(ql&&i==hl) printf("%s",EC_FINDALL);
+        if(ql&&matched&&i>=hl&&i<hl+ql) printf("%s",EC_FINDALL);
         fputc(s[i],stdout); w+=cw;
-        if(ql&&i==hl) printf("\x1b[97m");
+        if(ql&&matched&&i>=hl&&i<hl+ql) printf("\x1b[97m");
     }
     return w;
 }
+static void ed_pfind_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
+    int bw,bh,rows;
+    bw=W-10; if(bw<36) bw=36; if(bw>W-2) bw=W-2;
+    bh=H-10; if(bh<12) bh=12; if(bh>H) bh=H;
+    rows=bh-6; if(rows<3) rows=3; if(rows>H-6) rows=H-6; if(rows<1) rows=1;
+    bh=rows+6; if(bh>H){ bh=H; rows=bh-6; if(rows<1) rows=1; }
+    *x0=(W-bw)/2; if(*x0<5) *x0=5;
+    *y0=(H-bh)/2; if(*y0<5) *y0=5;
+    *w=bw; *h=bh;
+}
 static void ed_pfind_draw(Editor *e,int W,int H){
-    int fw=W/3,lw=6,tw,rows,i,r,qw,caretw=0,startw=0,drawn=0,first=0;
-    size_t k;
+    int x0,y0,bw,bh,i,k,rows,r;
+    size_t f;
     char cnt[80];
+    int tw,lw=6,fw,inner;
+    int qx,barrow,qwidth,statusw;
+    size_t first=0;
+    int caretw=0,drawn=0,startw=0;
     if(!e->pf_on) return;
-    if(fw<14) fw=14;
-    if(fw>36) fw=36;
-    tw=W-fw-lw-3;
-    if(tw<10){ tw=10; fw=W-tw-lw-3; if(fw<8) fw=8; }
-    rows=H>4?H-4:1;
-    if(rows<1) rows=1;
+    ed_pfind_geom(e,W,H,&x0,&y0,&bw,&bh);
+    rows=bh-6; if(rows<1) rows=1;
+    inner=bw-2;
+    lw=6;
+    fw=24;
+    tw=inner-fw-12; if(tw<10){ tw=10; fw=inner-tw-12; if(fw<8) fw=8; }
+    if(fw>inner-20) fw=inner-20; if(fw<8) fw=8;
     if(e->pf_sel<e->pf_top) e->pf_top=e->pf_sel;
     if(e->pf_sel>=e->pf_top+rows) e->pf_top=e->pf_sel-rows+1;
     if(e->pf_top<0) e->pf_top=0;
-    if(e->pf_len){
-        snprintf(cnt,sizeof cnt,"%d%s match%s / %d file%s",
-            e->pf_total,e->pf_trunc?"+":"",e->pf_total==1?"":"es",
-            e->pf_scanned,e->pf_scanned==1?"":"s");
-    } else snprintf(cnt,sizeof cnt,"type to search all files");
-    printf("\x1b[1;1H%s",EC_TOPBG);
-    printf("%s PROJECT FIND  %s",TH_TCUR,TH_TDIM);
-    { int cl=(int)strlen(cnt),mp=W-22-cl,used; if(mp<4) mp=4; used=ed_pfind_put(e->exdir,mp);
-      for(i=used+14;i<W-cl-2;i++) fputc(' ',stdout);
-      printf("%s%s",TH_TDIM,cnt); }
-    printf("\x1b[K\x1b[0m");
-    printf("\x1b[2;1H%s%s",EC_LOGBG,TH_TDIM);
-    { int w0=ed_pfind_put("TEXT",tw); for(i=w0;i<tw;i++) fputc(' ',stdout); }
-    printf(" %*s  ",lw,"LINE");
-    ed_pfind_put("FILE",fw);
-    printf("\x1b[K\x1b[0m");
-    printf("\x1b[3;1H%s",TH_TDIM);
-    for(i=0;i<W;i++) printf("\xe2\x94\x80");
-    printf("\x1b[K\x1b[0m");
+    if(e->pf_len)
+        snprintf(cnt,sizeof cnt,"%d%s matches / %d files",e->pf_total,e->pf_trunc?"+":"",e->pf_scanned);
+    else snprintf(cnt,sizeof cnt,"type to search");
+    /* top border */
+    printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
+    for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
+    printf("\xe2\x94\x90\x1b[0m");
+    /* title */
+    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+2,x0+1,TH_TDIM);
+    printf("\x1b[48;2;45;45;45m\x1b[97m");
+    { const char *title=" PROJECT SEARCH ";
+      const char *hint="Up/Down select  Enter open  Esc close";
+      int tl=(int)strlen(title),hl=(int)strlen(hint),hintstart=inner-hl;
+      ed_pfind_put(title,inner);
+      for(i=tl;i<inner;i++)
+          fputc(inner>tl+hl+1&&i>=hintstart?hint[i-hintstart]:' ',stdout);
+    }
+    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    /* column header */
+    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+3,x0+1,TH_TDIM);
+    printf("\x1b[48;2;30;30;30m\x1b[90m");
+    printf(" TEXT");
+    for(i=5;i<tw;i++) fputc(' ',stdout);
+    printf(" \xe2\x94\x82 ");
+    printf("LINE");
+    for(i=4;i<lw;i++) fputc(' ',stdout);
+    printf(" \xe2\x94\x82 ");
+    printf("FILE");
+    for(i=4;i<fw;i++) fputc(' ',stdout);
+    printf("\x1b[0m");
+    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,TH_TDIM);
+    /* separator */
+    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+4,x0+1,TH_TDIM);
+    for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
+    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    /* results */
     for(r=0;r<rows;r++){
         int idx=e->pf_top+r;
-        printf("\x1b[%d;1H%s",4+r,(idx==e->pf_sel&&idx<e->pf_n)?EC_SELBG:EC_CODEBG);
+        int yy=y0+5+r,used=0;
+        printf("\x1b[%d;%dH",yy,x0+1);
+        if(idx==e->pf_sel&&idx<e->pf_n) printf("\x1b[48;2;0;120;215m\x1b[97m");
+        else printf("\x1b[48;2;30;30;30m\x1b[97m");
+        printf("\xe2\x94\x82");
         if(idx<e->pf_n){
             EdPFind *p=&e->pf_res[idx];
             int tw2=ed_pfind_put_hl(p->text,e->pf_buf,tw);
             for(i=tw2;i<tw;i++) fputc(' ',stdout);
-            printf(" %*d  ",lw,p->line);
+            printf(" \xe2\x94\x82 ");
+            printf("%*d",lw,p->line);
+            printf(" \xe2\x94\x82 ");
             { int fw2=ed_pfind_put(p->file,fw); for(i=fw2;i<fw;i++) fputc(' ',stdout); }
+            used=tw+lw+fw+12;
         } else {
-            for(i=0;i<W;i++) fputc(' ',stdout);
+            if(r==0){
+                const char *empty=e->pf_len?"No matches for this query":"Type text to search all project files";
+                printf("\x1b[90m"); used=ed_pfind_put(empty,inner); printf("\x1b[97m");
+            }
         }
-        printf("\x1b[K\x1b[0m");
+        for(i=used;i<inner;i++) fputc(' ',stdout);
+        printf("\x1b[0m");
+        printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
     }
-    if(e->pf_len&&e->pf_n==0){
-        printf("\x1b[4;1H%s%s",EC_CODEBG,TH_TDIM);
-        printf("no matches for '%s'",e->pf_buf);
-        printf("\x1b[K\x1b[0m");
-    } else if(!e->pf_len){
-        printf("\x1b[4;1H%s%s",EC_CODEBG,TH_TDIM);
-        printf("type a query below; Up/Down scrolls, Enter opens");
-        printf("\x1b[K\x1b[0m");
+    /* input bar under results */
+    barrow=y0+5+rows;
+    printf("\x1b[%d;%dH%s\xe2\x94\x82",barrow,x0+1,TH_TDIM);
+    printf("\x1b[48;2;28;28;28m\x1b[97m");
+    printf(" text> ");
+    qx=x0+9;
+    statusw=(int)strlen(cnt);
+    if(statusw>inner/2) statusw=inner/2;
+    qwidth=inner-7-statusw-1;
+    if(qwidth<1) qwidth=1;
+    caretw=0; drawn=0; startw=0; first=0;
+    for(f=0;f<e->pf_cur;f++) caretw+=ed_chw((unsigned char)e->pf_buf[f],caretw);
+    if(caretw>qwidth) startw=caretw-qwidth+1;
+        {
+            int col=0; size_t ff=0;
+            while(ff<e->pf_len){ int w0=ed_chw((unsigned char)e->pf_buf[ff],col); if(col>=startw) break; if(col+w0>startw){ startw=col; break; } col+=w0; ff++; first=(size_t)ff; }
     }
-    printf("\x1b[%d;1H%s",H,EC_TOPBG);
-    printf("%s> %s",TH_TDIM,TH_TCUR);
-    qw=W-4; if(qw<1) qw=1;
-    for(k=0;k<e->pf_cur;k++) caretw+=ed_chw((unsigned char)e->pf_buf[k],caretw);
-    if(caretw>=qw) startw=caretw-qw+1;
-    { int col=0; size_t ff=0;
-      while(ff<e->pf_len){ int w0=ed_chw((unsigned char)e->pf_buf[ff],col); if(col>=startw) break; if(col+w0>startw){startw=col;break;} col+=w0; ff++; first=(int)ff; } }
-    for(k=(size_t)first;k<e->pf_len;k++){
-        int w0=ed_chw((unsigned char)e->pf_buf[k],drawn);
-        if(drawn+w0>qw) break;
-        fputc(e->pf_buf[k],stdout); drawn+=w0;
+    for(f=first;f<e->pf_len;f++){
+        int w0=ed_chw((unsigned char)e->pf_buf[f],drawn);
+        if(drawn+w0>qwidth) break;
+        fputc(e->pf_buf[f],stdout); drawn+=w0;
+        while(f+1<e->pf_len && ed_is_cont((unsigned char)e->pf_buf[f+1])){ f++; fputc(e->pf_buf[f],stdout); }
     }
-    for(;drawn<qw;drawn++) fputc(' ',stdout);
-    printf("\x1b[K\x1b[0m");
-    printf("\x1b[%d;%dH\x1b[?25h",H,3+(caretw-startw));
+    if(e->pf_len==0){ printf("\x1b[90m"); drawn=ed_pfind_put("search project files",qwidth); }
+    printf("\x1b[48;2;30;30;30m");
+    for(;drawn<qwidth;drawn++) fputc(' ',stdout);
+    printf("\x1b[%d;%dH\x1b[48;2;30;30;30m\x1b[90m",barrow,qx+qwidth+1);
+    fwrite(cnt,1,(size_t)statusw,stdout);
+    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    /* bottom border */
+    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+6+rows,x0+1,TH_TDIM);
+    for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
+    printf("\xe2\x94\x98\x1b[0m");
+    printf("\x1b[%d;%dH\x1b[?25h",barrow,qx+(caretw-startw));
 }
 
 /* ---------------- Find panel (:find / :ff) ---------------- */
@@ -7232,12 +7288,14 @@ static void ed_fnd_scan_names(Editor *e,const char *dir,const char *rel,int dept
             if(ed_pfind_skip_dir(fd.cFileName)) continue;
             ed_fnd_scan_names(e,child,childrel,depth+1);
         } else {
-            size_t nl=strlen(fd.cFileName),k;
+            size_t nl=strlen(fd.cFileName),i,k;
             e->fnd_scanned++;
             if(nl<e->fnd_len) continue;
-            for(k=0;k<e->fnd_len;k++)
-                if(!ed_find_ch_eq((unsigned char)fd.cFileName[k],(unsigned char)e->fnd_q[k])) break;
-            if(k==e->fnd_len) ed_fnd_add(e,childrel,child,0,fd.cFileName);
+            for(i=0;i+e->fnd_len<=nl;i++){
+                for(k=0;k<e->fnd_len;k++)
+                    if(!ed_find_ch_eq((unsigned char)fd.cFileName[i+k],(unsigned char)e->fnd_q[k])) break;
+                if(k==e->fnd_len){ ed_fnd_add(e,childrel,child,0,fd.cFileName); break; }
+            }
         }
     }while(FindNextFileA(h,&fd));
     FindClose(h);
@@ -7273,12 +7331,13 @@ static void ed_fnd_open(Editor *e,int mode,const char *query){
 }
 static void ed_fnd_close(Editor *e){ e->fnd_on=0; e->focus=0; }
 static void ed_fnd_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
-    int bw=W-4, bh;
-    if(bw>88) bw=88;
-    if(bw<40) bw=40;
-    if(bw>W-2) bw=W-2;
-    bh=H-6; if(bh<12) bh=12; if(bh>H-1) bh=H-1;
-    *x0=(W-bw)/2; *y0=(H-bh)/2; if(*y0<0) *y0=0;
+    int bw,bh,rows;
+    bw=W-10; if(bw<36) bw=36; if(bw>W-2) bw=W-2;
+    bh=H-10; if(bh<12) bh=12; if(bh>H) bh=H;
+    rows=bh-6; if(rows<3) rows=3; if(rows>H-6) rows=H-6; if(rows<1) rows=1;
+    bh=rows+6; if(bh>H){ bh=H; rows=bh-6; if(rows<1) rows=1; }
+    *x0=(W-bw)/2; if(*x0<5) *x0=5;
+    *y0=(H-bh)/2; if(*y0<5) *y0=5;
     *w=bw; *h=bh;
 }
 static int ed_fnd_rows(Editor *e){
@@ -7360,36 +7419,39 @@ static int ed_fnd_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
 /* print text, the query match inside it in red */
 static int ed_fnd_put_hl(const char *s,const char *q,int maxw){
     size_t ql=q?strlen(q):0,i,hl=0;
-    int w=0;
+    int w=0, matched=0;
     if(ql){
         for(i=0;s[i];i++){
             size_t k; int ok=1;
             for(k=0;k<ql;k++)
                 if(!s[i+k]||!ed_find_ch_eq((unsigned char)s[i+k],(unsigned char)q[k])){ ok=0; break; }
-            if(ok){ hl=i; break; }
+            if(ok){ hl=i; matched=1; break; }
         }
     }
     for(i=0;s[i];i++){
         int cw=ed_chw((unsigned char)s[i],w);
         if(cw<=0) cw=1;
         if(w+cw>maxw) break;
-        if(ql&&i==hl) printf("%s",EC_FINDALL);
+        if(ql&&matched&&i>=hl&&i<hl+ql) printf("%s",EC_FINDALL);
         fputc(s[i],stdout); w+=cw;
-        if(ql&&i==hl) printf("\x1b[97m");
+        if(ql&&matched&&i>=hl&&i<hl+ql) printf("\x1b[97m");
     }
     return w;
 }
 static void ed_fnd_draw(Editor *e,int W,int H){
-    int x0,y0,bw,bh,i,k,rows,r,caretw=0,startw=0,drawn=0,qx;
+    int x0,y0,bw,bh,i,k,rows,r,caretw=0,startw=0,drawn=0,qx,folderw,filew;
     size_t f;
     const char *label;
     char cnt[96];
     int inner;                     /* usable width between the borders */
     if(!e->fnd_on) return;
     ed_fnd_geom(e,W,H,&x0,&y0,&bw,&bh);
-    rows=bh-5; if(rows<1) rows=1;
-    e->fnd_vis=rows;
+    rows=bh-6; if(rows<1) rows=1;
     inner=bw-2;
+    e->fnd_vis=rows;
+    folderw=inner/2; filew=inner-folderw-3;
+    if(folderw<8) folderw=8;
+    if(filew<8){ filew=8; folderw=inner-filew-3; if(folderw<8) folderw=8; }
     label=e->fnd_mode==1?"file":"find";
     if(e->fnd_sel>=e->fnd_n) e->fnd_sel=e->fnd_n>0?e->fnd_n-1:0;
     if(e->fnd_sel<0) e->fnd_sel=0;
@@ -7398,40 +7460,27 @@ static void ed_fnd_draw(Editor *e,int W,int H){
     printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x90\x1b[0m");
-    /* header */
-    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m\xe2\x94\x82",y0+2,x0+1);
-    { char title[64]; int tl;
-      snprintf(title,sizeof title," %s ",e->fnd_mode==1?"find files":"find");
-      tl=(int)strlen(title);
-      fwrite(title,1,(size_t)tl,stdout);
-      for(i=tl;i<inner;i++) fputc(' ',stdout); }
+    /* title and keyboard guidance */
+    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+2,x0+1,TH_TDIM);
+    printf("\x1b[48;2;45;45;45m\x1b[97m");
+    { const char *title=e->fnd_mode==1?" FIND FILES ":" FIND IN PROJECT ";
+      const char *hint="Up/Down select  Enter open  Esc close";
+      int tl=(int)strlen(title),hl=(int)strlen(hint),hintstart=inner-hl;
+      ed_pfind_put(title,inner);
+      for(i=tl;i<inner;i++)
+          fputc(inner>tl+hl+1&&i>=hintstart?hint[i-hintstart]:' ',stdout);
+    }
     printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
-    /* input bar */
+    /* column header */
     printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+3,x0+1,TH_TDIM);
-    printf("\x1b[48;2;28;28;28m\x1b[97m");
-    printf(" %s> ",label);
-    qx=x0+2+(int)strlen(label)+4;   /* column of the first query char */
-    for(f=0;f<e->fnd_cur;f++) caretw+=ed_chw((unsigned char)e->fnd_q[f],caretw);
-    if(caretw>inner-20) startw=caretw-(inner-20)+1;
-    for(f=0;f<e->fnd_len;f++){
-        int w0=ed_chw((unsigned char)e->fnd_q[f],drawn);
-        if(drawn+w0>inner-20) break;
-        fputc(e->fnd_q[f],stdout); drawn+=w0;
-    }
-    printf("\x1b[48;2;30;30;30m");
-    for(;drawn<inner-20;drawn++) fputc(' ',stdout);
-    e->fnd_cur_x=qx+(caretw-startw);
-    e->fnd_cur_y=y0+3;
-    if(e->fnd_len==0) printf("\x1b[90m%s",e->fnd_mode==1?"search file names":"search text in file + project");
-    /* count on the right of the input bar */
-    if(e->fnd_mode==1&&e->fnd_nofolder) snprintf(cnt,sizeof cnt,"(no folder)");
-    else if(e->fnd_len) snprintf(cnt,sizeof cnt,"%d%s match%s",e->fnd_total,e->fnd_trunc?"+":"",e->fnd_total==1?"":"es");
-    else cnt[0]=0;
-    if(cnt[0]){
-        int cl=(int)strlen(cnt);
-        printf("\x1b[%d;%dH\x1b[48;2;30;30;30m\x1b[90m%s",y0+3,x0+1+inner-cl,cnt);
-    }
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("\x1b[48;2;30;30;30m\x1b[90m");
+    printf(" FOLDER");
+    for(i=7;i<folderw;i++) fputc(' ',stdout);
+    printf(" \xe2\x94\x82 ");
+    printf("FILE");
+    for(i=4;i<filew;i++) fputc(' ',stdout);
+    printf("\x1b[0m");
+    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,TH_TDIM);
     /* separator */
     printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+4,x0+1,TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
@@ -7446,43 +7495,80 @@ static void ed_fnd_draw(Editor *e,int W,int H){
         printf("\xe2\x94\x82");
         if(idx<e->fnd_n){
             EdFnd *p=&e->fnd_res[idx];
-            int fw=inner/3, w0;
-            if(fw<16) fw=16;
-            if(fw>34) fw=34;
-            w0=ed_fnd_put_hl(p->file,e->fnd_q,fw);
-            for(i=w0;i<fw;i++) fputc(' ',stdout);
-            used=fw;
-            printf("\x1b[90m:"); used+=1;
-            if(p->line>0) snprintf(cnt,sizeof cnt,"%d",p->line); else snprintf(cnt,sizeof cnt,"-");
-            printf("%s",cnt); used+=(int)strlen(cnt);
-            printf("\x1b[97m "); used+=1;
-            used+=ed_fnd_put_hl(p->text,e->fnd_q,inner-used-1);
+            char folder[300], fname[160];
+            char *slash;
+            int w0,w1;
+            snprintf(folder,sizeof folder,"%s",p->file);
+            slash=strrchr(folder,'\\'); if(!slash) slash=strrchr(folder,'/');
+            if(slash){ *slash=0; snprintf(fname,sizeof fname,"%s",slash+1); if(folder[0]==0) snprintf(folder,sizeof folder,"%s","."); }
+            else { snprintf(fname,sizeof fname,"%s",folder); snprintf(folder,sizeof folder,"%s","."); }
+            if(e->fnd_mode!=1){ snprintf(folder,sizeof folder,"%s",p->file); snprintf(fname,sizeof fname,"%s",p->text); }
+            w0=ed_pfind_put(folder,folderw);
+            for(i=w0;i<folderw;i++) fputc(' ',stdout);
+            printf(" \xe2\x94\x82 ");
+            w1=ed_fnd_put_hl(fname,e->fnd_q,filew);
+            for(i=w1;i<filew;i++) fputc(' ',stdout);
+            used=inner;
         } else if(e->fnd_n==0&&r==0){
             if(e->fnd_mode==1&&e->fnd_nofolder){ printf(" (no folder)"); used=12; }
-            else if(e->fnd_len){ used=snprintf(cnt,sizeof cnt," no matches for '%s'",e->fnd_q); printf("%s",cnt); }
+            else if(e->fnd_len){ snprintf(cnt,sizeof cnt,"No matches for '%s'",e->fnd_q); printf("%s",TH_TDIM); used=ed_pfind_put(cnt,inner); printf("\x1b[97m"); }
+            else { used=ed_pfind_put(e->fnd_mode==1?"Type a name to search files":"Type text to search project files",inner); }
         }
         for(i=used;i<inner;i++) fputc(' ',stdout);
         printf("\x1b[0m");
         printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
     }
-    /* footer */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[48;2;22;22;22m%s",y0+4+rows,x0+1,TH_TDIM,TH_TDIM);
-    { const char *hint=" Up/Down select  Enter open  Esc close";
-      int used=(int)strlen(hint);
-      if(used>inner) used=inner;
-      fwrite(hint,1,(size_t)used,stdout);
-      for(k=used;k<inner;k++) fputc(' ',stdout); }
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+4+rows,x0+bw,TH_TDIM);
+    /* input bar at bottom */
+    {
+        int row=y0+5+rows, cl;
+        size_t first=0;
+        printf("\x1b[%d;%dH%s\xe2\x94\x82",row,x0+1,TH_TDIM);
+        printf("\x1b[48;2;28;28;28m\x1b[97m");
+        printf(" %s> ",label);
+        qx=x0+5+(int)strlen(label); /* first query cell */
+        caretw=0; drawn=0; startw=0;
+        for(f=0;f<e->fnd_cur;f++) caretw+=ed_chw((unsigned char)e->fnd_q[f],caretw);
+        if(caretw>inner-20) startw=caretw-(inner-20)+1;
+        {
+            int col=0; size_t ff=0;
+            while(ff<e->fnd_len){
+                int w0=ed_chw((unsigned char)e->fnd_q[ff],col);
+                if(col>=startw) break;
+                if(col+w0>startw){ startw=col; break; }
+                col+=w0; ff++;
+            }
+            first=ff;
+        }
+        for(f=first;f<e->fnd_len;f++){
+            int w0=ed_chw((unsigned char)e->fnd_q[f],drawn);
+            if(drawn+w0>inner-20) break;
+            fputc(e->fnd_q[f],stdout); drawn+=w0;
+            while(f+1<e->fnd_len && ed_is_cont((unsigned char)e->fnd_q[f+1])){ f++; fputc(e->fnd_q[f],stdout); }
+        }
+        if(e->fnd_len==0) printf("\x1b[90m%s",e->fnd_mode==1?"search file names":"search text in file + project");
+        printf("\x1b[48;2;30;30;30m");
+        for(;drawn<inner-20;drawn++) fputc(' ',stdout);
+        e->fnd_cur_x=qx+(caretw-startw);
+        e->fnd_cur_y=row;
+        if(e->fnd_mode==1&&e->fnd_nofolder) snprintf(cnt,sizeof cnt,"(no folder)");
+        else if(e->fnd_len) snprintf(cnt,sizeof cnt,"%d%s match%s",e->fnd_total,e->fnd_trunc?"+":"",e->fnd_total==1?"":"es");
+        else cnt[0]=0;
+        if(cnt[0]){
+            cl=(int)strlen(cnt);
+            printf("\x1b[%d;%dH\x1b[48;2;30;30;30m\x1b[90m%s",row,x0+1+inner-cl,cnt);
+        }
+        printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    }
     /* bottom border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+5+rows,x0+1,TH_TDIM);
-    for(k=0;k<bw-2;k++) fputs("\xe2\x94\x80",stdout);
+    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+6+rows,x0+1,TH_TDIM);
+    for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x98\x1b[0m");
     if(e->fnd_cur_x>0) printf("\x1b[%d;%dH\x1b[?25h",e->fnd_cur_y,e->fnd_cur_x);
 }
 
 /* ':' command hints in the shell (canonical commands only: no aliases) */
 static const char *LUC_CMDS[]={
-    "find","findfile","keybind","pf","pfind","plugin","run","setting","theme","help",NULL};
+    "pf","pfind","find","findfile","keybind","plugin","run","setting","theme","help",NULL};
 static int ed_cmd_hint_list(Editor *e,char items[10][32],int *sel){
     char pre[64]; size_t n=0; int i,count=0;
     if(e->focus!=2||e->shlen<1||e->shbuf[0]!=':') return 0;
@@ -7505,19 +7591,22 @@ static int ed_cmd_hint_list(Editor *e,char items[10][32],int *sel){
 static void ed_cmd_hint_draw(Editor *e,int W,int H){
     char items[10][32];
     int n=ed_cmd_hint_list(e,items,&e->cmdh_sel);
-    int i,bh=n>10?10:n;
+    int i,bh=n,first=0,limit=H>1?H-1:1;
     (void)W;
+    if(bh>limit) bh=limit;
     if(bh<=0) return;
+    if(e->cmdh_sel>=bh) first=e->cmdh_sel-bh+1;
     for(i=0;i<bh;i++){
         int row=H-bh+i;
+        int idx=first+i;
         if(row<1) continue;
         printf("\x1b[%d;1H",row);
-        if(i==e->cmdh_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+        if(idx==e->cmdh_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
         else printf("\x1b[48;2;28;28;28m\x1b[97m");
-        printf(" \xe2\x97\x8f :%s",items[i]);
-        { int used=(int)strlen(items[i])+5,k;
+        printf(" \xe2\x97\x8f :%s",items[idx]);
+        { int used=(int)strlen(items[idx])+5,k;
           for(k=used;k<26;k++) fputc(' ',stdout); }
-        printf("\x1b[0m");
+        printf("\x1b[K\x1b[0m");
     }
 }
 
@@ -7887,7 +7976,7 @@ static void ed_draw(Editor *e){
             else printf("%s%.*s",TH_TDIM,W-2,e->logs[idx]);
             printf("\x1b[0m");
         }
-        { /* Command input row (click to focus, Enter runs, Up/Down history) */
+        { /* Command input row (click to focus, Enter runs, Ctrl+Up/Down history) */
           const char *dd=e->exdir, *bb=dd;
           char pr[64]; int pc;
           while(*bb){ if(*bb=='\\'||*bb=='/') dd=bb+1; bb++; }
@@ -9088,6 +9177,20 @@ static void ed_shell_hist_push(Editor *e,const char *line){
     snprintf(e->shhist[e->shn++],sizeof e->shhist[0],"%s",line);
     e->shpos=e->shn;
 }
+static void ed_shell_hist_move(Editor *e,int dir){
+    if(dir<0){
+        if(e->shn<=0) return;
+        if(e->shpos>=e->shn) snprintf(e->shdraft,sizeof e->shdraft,"%s",e->shbuf);
+        if(e->shpos>0) e->shpos--;
+        snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
+    } else if(e->shpos<e->shn){
+        e->shpos++;
+        if(e->shpos<e->shn) snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
+        else snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shdraft);
+    }
+    e->shlen=strlen(e->shbuf);
+    e->shcur=e->shlen;
+}
 /* Strip ANSI escapes + control junk so child output can't wreck the TUI */
 static void ed_sanitize(char *d,size_t cap,const char *s){
     size_t r=0, w=0;
@@ -9179,6 +9282,12 @@ static void ed_cmd_run(Editor *e,const char *cmd){
         ed_fnd_open(e,1,a);
         return;
     }
+    if(!strncmp(cmd,"filefind",8)&&(cmd[8]==0||cmd[8]==' '||cmd[8]=='\t')){
+        const char *a=cmd+8;
+        while(*a==' '||*a=='\t') a++;
+        ed_fnd_open(e,1,a);
+        return;
+    }
     if(!strncmp(cmd,"ff",2)&&(cmd[2]==0||cmd[2]==' '||cmd[2]=='\t')){
         const char *a=cmd+2;
         while(*a==' '||*a=='\t') a++;
@@ -9222,6 +9331,7 @@ static void ed_cmd_run(Editor *e,const char *cmd){
         ed_log(e,":ff [text] - find files by name");
         ed_log(e,":pf / :pfind - search all project files (Ctrl+Shift+F)");
         ed_log(e,":run - run the current file (F5)");
+        ed_log(e,"Ctrl+Up/Down - command history; Down restores your current input");
         ed_log(e,":help - this list");
         e->log_expand=1; e->log_scroll=0;
         return;
@@ -9293,7 +9403,12 @@ static void ed_shell_run(Editor *e){
 /* Shell line keys; returns 1 when the key was consumed */
 static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
     char hints[10][32];
+    int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
     int nh=ed_cmd_hint_list(e,hints,&e->cmdh_sel);
+    if(ch==0&&ctrl&&(vk==VK_UP||vk==VK_DOWN)){
+        ed_shell_hist_move(e,vk==VK_UP?-1:1);
+        return 0;
+    }
     if(ch==9&&nh>0){   /* Tab accepts the ':' command hint */
         if(e->cmdh_sel<0) e->cmdh_sel=0;
         if(e->cmdh_sel>=nh) e->cmdh_sel=nh-1;
@@ -9313,6 +9428,7 @@ static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
     if(ch==13){ ed_shell_run(e); return e->sh_quit; }
     if(ch==8){                            /* Backspace */
         if(e->shcur>0){
+            e->shpos=e->shn;
             e->shcur--;
             memmove(&e->shbuf[e->shcur],&e->shbuf[e->shcur+1],e->shlen-e->shcur);
             if(e->shlen>0) e->shlen--;
@@ -9339,6 +9455,7 @@ static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
         if(cn==0) return 0;
         if(e->shlen+cn>=sizeof e->shbuf) cn=sizeof e->shbuf-e->shlen-1;
         if(cn==0) return 0;
+        e->shpos=e->shn;
         memmove(&e->shbuf[e->shcur+cn],&e->shbuf[e->shcur],e->shlen-e->shcur+1);
         memcpy(&e->shbuf[e->shcur],clean,cn);
         e->shcur+=cn; e->shlen+=cn;
@@ -9359,17 +9476,11 @@ static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
             }
         }
         if(vk==VK_UP&&e->shn>0){
-            if(e->shpos>0) e->shpos--;
-            snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
-            e->shlen=strlen(e->shbuf); e->shcur=e->shlen;
+            ed_shell_hist_move(e,-1);
             return 0;
         }
         if(vk==VK_DOWN){
-            if(e->shpos+1<e->shn){
-                e->shpos++;
-                snprintf(e->shbuf,sizeof e->shbuf,"%s",e->shhist[e->shpos]);
-            } else { e->shpos=e->shn; e->shbuf[0]=0; }
-            e->shlen=strlen(e->shbuf); e->shcur=e->shlen;
+            ed_shell_hist_move(e,1);
             return 0;
         }
         if(ed_bind_match(e,KB_ICONS,vk,ctl)){ ed_icons_toggle(e); return 0; }
@@ -9378,6 +9489,7 @@ static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
     if(ch>=32){
         unsigned long cp;
         char tmp[4]; int m=0;
+        if(e->shlen==0&&ch==':') e->cmdh_sel=0;
         if(ch>=0xD800&&ch<=0xDBFF){ e->surr_hi=ch; return 0; }
         if(ch>=0xDC00&&ch<=0xDFFF&&e->surr_hi){
             cp=0x10000UL+(((unsigned long)(e->surr_hi-0xD800))<<10)+(unsigned long)(ch-0xDC00);
@@ -9388,6 +9500,7 @@ static int ed_shell_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
         else if(cp<0x10000){ tmp[m++]=(char)(0xE0|(cp>>12)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
         else { tmp[m++]=(char)(0xF0|(cp>>18)); tmp[m++]=(char)(0x80|((cp>>12)&0x3F)); tmp[m++]=(char)(0x80|((cp>>6)&0x3F)); tmp[m++]=(char)(0x80|(cp&0x3F)); }
         if(e->shlen+(size_t)m>=sizeof e->shbuf) return 0;
+        e->shpos=e->shn;
         memmove(&e->shbuf[e->shcur+m],&e->shbuf[e->shcur],e->shlen-e->shcur+1);
         memcpy(&e->shbuf[e->shcur],tmp,(size_t)m);
         e->shcur+=(size_t)m; e->shlen+=(size_t)m;
@@ -9600,7 +9713,7 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
         int x0,y0,bw,bh,rows,r;
         if(GetConsoleScreenBufferInfo(fh,&fbi)){ fx=fbi.srWindow.Left; fy=fbi.srWindow.Top; }
         ed_fnd_geom(e,fW,fH,&x0,&y0,&bw,&bh);
-        rows=bh-5; if(rows<1) rows=1;
+    rows=bh-6; if(rows<1) rows=1;
         if(m->dwEventFlags==MOUSE_WHEELED){
             int up=((short)(m->dwButtonState>>16))>0;
             if(up){ if(e->fnd_top>=3) e->fnd_top-=3; else e->fnd_top=0; }
@@ -9613,7 +9726,7 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
            (m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)){
             int mx=(int)m->dwMousePosition.X-fx, my=(int)m->dwMousePosition.Y-fy;
             if(mx<x0||mx>=x0+bw||my<y0||my>=y0+bh){ e->fnd_on=0; return; }
-            r=my-(y0+4);          /* first result row sits on y0+5 */
+            r=my-(y0+5);          /* first result row sits on y0+5 */
             if(r>=0&&r<rows){
                 int idx=e->fnd_top+r;
                 if(idx<e->fnd_n){ e->fnd_sel=idx; e->fnd_top=idx; }
@@ -9621,7 +9734,34 @@ static void ed_mouse(Editor *e,MOUSE_EVENT_RECORD *m){
         }
         return;
     }
-    if(e->pf_on) return;
+    if(e->pf_on){
+        HANDLE fh=GetStdHandle(STD_OUTPUT_HANDLE);
+        CONSOLE_SCREEN_BUFFER_INFO fbi;
+        int fx=0,fy=0,fW=e->vw>0?e->vw:80,fH=e->vh>0?e->vh:24;
+        int x0,y0,bw,bh,rows,r;
+        if(GetConsoleScreenBufferInfo(fh,&fbi)){ fx=fbi.srWindow.Left; fy=fbi.srWindow.Top; }
+        ed_pfind_geom(e,fW,fH,&x0,&y0,&bw,&bh);
+        rows=bh-6; if(rows<1) rows=1;
+        if(m->dwEventFlags==MOUSE_WHEELED){
+            int up=((short)(m->dwButtonState>>16))>0;
+            if(up){ if(e->pf_top>=3) e->pf_top-=3; else e->pf_top=0; }
+            else e->pf_top+=3;
+            if(e->pf_top>e->pf_n-rows) e->pf_top=e->pf_n-rows;
+            if(e->pf_top<0) e->pf_top=0;
+            return;
+        }
+        if((m->dwEventFlags==0||m->dwEventFlags==DOUBLE_CLICK)&&
+           (m->dwButtonState&FROM_LEFT_1ST_BUTTON_PRESSED)){
+            int mx=(int)m->dwMousePosition.X-fx, my=(int)m->dwMousePosition.Y-fy;
+            if(mx<x0||mx>=x0+bw||my<y0||my>=y0+bh){ e->pf_on=0; return; }
+            r=my-(y0+4);
+            if(r>=0&&r<rows){
+                int idx=e->pf_top+r;
+                if(idx<e->pf_n){ e->pf_sel=idx; }
+            }
+        }
+        return;
+    }
     HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
     CONSOLE_SCREEN_BUFFER_INFO bi;
     int wx=0,wy=0,x,y,H,W,ph,ptop,CROWS,exvw,exx,divx,codex,scrollx;
