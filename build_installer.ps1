@@ -1,4 +1,4 @@
-# LUC 0.2.0-beta-1 - build the Inno Setup installer (PREBUILT binaries)
+# LUC - build the Inno Setup installer (PREBUILT binaries)
 # update 2026-09-01: -lwinhttp for both builds, no installer\sdl2 fallback
 #
 # The installer ships READY-TO-RUN exes + SDL2.dll. The USER'S PC needs
@@ -33,10 +33,13 @@ $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppDir = Join-Path $ProjectDir 'dist\app'
 $InstallerScript = Join-Path $ProjectDir 'installer\luc-installer.iss'
 $SrcCore = Join-Path $ProjectDir 'src\luc_core.c'
+$SrcHeader = Join-Path $ProjectDir 'src\luc.h'
 $SrcLibs = Join-Path $ProjectDir 'src\luc_libs.c'
 $SrcTrans = Join-Path $ProjectDir 'src\luc_trans.c'
+$VersionMatch = [regex]::Match((Get-Content $SrcHeader -Raw), '#define\s+LUC_VERSION\s+"LUC\s+([^"]+)"')
+if (-not $VersionMatch.Success) { throw "Cannot read LUC_VERSION from $SrcHeader" }
+$ExpectedVersion = $VersionMatch.Groups[1].Value
 
-# luc.exe dang chay se khoa file -> tat het truoc khi lam viec
 Get-Process luc, luc-core, luc-win, luc-fallback -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 300
 
@@ -48,7 +51,7 @@ function Test-LucExe {
     param([string]$Exe)
     $ver = & $Exe --version 2>&1
     if ($LASTEXITCODE -ne 0) { return $false }
-    if ($ver -notmatch '0\.2\.0-beta-1') { return $false }
+    if ($ver -notmatch [regex]::Escape($ExpectedVersion)) { return $false }
     & $Exe -e 'print(1)' | Out-Null
     return ($LASTEXITCODE -eq 0)
 }

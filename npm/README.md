@@ -23,7 +23,8 @@ luc --install -c window,ai -d "D:\Tools\LUC" -y
 ```
 
 Available components: `window`, `ai`, `discord`, `lcode`, `vscode`, `source`.
-The core interpreter is always installed.
+LCode is optional and is not selected by default. To install its launcher from
+npm instead, use `npm install -g @hsusulist/lcode`.
 
 The npm package is a small launcher; the runtime is downloaded from the signed
 GitHub release and verified with SHA-256 and Ed25519 (minisign format) before it

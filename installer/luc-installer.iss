@@ -89,7 +89,8 @@ Name: "vi"; MessagesFile: "compiler:Languages\Vietnamese.isl"
 #endif
 
 [Types]
-Name: "full"; Description: "Download all"; Flags: iscustom
+Name: "full"; Description: "Default installation"
+Name: "custom"; Description: "Custom installation"; Flags: iscustom
 
 [Components]
 ; main (fixed) is the lightweight default: interpreter + core libraries
@@ -104,8 +105,8 @@ Name: "window"; Description: "Window support - SDL2 2D graphics, PNG/JPG sprites
 Name: "ailib"; Description: "lanternl AI library - 'import ai': neural nets, LMTrain, BPE tokenizer (optional; add later with: luc install ai)"
 Name: "discord"; Description: "Discord bot library - 'import discord': bot, slash commands, gateway (optional; add later with: luc install discord)"
 Name: "vsext"; Description: "VS Code extension - LUC syntax highlighting"; Types: full
-Name: "lcode"; Description: "LCode editor - built-in code editor with file explorer (Start Menu shortcut)"; Types: full
-Name: "lcodefont"; Description: "Download for LCode: FiraCode Nerd Font Mono for file icons (then set your terminal font to it)"; Types: full
+Name: "lcode"; Description: "LCode editor - built-in code editor with file explorer (optional)"; Types: custom
+Name: "lcodefont"; Description: "Download for LCode: FiraCode Nerd Font Mono for file icons (then set your terminal font to it)"; Types: custom
 Name: "source"; Description: "Keep the C source in the install folder (for developers)"; Types: full
 
 [Files]
@@ -144,6 +145,9 @@ Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window;
 Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
 ; Console-only build, installed as luc.exe when "window" is unticked
 Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "luc.exe"; Check: ConsoleSelected; Flags: ignoreversion
+; Optional LCode command; the core build is also used when luc.exe has window support.
+Source: "..\dist\app\luc-win.exe"; DestDir: "{app}"; DestName: "lcode.exe"; Components: lcode and window; Flags: ignoreversion
+Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "lcode.exe"; Components: lcode; Check: ConsoleSelected; Flags: ignoreversion
 ; Terminal installer used by "luc --install" and for updating portable builds
 Source: "..\install.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\installer\minisign.pub"; DestDir: "{app}"; Flags: ignoreversion
@@ -205,7 +209,7 @@ Source: "..\src\*.c"; DestDir: "{app}\src"; Components: source; Flags: ignorever
 
 [Icons]
 Name: "{group}\LUC"; Filename: "{app}\luc.exe"
-Name: "{group}\LCode"; Filename: "{app}\luc.exe"; Parameters: "--lcode ""{app}\demos"""; Components: lcode
+Name: "{group}\LCode"; Filename: "{app}\lcode.exe"; Parameters: """{app}\demos"""; Components: lcode
 Name: "{userdesktop}\LUC"; Filename: "{app}\luc.exe"
 ; Reopens the maintenance dialog (Install libraries / Fix / Uninstall) any time
 Name: "{group}\Luc Installer"; Filename: "{app}\luc-installer.exe"
@@ -215,6 +219,14 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 ; LUC_PATH is set unconditionally: "luc install ai" must be able to drop
 ; modules into luc_modules even when the ailib component was not ticked
 Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "LUC_PATH"; ValueData: "{app}\luc_modules"; Flags: uninsdeletevalue
+; Keep normal file-open defaults untouched; these entries add LUC to Open with.
+Root: HKCU; Subkey: "Software\Classes\.luc\OpenWithProgids"; ValueType: string; ValueName: "LUC.Library"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.luic\OpenWithProgids"; ValueType: string; ValueName: "LUC.Library"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\LUC.Library"; ValueType: string; ValueName: ""; ValueData: "LUC library"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\LUC.Library\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\luc.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\.cfg\OpenWithProgids"; ValueType: string; ValueName: "LUC.PluginConfig"; ValueData: ""; Components: lcode; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\LUC.PluginConfig"; ValueType: string; ValueName: ""; ValueData: "LCode plugin configuration"; Components: lcode; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\LUC.PluginConfig\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\lcode.exe"" --lcode ""%1"""; Components: lcode
 ; Snapshot of the ticked components: maintenance re-ticks them on
 ; "Install libraries" so re-running setup starts from the last selection
 Root: HKCU; Subkey: "Software\LUC"; ValueType: string; ValueName: "Components"; ValueData: "{code:ComponentSnapshot}"; Flags: uninsdeletekey

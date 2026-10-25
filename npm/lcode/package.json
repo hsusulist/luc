@@ -1,0 +1,32 @@
+{
+  "name": "@hsusulist/lcode",
+  "version": "0.1.2",
+  "description": "LCode terminal editor for LUC projects",
+  "bin": {
+    "lcode": "bin/lcode.js"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hsusulist/luc.git",
+    "directory": "npm/lcode"
+  },
+  "keywords": [
+    "lcode",
+    "luc",
+    "editor"
+  ],
+  "dependencies": {
+    "@hsusulist/luc": "^0.2.4"
+  }
+}
