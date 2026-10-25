@@ -4915,7 +4915,7 @@ static void repl_help_loop(void){
     }
 }
 
-#include "lcode.c"
+#include "lcode/lcode.c"
 
 static void lcode_cmd(const char *line);
 

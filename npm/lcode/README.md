@@ -1,12 +1,21 @@
 # @hsusulist/lcode
 
-Install the LCode terminal editor for LUC projects on Windows:
+Install LCode by itself on Windows:
 
 ```powershell
 npm install -g @hsusulist/lcode
 lcode .
 ```
 
-The package uses the LUC runtime and forwards its arguments to
-`luc --lcode [path]`. Install `@hsusulist/luc` directly if you also want the
-LUC interpreter command.
+The package downloads and verifies the dedicated `lcode-portable.zip` release
+asset and installs it to `%LOCALAPPDATA%\Programs\LCode`. It does not install
+the `luc` command. Each GitHub release needs this ZIP, its `.sha256` checksum,
+and `.sha256.minisig` signature attached.
+To install or update the editor later, run:
+
+```powershell
+lcode --install
+```
+
+To install the interpreter too, install `@hsusulist/luc`. Run `luc --install`
+to choose **LCode support** in its component chooser, or use both npm packages.

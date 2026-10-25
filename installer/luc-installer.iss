@@ -206,6 +206,7 @@ Source: "..\vscode\*"; DestDir: "{%USERPROFILE}\.vscode\extensions\hsusulist.luc
 ; must NOT be shipped - they would silently bloat the installer)
 Source: "..\src\*.h"; DestDir: "{app}\src"; Components: source; Flags: ignoreversion
 Source: "..\src\*.c"; DestDir: "{app}\src"; Components: source; Flags: ignoreversion
+Source: "..\src\lcode\*"; DestDir: "{app}\src\lcode"; Components: source; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\LUC"; Filename: "{app}\luc.exe"

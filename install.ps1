@@ -10,6 +10,7 @@ param(
     [switch]$NoEnvironmentChanges,
     [switch]$Force,
     [switch]$Quiet,
+    [switch]$LCodeOnly,
     [switch]$AllowUnsigned,
     [switch]$NoColor
 )
@@ -20,7 +21,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $repo = 'hsusulist/luc'
 $minisignPublicKey = 'RWRPLJnLdrwqwkmhtMPAEfihwSnAC9TmbPc4ghGntXYOSLqKlKGUUx40'
-$defaultInstallPath = Join-Path $env:LOCALAPPDATA 'Programs\LUC'
+$defaultInstallPath = Join-Path $env:LOCALAPPDATA $(if ($LCodeOnly) { 'Programs\LCode' } else { 'Programs\LUC' })
 $optionalComponents = @('window', 'ai', 'discord', 'lcode', 'vscode', 'source')
 $componentInfo = [ordered]@{
     window  = @{ Label = 'Window support';   Desc = 'SDL2 graphics, sound and the Pong demo' }
@@ -464,16 +465,19 @@ function Get-ArchivePlan {
         [IO.Compression.ZipArchive]$Zip,
         [string[]]$SelectedComponents,
         [string]$Target,
-        [string]$VsCodeTarget
+        [string]$VsCodeTarget,
+        [switch]$LCodeOnly
     )
 
     if ($Zip.Entries.Count -gt $maxEntries) {
         throw "Archive contains too many entries ($($Zip.Entries.Count) > $maxEntries)."
     }
 
-    $prefixes = @('core', 'common')
+    $prefixes = @()
+    if ($LCodeOnly) { $prefixes += 'lcode' }
+    else { $prefixes += @('core', 'common') }
     foreach ($name in $SelectedComponents) {
-        if ($name -ne 'core') { $prefixes += $name }
+        if ($name -ne 'core' -and $prefixes -notcontains $name) { $prefixes += $name }
     }
 
     $plan = New-Object System.Collections.Generic.List[object]
@@ -913,7 +917,7 @@ function Add-UserPath {
 }
 
 function Write-InstallState {
-    param([string]$Version, [string]$Path, [string[]]$Selected, [string]$SourceName)
+    param([string]$Version, [string]$Path, [string[]]$Selected, [string]$SourceName, [switch]$LCodeOnly)
     $stateDir = Join-Path $env:LOCALAPPDATA 'LUC'
     if (-not (Test-Path -LiteralPath $stateDir -PathType Container)) {
         New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
@@ -921,22 +925,24 @@ function Write-InstallState {
     $state = [ordered]@{
         version     = $Version
         installPath = $Path
-        components  = @('core') + $Selected
+        components  = if ($LCodeOnly) { @('lcode') } else { @('core') + $Selected }
         source      = $SourceName
         installedAt = (Get-Date).ToString('o')
     }
-    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stateDir 'state.json') -Encoding UTF8
+    $stateFile = if ($LCodeOnly) { 'lcode-state.json' } else { 'state.json' }
+    $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $stateDir $stateFile) -Encoding UTF8
 }
 
 function Write-InstallManifest {
-    param([string]$Version, [string]$Path, [string[]]$Selected)
+    param([string]$Version, [string]$Path, [string[]]$Selected, [switch]$LCodeOnly)
     $manifest = [ordered]@{
         version     = $Version
-        components  = @('core') + $Selected
+        components  = if ($LCodeOnly) { @('lcode') } else { @('core') + $Selected }
         installedAt = (Get-Date).ToString('o')
     }
     try {
-        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Path '.luc-manifest.json') -Encoding UTF8
+        $manifestFile = if ($LCodeOnly) { '.lcode-manifest.json' } else { '.luc-manifest.json' }
+        $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $Path $manifestFile) -Encoding UTF8
     } catch {
         Write-Note "Could not write the install manifest: $($_.Exception.Message)" 'warn'
     }
@@ -977,7 +983,8 @@ try {
     if ($Source -eq 'local' -and -not $ArchivePath) {
         if (-not $script:Interactive) { throw 'A local install needs -ArchivePath pointing at luc-portable.zip.' }
         Enter-AltScreen
-        $ArchivePath = Show-PathPage -Title 'Portable archive (.zip)' -Default (Join-Path $env:USERPROFILE 'Downloads\luc-portable.zip') -ExistingFile
+        $archiveName = if ($LCodeOnly) { 'lcode-portable.zip' } else { 'luc-portable.zip' }
+        $ArchivePath = Show-PathPage -Title 'Portable archive (.zip)' -Default (Join-Path $env:USERPROFILE "Downloads\$archiveName") -ExistingFile
         Exit-AltScreen
         if (-not $ArchivePath) { Write-Note 'Installation cancelled.' 'warn'; exit 2 }
     }
@@ -1011,11 +1018,12 @@ try {
         $script:Version = $release.tag_name -replace '^v', ''
 
         $assets = @($release.assets)
-        $zipAsset = $assets | Where-Object { $_.name -eq 'luc-portable.zip' } | Select-Object -First 1
-        $hashAsset = $assets | Where-Object { $_.name -eq 'luc-portable.zip.sha256' } | Select-Object -First 1
-        $sigAsset = $assets | Where-Object { $_.name -eq 'luc-portable.zip.sha256.minisig' } | Select-Object -First 1
+        $archiveName = if ($LCodeOnly) { 'lcode-portable.zip' } else { 'luc-portable.zip' }
+        $zipAsset = $assets | Where-Object { $_.name -eq $archiveName } | Select-Object -First 1
+        $hashAsset = $assets | Where-Object { $_.name -eq "$archiveName.sha256" } | Select-Object -First 1
+        $sigAsset = $assets | Where-Object { $_.name -eq "$archiveName.sha256.minisig" } | Select-Object -First 1
         if (-not $zipAsset -or -not $hashAsset) {
-            throw "Release $($release.tag_name) must include luc-portable.zip and luc-portable.zip.sha256."
+            throw "Release $($release.tag_name) must include $archiveName and $archiveName.sha256."
         }
         Assert-ReleaseUrl $zipAsset.browser_download_url $zipAsset.name
         Assert-ReleaseUrl $hashAsset.browser_download_url $hashAsset.name
@@ -1023,7 +1031,7 @@ try {
 
         $downloadTemp = Join-Path ([IO.Path]::GetTempPath()) ('luc-install-' + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Force -Path $downloadTemp | Out-Null
-        $archiveFile = Join-Path $downloadTemp 'luc-portable.zip'
+        $archiveFile = Join-Path $downloadTemp $archiveName
         $checksumFile = "$archiveFile.sha256"
         $signatureFile = "$checksumFile.minisig"
         Invoke-Download $zipAsset.browser_download_url $archiveFile 'portable archive'
@@ -1068,13 +1076,13 @@ try {
         throw 'The downloaded archive version does not match its GitHub release tag.'
     }
     $script:Version = $archiveVersion
-    if (-not $Quiet) { Write-Note "LUC $($script:Version) verified" 'ok' }
+    if (-not $Quiet) { Write-Note "$(if ($LCodeOnly) { 'LCode' } else { 'LUC' }) $($script:Version) verified" 'ok' }
 
     $licenseText = Read-ZipEntryText $zip 'LICENCE'
     if (-not $licenseText) { $licenseText = 'LUC is free software released under the Apache License 2.0.' }
 
-    $selected = @()
-    if ($Components) {
+    $selected = if ($LCodeOnly) { @('lcode') } else { @() }
+    if (-not $LCodeOnly -and $Components) {
         foreach ($item in $Components) {
             foreach ($name in ($item -split '[,\s]+')) {
                 if ([string]::IsNullOrWhiteSpace($name)) { continue }
@@ -1086,7 +1094,7 @@ try {
         }
     }
 
-    if ($script:Interactive -and -not $Components) {
+    if (-not $LCodeOnly -and $script:Interactive -and -not $Components) {
         Enter-AltScreen
         $picked = Show-ComponentPage -Preselected $selected -LicenseText $licenseText
         Exit-AltScreen
@@ -1108,9 +1116,10 @@ try {
     }
 
     $vsCodeTarget = Join-Path $env:USERPROFILE '.vscode\extensions\hsusulist.luc'
-    $upgrade = Test-Path -LiteralPath (Join-Path $InstallPath 'luc.exe') -PathType Leaf
+    $binaryName = if ($LCodeOnly) { 'lcode.exe' } else { 'luc.exe' }
+    $upgrade = Test-Path -LiteralPath (Join-Path $InstallPath $binaryName) -PathType Leaf
     if ($upgrade -and -not $Force -and -not $Yes -and -not $script:Interactive) {
-        throw "LUC is already installed in '$InstallPath'. Pass -Force to replace it."
+        throw "$binaryName is already installed in '$InstallPath'. Pass -Force to replace it."
     }
 
     if ($script:Interactive) {
@@ -1135,9 +1144,9 @@ try {
     }
 
     $script:StagingRoot = Join-Path (Split-Path -Parent $InstallPath) ('.luc-staging-' + [guid]::NewGuid().ToString('N'))
-    $archivePlan = Get-ArchivePlan -Zip $zip -SelectedComponents $selected -Target $InstallPath -VsCodeTarget $vsCodeTarget
-    if (-not ($archivePlan.Items | Where-Object { $_.Relative -eq 'luc.exe' -and $_.Destination -eq (Join-Path $InstallPath 'luc.exe') })) {
-        throw 'Core installation did not produce luc.exe.'
+    $archivePlan = Get-ArchivePlan -Zip $zip -SelectedComponents $selected -Target $InstallPath -VsCodeTarget $vsCodeTarget -LCodeOnly:$LCodeOnly
+    if (-not ($archivePlan.Items | Where-Object { $_.Relative -eq $binaryName -and $_.Destination -eq (Join-Path $InstallPath $binaryName) })) {
+        throw "Installation archive did not produce $binaryName."
     }
 
     $roots = @($InstallPath)
@@ -1159,31 +1168,33 @@ try {
     Install-ArchivePlan $archivePlan.Items
     Write-StepDone 'Files installed'
 
-    if (-not (Test-Path -LiteralPath (Join-Path $InstallPath 'luc.exe') -PathType Leaf)) {
-        throw 'Installation finished without luc.exe. The previous version was restored.'
+    if (-not (Test-Path -LiteralPath (Join-Path $InstallPath $binaryName) -PathType Leaf)) {
+        throw "Installation finished without $binaryName. The previous version was restored."
     }
 
-    Write-InstallManifest $script:Version $InstallPath $selected
-    Write-InstallState $script:Version $InstallPath $selected $Source
+    Write-InstallManifest $script:Version $InstallPath $selected -LCodeOnly:$LCodeOnly
+    Write-InstallState $script:Version $InstallPath $selected $Source -LCodeOnly:$LCodeOnly
 
     # Keep a copy of this script next to luc.exe so that "luc --install" works
     # even when the archive was built before install.ps1 was bundled in it.
-    try {
-        $selfScript = $PSCommandPath
-        if (-not $selfScript) { $selfScript = $MyInvocation.MyCommand.Path }
-        $targetScript = Join-Path $InstallPath 'install.ps1'
-        if ($selfScript -and (Test-Path -LiteralPath $selfScript -PathType Leaf) -and
-            -not [string]::Equals($selfScript, $targetScript, [StringComparison]::OrdinalIgnoreCase)) {
-            Copy-Item -LiteralPath $selfScript -Destination $targetScript -Force
+    if (-not $LCodeOnly) {
+        try {
+            $selfScript = $PSCommandPath
+            if (-not $selfScript) { $selfScript = $MyInvocation.MyCommand.Path }
+            $targetScript = Join-Path $InstallPath 'install.ps1'
+            if ($selfScript -and (Test-Path -LiteralPath $selfScript -PathType Leaf) -and
+                -not [string]::Equals($selfScript, $targetScript, [StringComparison]::OrdinalIgnoreCase)) {
+                Copy-Item -LiteralPath $selfScript -Destination $targetScript -Force
+            }
+        } catch {
+            Write-Note "Could not copy install.ps1 next to luc.exe: $($_.Exception.Message)" 'warn'
         }
-    } catch {
-        Write-Note "Could not copy install.ps1 next to luc.exe: $($_.Exception.Message)" 'warn'
     }
 
     Remove-StaleBackups $InstallPath
     if ($selected -contains 'vscode') { Remove-StaleBackups $vsCodeTarget }
 
-    if (-not $NoEnvironmentChanges) {
+    if (-not $NoEnvironmentChanges -and -not $LCodeOnly) {
         [Environment]::SetEnvironmentVariable('LUC_PATH', (Join-Path $InstallPath 'luc_modules'), 'User')
         if (-not $NoPath) {
             $addPath = $true
@@ -1197,8 +1208,10 @@ try {
     }
 
     Write-Host ''
-    Write-Host "LUC $($script:Version) installed to $InstallPath" -ForegroundColor Green
-    Write-Host 'Open a new terminal, then run: luc --help'
+    $productName = if ($LCodeOnly) { 'LCode' } else { 'LUC' }
+    Write-Host "$productName $($script:Version) installed to $InstallPath" -ForegroundColor Green
+    if ($LCodeOnly) { Write-Host 'Open a new terminal, then run: lcode .' }
+    else { Write-Host 'Open a new terminal, then run: luc --help' }
     exit 0
 } catch {
     if ($script:InAltScreen) { Exit-AltScreen }

@@ -1,14 +1,22 @@
 {
   "name": "@hsusulist/lcode",
-  "version": "0.1.2",
-  "description": "LCode terminal editor for LUC projects",
+  "version": "0.2.0",
+  "description": "Standalone LCode terminal editor",
   "bin": {
     "lcode": "bin/lcode.js"
   },
   "files": [
     "bin",
+    "scripts",
+    "install.ps1",
+    "LICENCE",
     "README.md"
   ],
+  "scripts": {
+    "prepack": "node ../scripts/prepack.js",
+    "postpack": "node ../scripts/postpack.js",
+    "postinstall": "node scripts/postinstall.js"
+  },
   "os": [
     "win32"
   ],
@@ -25,8 +33,5 @@
     "lcode",
     "luc",
     "editor"
-  ],
-  "dependencies": {
-    "@hsusulist/luc": "^0.2.4"
-  }
+  ]
 }

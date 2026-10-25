@@ -4,7 +4,9 @@ $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pat
 $AppDir = Join-Path $ProjectDir 'dist\app'
 $PortableDir = Join-Path $ProjectDir 'dist'
 $ZipPath = Join-Path $PortableDir 'luc-portable.zip'
+$LCodeZipPath = Join-Path $PortableDir 'lcode-portable.zip'
 $StageDir = Join-Path ([IO.Path]::GetTempPath()) ('luc-portable-' + [guid]::NewGuid().ToString('N'))
+$LCodeStageDir = Join-Path ([IO.Path]::GetTempPath()) ('lcode-portable-' + [guid]::NewGuid().ToString('N'))
 $header = Get-Content -LiteralPath (Join-Path $ProjectDir 'src\luc.h') -Raw
 if ($header -notmatch '#define\s+LUC_VERSION\s+"LUC\s+([^"]+)"') {
     throw 'Could not read LUC_VERSION from src\luc.h.'
@@ -49,6 +51,7 @@ function Copy-RequiredFile {
 try {
     New-Item -ItemType Directory -Force -Path $PortableDir | Out-Null
     New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $LCodeStageDir | Out-Null
     foreach ($exe in @('luc-core.exe', 'luc-win.exe')) {
         $exePath = Join-Path $AppDir $exe
         if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
@@ -62,10 +65,13 @@ try {
     Set-Content -LiteralPath (Join-Path $StageDir 'VERSION.txt') -Value $Version -Encoding ASCII
     Copy-RequiredFile (Join-Path $ProjectDir 'README.md') (Join-Path $StageDir 'README.md')
     Copy-RequiredFile (Join-Path $ProjectDir 'LICENCE') (Join-Path $StageDir 'LICENCE')
+    Copy-RequiredFile (Join-Path $ProjectDir 'LICENCE') (Join-Path $LCodeStageDir 'LICENCE')
     Copy-RequiredFile (Join-Path $ProjectDir 'install.ps1') (Join-Path $StageDir 'core\install.ps1')
     Copy-RequiredFile (Join-Path $ProjectDir 'installer\minisign.pub') (Join-Path $StageDir 'core\minisign.pub')
     Copy-RequiredFile (Join-Path $AppDir 'luc-core.exe') (Join-Path $StageDir 'core\luc.exe')
     Copy-RequiredFile (Join-Path $AppDir 'luc-win.exe') (Join-Path $StageDir 'window\luc.exe')
+    Copy-RequiredFile (Join-Path $AppDir 'luc-core.exe') (Join-Path $StageDir 'lcode\lcode.exe')
+    Copy-RequiredFile (Join-Path $AppDir 'luc-core.exe') (Join-Path $LCodeStageDir 'lcode\lcode.exe')
 
     foreach ($name in $windowFiles) {
         Copy-RequiredFile (Join-Path $AppDir $name) (Join-Path $StageDir "window\$name")
@@ -74,6 +80,7 @@ try {
 
     Copy-DirectoryContents (Join-Path $ProjectDir 'demos') (Join-Path $StageDir 'common\demos')
     Copy-DirectoryContents (Join-Path $ProjectDir 'plugin') (Join-Path $StageDir 'lcode\plugin')
+    Copy-DirectoryContents (Join-Path $ProjectDir 'plugin') (Join-Path $LCodeStageDir 'lcode\plugin')
     Copy-DirectoryContents (Join-Path $ProjectDir 'vscode') (Join-Path $StageDir 'vscode')
     Copy-RequiredFile (Join-Path $ProjectDir 'packages\ai.lucpkg') (Join-Path $StageDir 'ai\packages\ai.lucpkg')
     Copy-RequiredFile (Join-Path $ProjectDir 'packages\discord.lucpkg') (Join-Path $StageDir 'discord\packages\discord.lucpkg')
@@ -88,13 +95,16 @@ try {
     $font = Join-Path $ProjectDir 'fonts\FiraCodeNerdFontMono-Regular.ttf'
     if (Test-Path -LiteralPath $font -PathType Leaf) {
         Copy-RequiredFile $font (Join-Path $StageDir 'lcode\fonts\FiraCodeNerdFontMono-Regular.ttf')
+        Copy-RequiredFile $font (Join-Path $LCodeStageDir 'lcode\fonts\FiraCodeNerdFontMono-Regular.ttf')
     }
+    Set-Content -LiteralPath (Join-Path $LCodeStageDir 'VERSION.txt') -Value $Version -Encoding ASCII
 
     $sourceDir = Join-Path $StageDir 'source\src'
     New-Item -ItemType Directory -Force -Path $sourceDir | Out-Null
     Get-ChildItem -LiteralPath (Join-Path $ProjectDir 'src') -File |
         Where-Object { $_.Extension -eq '.c' -or $_.Extension -eq '.h' } |
         Copy-Item -Destination $sourceDir -Force
+    Copy-DirectoryContents (Join-Path $ProjectDir 'src\lcode') (Join-Path $sourceDir 'lcode')
 
     if (Test-Path -LiteralPath $ZipPath) {
         Remove-Item -LiteralPath $ZipPath -Force
@@ -102,6 +112,12 @@ try {
     Compress-Archive -Path (Join-Path $StageDir '*') -DestinationPath $ZipPath -CompressionLevel Optimal
     $hash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath "$ZipPath.sha256" -Value $hash -Encoding ASCII
+    if (Test-Path -LiteralPath $LCodeZipPath) {
+        Remove-Item -LiteralPath $LCodeZipPath -Force
+    }
+    Compress-Archive -Path (Join-Path $LCodeStageDir '*') -DestinationPath $LCodeZipPath -CompressionLevel Optimal
+    $lcodeHash = (Get-FileHash -LiteralPath $LCodeZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath "$LCodeZipPath.sha256" -Value $lcodeHash -Encoding ASCII
 
     $installerText = Get-Content -LiteralPath (Join-Path $ProjectDir 'install.ps1') -Raw
     if ($installerText -notmatch "(?m)\`$minisignPublicKey\s*=\s*'([^']+)'") {
@@ -119,18 +135,25 @@ try {
     if (-not $signingKey) { $signingKey = Join-Path $env:USERPROFILE '.luc\keys\luc-release.key' }
     $node = Get-Command node -ErrorAction SilentlyContinue
     if ((Test-Path -LiteralPath $signingKey -PathType Leaf) -and $node) {
-        & $node.Source (Join-Path $ProjectDir 'tools\lucsig.js') sign "$ZipPath.sha256" --key $signingKey
-        if ($LASTEXITCODE -ne 0) { throw 'Signing the release checksum failed.' }
+        foreach ($archive in @($ZipPath, $LCodeZipPath)) {
+            & $node.Source (Join-Path $ProjectDir 'tools\lucsig.js') sign "$archive.sha256" --key $signingKey
+            if ($LASTEXITCODE -ne 0) { throw "Signing the release checksum failed for $archive." }
+        }
     } elseif (Test-Path -LiteralPath $signingKey -PathType Leaf) {
-        Write-Warning 'node was not found; the checksum was not signed.'
+        Write-Warning 'node was not found; the release checksums were not signed.'
     } else {
-        Write-Warning "Signing key not found at $signingKey; the checksum was not signed."
+        Write-Warning "Signing key not found at $signingKey; the release checksums were not signed."
     }
 
     Write-Host "Portable release created: $ZipPath"
     Write-Host "SHA-256: $hash"
+    Write-Host "Standalone LCode release created: $LCodeZipPath"
+    Write-Host "SHA-256: $lcodeHash"
 } finally {
     if (Test-Path -LiteralPath $StageDir -PathType Container) {
         Remove-Item -LiteralPath $StageDir -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $LCodeStageDir -PathType Container) {
+        Remove-Item -LiteralPath $LCodeStageDir -Recurse -Force
     }
 }
