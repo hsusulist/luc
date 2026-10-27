@@ -50,7 +50,7 @@ create function rest(method, path, body)
     if method == "GET" then
         r, code = dn.get(url, auth())
     else
-        r, code = dn.post(url, payload, "application/json", auth())
+        r, code = dn.request(method, url, payload, "application/json", auth())
     end
     if code == 429 and r != nil then
         create t = json.decode(r)
@@ -60,7 +60,7 @@ create function rest(method, path, body)
         if method == "GET" then
             r, code = dn.get(url, auth())
         else
-            r, code = dn.post(url, payload, "application/json", auth())
+            r, code = dn.request(method, url, payload, "application/json", auth())
         end
     end
     return r, code

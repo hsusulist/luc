@@ -104,7 +104,7 @@ try {
     Get-ChildItem -LiteralPath (Join-Path $ProjectDir 'src') -File |
         Where-Object { $_.Extension -eq '.c' -or $_.Extension -eq '.h' } |
         Copy-Item -Destination $sourceDir -Force
-    Copy-DirectoryContents (Join-Path $ProjectDir 'src\lcode') (Join-Path $sourceDir 'lcode')
+    Copy-DirectoryContents (Join-Path $ProjectDir 'src\lcode-window') (Join-Path $sourceDir 'lcode')
 
     if (Test-Path -LiteralPath $ZipPath) {
         Remove-Item -LiteralPath $ZipPath -Force
