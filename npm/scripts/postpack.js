@@ -9,3 +9,17 @@ for (const name of ['install.ps1', 'LICENCE']) {
   } catch (_) {
   }
 }
+
+const source = path.join(process.cwd(), 'src');
+const marker = path.join(process.cwd(), '.npm-source-bundle-generated');
+if (fs.existsSync(marker)) {
+  fs.rmSync(source, { recursive: true, force: true });
+  fs.unlinkSync(marker);
+}
+
+const helper = path.join(process.cwd(), 'scripts', 'build-linux.js');
+const helperMarker = path.join(process.cwd(), '.npm-build-linux-generated');
+if (fs.existsSync(helperMarker)) {
+  fs.unlinkSync(helper);
+  fs.unlinkSync(helperMarker);
+}

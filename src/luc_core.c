@@ -515,7 +515,8 @@ static Str *dict_tostr(Table *t,int depth){
     int first=1;
     PUTD("{",1);
     for(int i=0;i<t->alen;i++){
-        if(!first) PUTD(", ",2); first=0;
+        if(!first) PUTD(", ",2);
+        first=0;
         Str *ks=v2str(mknum((double)(i+1)),depth+1); PUTD(ks->s,ks->len);
         PUTD(": ",2);
         Value e=t->arr[i];
@@ -524,7 +525,8 @@ static Str *dict_tostr(Table *t,int depth){
     }
     for(int i=0;i<t->ecap;i++){
         if(t->ents[i].k.t==LT_NIL || t->ents[i].v.t==LT_NIL) continue;
-        if(!first) PUTD(", ",2); first=0;
+        if(!first) PUTD(", ",2);
+        first=0;
         Value k=t->ents[i].k;
         if(k.t==LT_STR){ PUTD("\"",1); PUTD(AS_STR(k)->s,AS_STR(k)->len); PUTD("\"",1); }
         else { Str *ks=v2str(k,depth+1); PUTD(ks->s,ks->len); }
@@ -701,7 +703,6 @@ static int lx_scan(Lexer *lx,double *num,Str **str){
         if(lx->p<lx->end&&*lx->p=='.'){ lx->p++;
             while(lx->p<lx->end&&isdigit((unsigned char)*lx->p)) lx->p++; }
         if(lx->p<lx->end&&(*lx->p=='e'||*lx->p=='E')){
-            const char *es=lx->p;
             lx->p++;
             if(lx->p<lx->end&&(*lx->p=='+'||*lx->p=='-')) lx->p++;
             int hasdig=0;
@@ -2802,6 +2803,15 @@ static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Val
     vm_setindex(tv,kv,nv);
 }
 
+static int vm_slice_index(double value,int len){
+    int index;
+    if(!isfinite(value)) luc_error("slice indices must be finite");
+    if(value>=(double)len) return len;
+    if(value<=-(double)len) return 0;
+    index=(int)floor(value);
+    return index<0?index+len:index;
+}
+
 static void vm_execute(LucState *L,int baselevel){
     CallInfo *ci; Closure *cl; Proto *pr; uint32_t *pc; Value *base; Value *K;
     V.cur=L;
@@ -3212,13 +3222,11 @@ static void vm_execute(LucState *L,int baselevel){
             else { luc_error("cannot slice a %s value",type_name(tv)); len=0; }
             int st,en;
             if(sv.t==LT_NIL) st=0;
-            else if(sv.t==LT_NUM){ st=(int)floor(sv.u.n); if(st<0) st+=len; }
+            else if(sv.t==LT_NUM) st=vm_slice_index(sv.u.n,len);
             else { luc_error("slice indices must be numbers"); st=0; }
             if(ev.t==LT_NIL) en=len;
-            else if(ev.t==LT_NUM){ en=(int)floor(ev.u.n); if(en<0) en+=len; }
+            else if(ev.t==LT_NUM) en=vm_slice_index(ev.u.n,len);
             else { luc_error("slice indices must be numbers"); en=len; }
-            if(st<0) st=0; if(st>len) st=len;
-            if(en<0) en=0; if(en>len) en=len;
             if(en<st) en=st;
             if(tv.t==LT_LIST){
                 if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); }
@@ -4104,7 +4112,11 @@ static int pkg_install_window(int force){
       char exedir[1200];
       if(!pkg_exe_dir(exedir,sizeof exedir)) snprintf(exedir,sizeof exedir,".");
       for(int k=0;extra[k];k++){
-        snprintf(dest,sizeof dest,"%s/%s",exedir,extra[k]);
+        int dn=snprintf(dest,sizeof dest,"%s/%s",exedir,extra[k]);
+        if(dn<0||(size_t)dn>=sizeof dest){
+            printf("luc install: warning: install path is too long for %s\n",extra[k]);
+            continue;
+        }
         if(!force && pkg_file_exists(dest)) continue;
         snprintf(src,sizeof src,"%s/%s",pd,extra[k]);
         if(offline && pkg_file_exists(src)){
@@ -4881,7 +4893,7 @@ static const HelpTopic HELP_TOPICS[] = {
  "import ai: lanternl mini-PyTorch. ai.Train for numbers, ai.LMTrain for text.\n"
  "Needs: luc install ai. See demos/ai_libaries/."},
 {"net",
- "import net(\"n\"): TCP + HTTP. n.get(url), n.serve(port).\n"
+ "import net(\"n\"): TCP + HTTP. n.get(url), n.post(url, body), n.request(method, url, body), n.serve(port).\n"
  "See demos/net_libaries/."},
 {"window",
  "import window(\"w\"): SDL2 graphics and sound.\n"
@@ -4915,7 +4927,11 @@ static void repl_help_loop(void){
     }
 }
 
-#include "lcode/lcode.c"
+#if defined(_WIN32)
+#  include "lcode-window/lcode.c"
+#else
+#  include "lcode-linux/lcode.c"
+#endif
 
 static void lcode_cmd(const char *line);
 
@@ -4985,18 +5001,20 @@ static int luc_exe_directory(char *out,size_t cap){
 
 static int luc_installer_script(char *out,size_t cap){
     char dir[1024];
+    int n;
+    if(!out||cap==0) return 0;
     if(luc_exe_directory(dir,sizeof dir)){
-        snprintf(out,cap,"%s\\install.ps1",dir);
-        if(luc_file_is_file(out)) return 1;
-        snprintf(out,cap,"%s\\core\\install.ps1",dir);
-        if(luc_file_is_file(out)) return 1;
+        n=snprintf(out,cap,"%s\\install.ps1",dir);
+        if(n>=0&&(size_t)n<cap&&luc_file_is_file(out)) return 1;
+        n=snprintf(out,cap,"%s\\core\\install.ps1",dir);
+        if(n>=0&&(size_t)n<cap&&luc_file_is_file(out)) return 1;
     }
     const char *local=getenv("LOCALAPPDATA");
     if(local){
-        snprintf(out,cap,"%s\\Programs\\LUC\\install.ps1",local);
-        if(luc_file_is_file(out)) return 1;
-        snprintf(out,cap,"%s\\LUC\\install.ps1",local);
-        if(luc_file_is_file(out)) return 1;
+        n=snprintf(out,cap,"%s\\Programs\\LUC\\install.ps1",local);
+        if(n>=0&&(size_t)n<cap&&luc_file_is_file(out)) return 1;
+        n=snprintf(out,cap,"%s\\LUC\\install.ps1",local);
+        if(n>=0&&(size_t)n<cap&&luc_file_is_file(out)) return 1;
     }
     out[0]=0;
     return 0;

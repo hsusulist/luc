@@ -5163,6 +5163,36 @@ LFN(f_net_post){
     Value v=strv(rbody,rlen); free(rbody);
     RET(0,v); RET(1,mknum((double)code)); return 2;
 }
+LFN(f_net_request){
+    Str *m=checkstr(L,base,nargs,0,"request");
+    Str *u=checkstr(L,base,nargs,1,"request");
+    Str *b=(nargs>=3&&AR(2).t!=LT_NIL)?checkstr(L,base,nargs,2,"request"):NULL;
+    Str *ct=(nargs>=4&&AR(3).t!=LT_NIL)?checkstr(L,base,nargs,3,"request"):NULL;
+    Str *hd=(nargs>=5&&AR(4).t!=LT_NIL)?checkstr(L,base,nargs,4,"request"):NULL;
+    if(m->len<=0) luc_error("request: method must not be empty");
+    for(int i=0;i<m->len;i++)
+        if(m->s[i]<'A'||m->s[i]>'Z')
+            luc_error("request: method must contain uppercase letters only");
+    char *method=(char*)malloc((size_t)m->len+1);
+    char *url=(char*)malloc((size_t)u->len+1);
+    if(!method||!url){ free(method); free(url); luc_error("net: out of memory"); }
+    memcpy(method,m->s,(size_t)m->len); method[m->len]=0;
+    memcpy(url,u->s,(size_t)u->len); url[u->len]=0;
+    char *hdrs=NULL;
+    if(hd){
+        hdrs=(char*)malloc((size_t)hd->len+1);
+        if(!hdrs){ free(method); free(url); luc_error("net: out of memory"); }
+        memcpy(hdrs,hd->s,(size_t)hd->len); hdrs[hd->len]=0;
+    }
+    char err[192]; err[0]=0;
+    char *rbody=NULL; size_t rlen=0; int code=0;
+    int ok=net_http(url,method,b?b->s:NULL,b?(int)b->len:0,ct?ct->s:NULL,hdrs,
+                    &rbody,&rlen,&code,err,sizeof err);
+    free(method); free(url); free(hdrs);
+    if(!ok){ RET(0,NIL); RET(1,cstrv(err)); return 2; }
+    Value v=strv(rbody,rlen); free(rbody);
+    RET(0,v); RET(1,mknum((double)code)); return 2;
+}
 /* LUC retry wraps raw tries (yields via task.wait). */
 static const char *net_methods_src =
 "return function(raw_recv, raw_accept)\n"
@@ -5218,6 +5248,7 @@ Value lucL_net_module(LucState *L){
     tab_set(t,cstrv("serve"),mkobj(LT_CFUNC,cfunc_new(f_net_serve,"serve",0)));
     tab_set(t,cstrv("get"),mkobj(LT_CFUNC,cfunc_new(f_net_get,"get",0)));
     tab_set(t,cstrv("post"),mkobj(LT_CFUNC,cfunc_new(f_net_post,"post",0)));
+    tab_set(t,cstrv("request"),mkobj(LT_CFUNC,cfunc_new(f_net_request,"request",0)));
     tab_set(t,cstrv("ws_connect"),mkobj(LT_CFUNC,cfunc_new(f_net_ws_connect,"ws_connect",0)));
     tab_set(t,cstrv("raw_recv"),mkobj(LT_CFUNC,cfunc_new(f_sock_recv_try,"raw_recv",0)));
     tab_set(t,cstrv("raw_accept"),mkobj(LT_CFUNC,cfunc_new(f_sock_accept_try,"raw_accept",0)));

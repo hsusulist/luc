@@ -5,6 +5,12 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+if (process.platform === 'linux') {
+  const { buildLinux } = require('./build-linux');
+  buildLinux(path.join(__dirname, '..'), 'luc');
+  process.exit(0);
+}
+
 function findBinary() {
   const candidates = [];
   const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');

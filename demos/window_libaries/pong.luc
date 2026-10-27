@@ -39,6 +39,10 @@ create function clamp(v, lo, hi)
     return v
 end
 
+create function pixel(v)
+    return math.floor(v + 0.5)
+end
+
 create function serve(dir)
     bx, by = WW/2, WH/2
     speed = SPEED0
@@ -158,15 +162,15 @@ end
 
 create function center_text(s, cy, col, size)
     create tw, th = window.text_size(s, size)
-    window.text(s, (WW - tw)/2, cy, col, size)
+    window.text(s, pixel((WW - tw)/2), pixel(cy), col, size)
 end
 
 create function draw()
     window.clear(BG)
     draw_net()
-    window.rect(px, py, PW, PH, P_COL)
-    window.rect(ax, ay, PW, PH, A_COL)
-    window.circle(bx, by, BALL_R, BALL_C)
+    window.rect(pixel(px), pixel(py), PW, PH, P_COL)
+    window.rect(pixel(ax), pixel(ay), PW, PH, A_COL)
+    window.circle(pixel(bx), pixel(by), BALL_R, BALL_C)
     window.text(tostring(pscore), WW/2 - 112, 24, TXT_C, 60)
     window.text(tostring(ascore), WW/2 + 70, 24, TXT_C, 60)
     if state == "serve" then

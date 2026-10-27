@@ -1,6 +1,6 @@
 {
   "name": "@hsusulist/lcode",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Standalone LCode terminal editor",
   "bin": {
     "lcode": "bin/lcode.js"
@@ -8,6 +8,7 @@
   "files": [
     "bin",
     "scripts",
+    "src",
     "install.ps1",
     "LICENCE",
     "README.md"
@@ -17,9 +18,7 @@
     "postpack": "node ../scripts/postpack.js",
     "postinstall": "node scripts/postinstall.js"
   },
-  "os": [
-    "win32"
-  ],
+  "os": ["win32", "linux"],
   "engines": {
     "node": ">=16"
   },

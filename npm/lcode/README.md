@@ -1,16 +1,20 @@
 # @hsusulist/lcode
 
-Install LCode by itself on Windows:
+Install LCode by itself on Windows or Linux:
 
 ```powershell
 npm install -g @hsusulist/lcode
-lcode .
+lcode path/to/file.luc
 ```
 
+On Linux, the package compiles the included terminal editor during installation.
+Install GCC or Clang first (or set `CC` to your compiler). `lcode --install`
+rebuilds it.
+
 The package downloads and verifies the dedicated `lcode-portable.zip` release
-asset and installs it to `%LOCALAPPDATA%\Programs\LCode`. It does not install
-the `luc` command. Each GitHub release needs this ZIP, its `.sha256` checksum,
-and `.sha256.minisig` signature attached.
+asset and installs it to `%LOCALAPPDATA%\Programs\LCode` on Windows. It does
+not install the `luc` command. Each Windows GitHub release needs this ZIP, its
+`.sha256` checksum, and `.sha256.minisig` signature attached.
 To install or update the editor later, run:
 
 ```powershell

@@ -6,13 +6,37 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+const args = process.argv.slice(2);
+
+if (process.platform === 'linux') {
+  const packageDir = path.join(__dirname, '..');
+  const { buildLinux } = require('../scripts/build-linux');
+  if (args[0] === '--install') {
+    buildLinux(packageDir, 'lcode');
+    process.exit(0);
+  }
+  const binary = path.join(packageDir, 'native', 'lcode');
+  if (!fs.existsSync(binary)) {
+    console.error('lcode: Linux editor is missing; run "lcode --install" to build it.');
+    process.exit(1);
+  }
+  const result = spawnSync(binary, ['--lcode'].concat(args), {
+    stdio: 'inherit',
+    cwd: process.cwd()
+  });
+  if (result.error) {
+    console.error('lcode: ' + result.error.message);
+    process.exit(1);
+  }
+  process.exit(result.status === null ? 1 : result.status);
+}
+
 if (process.platform !== 'win32') {
-  console.error('lcode: this package currently supports Windows only.');
+  console.error('lcode: this package supports Windows and Linux only.');
   process.exit(1);
 }
 
 const installScript = path.join(__dirname, '..', 'install.ps1');
-const args = process.argv.slice(2);
 
 function findBinary() {
   const candidates = [];

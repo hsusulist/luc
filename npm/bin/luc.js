@@ -6,6 +6,28 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+const args = process.argv.slice(2);
+
+if (process.platform === 'linux') {
+  const packageDir = path.join(__dirname, '..');
+  const { buildLinux } = require('../scripts/build-linux');
+  if (args[0] === '--install') {
+    buildLinux(packageDir, 'luc');
+    process.exit(0);
+  }
+  const binary = path.join(packageDir, 'native', 'luc');
+  if (!fs.existsSync(binary)) {
+    console.error('luc: Linux runtime is missing; run "luc --install" to build it.');
+    process.exit(1);
+  }
+  const result = spawnSync(binary, args, { stdio: 'inherit' });
+  if (result.error) {
+    console.error('luc: ' + result.error.message);
+    process.exit(1);
+  }
+  process.exit(result.status === null ? 1 : result.status);
+}
+
 function stateBinary() {
   const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
   try {
@@ -95,11 +117,10 @@ function mapInstallerArgs(args) {
 }
 
 if (process.platform !== 'win32') {
-  console.error('luc: this package currently supports Windows only.');
+  console.error('luc: this package supports Windows and Linux only.');
   process.exit(1);
 }
 
-const args = process.argv.slice(2);
 let binary = findBinary();
 
 if (!binary) {

@@ -3,8 +3,14 @@
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+if (process.platform === 'linux') {
+  const { buildLinux } = require('./build-linux');
+  buildLinux(path.join(__dirname, '..'), 'lcode');
+  process.exit(0);
+}
+
 if (process.platform !== 'win32') {
-  console.error('lcode: this package currently supports Windows only.');
+  console.error('lcode: this package supports Windows and Linux only.');
   process.exit(1);
 }
 

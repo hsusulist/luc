@@ -67,3 +67,15 @@ luc --version
 The npm package is a small launcher. It installs the runtime into
 `%LOCALAPPDATA%\Programs\LUC` and does not modify PATH.
 
+## Install (Linux)
+
+Install GCC or Clang, then install the npm package:
+
+```sh
+npm install -g @hsusulist/luc
+luc --version
+```
+
+The package compiles the Linux runtime and terminal LCode editor during
+installation. `npm install -g @hsusulist/lcode` installs the editor-only
+launcher; the Linux backend currently provides basic terminal editing.
