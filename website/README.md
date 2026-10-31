@@ -22,7 +22,7 @@ preview sandbox).
 | Route | What it is |
 | --- | --- |
 | `#/` | Home: language pitch, a live-looking example, built-ins, registry preview |
-| `#/about` | Why LUC exists, the design principles, a syntax tour, comparison |
+| `#/about` | The landing page, also reachable from the About nav link (same content as `#/`) |
 | `#/download` | Windows installer, portable zip, npm, PowerShell script, command builder, checksums, Linux build, editor setup |
 | `#/guide` | 15-chapter beginner guide with a sticky table of contents and scroll progress |
 | `#/community` | Repo, discussions, issues, demo gallery, contributing flow, roadmap |
@@ -80,7 +80,8 @@ website/
 └── public/
     ├── index.html         # shell, header, boot screen, footer
     ├── css/styles.css     # design system, components, responsive rules, light/dark themes
-    ├── css/home-refresh.css # landing-page-only layout and cream/dark palette
+    ├── css/home-refresh.css # landing layout, shared chrome and cream/dark palette
+    ├── css/pages-refresh.css # landing-style layer for download, guide, community, packages, publish
     ├── js/app.js          # hash router + page lifecycle
     ├── js/lib/            # icons, syntax highlighting, Markdown, shared UI (copy, toast, reveal)
     ├── js/pages/          # one module per page (home-refresh.js is the landing page)
@@ -93,10 +94,13 @@ Font License 1.1 — see `public/assets/fonts/OFL.txt`), so the site makes no
 third-party requests.
 
 The landing page is a self-contained refresh. `home-refresh.css` is scoped to
-`body.home-refresh-active` (toggled by the router only on `/`), so the other
-routes keep the original component system. The refreshed page supports both the
-cream default and the dark theme, and shares the same header, footer, copy
-handlers and package cards as the rest of the site.
+`body.site-refresh`, which the router adds on every route, so the header, footer
+and palette stay consistent across the site. `pages-refresh.css` applies the
+same editorial system to the inner pages: cream paper, square edges, mono
+micro-labels, orange display accents and dark code/CTA bands. Both stylesheets
+support the cream default and the dark theme. The landing content is rendered by
+both `#/` and `#/about`; the other routes share the same copy handlers and
+package cards as the landing page.
 
 ## Publishing a package
 

@@ -1,6 +1,5 @@
 import { setupChrome, setActiveNav, observeReveal, icon } from './lib/ui.js';
 import { renderHome } from './pages/home-refresh.js';
-import { renderAbout } from './pages/about.js';
 import { renderDownload } from './pages/download.js';
 import { renderGuide } from './pages/guide.js';
 import { renderCommunity } from './pages/community.js';
@@ -15,7 +14,14 @@ const routes = [
   {
     path: '/about',
     nav: 'about',
-    render: () => renderAbout()
+    render: () => {
+      const page = renderHome();
+      return {
+        ...page,
+        title: 'About LUC — a small language with big batteries',
+        description: 'The design, the syntax and the trade-offs behind LUC: a C99 scripting language that stays readable from the first line to the last.'
+      };
+    }
   },
   {
     path: '/download',
@@ -101,8 +107,9 @@ function resolve(path, params) {
 async function renderRoute() {
   const token = ++renderToken;
   const { path, params, anchor } = parseLocation();
+  document.body.dataset.page = pageKeyFromPath(path);
+  document.body.classList.toggle('is-inner', path !== '/' && path !== '/about');
   const route = resolve(path, params);
-  document.body.classList.toggle('home-refresh-active', path === '/');
   const app = document.getElementById('app');
   if (!app) return;
 
@@ -162,6 +169,8 @@ async function renderRoute() {
 }
 
 setupChrome();
+document.body.classList.add('site-refresh');
+const pageKeyFromPath = (path) => (path === '/' ? 'home' : (path.split('/')[1] || 'home'));
 window.addEventListener('hashchange', renderRoute);
 renderRoute();
 
