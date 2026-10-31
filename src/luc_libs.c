@@ -4214,6 +4214,8 @@ Value lucL_window_module(void){
 #  include <fcntl.h>
 #  include <errno.h>
 #  include <string.h>
+#  include <sys/select.h>
+#  include <sys/time.h>
    typedef int sock_t;
 #  define SOCK_INVALID (-1)
 #  define sock_closefd close
@@ -4477,6 +4479,22 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
         }
     }
 }
+#else
+typedef struct { int unused; } TLSSession;
+static void tls_free_session(TLSSession *s){ (void)s; }
+static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
+                          char *err,size_t errcap){
+    (void)fd; (void)hostname; (void)out;
+    snprintf(err,errcap,"tls: https needs a Windows build in this version");
+    return -1;
+}
+static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
+    (void)s; (void)fd; (void)p; (void)n; return -1;
+}
+static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
+    (void)s; (void)fd; (void)out; (void)max; return -1;
+}
+#endif
 static Socket *sock_wrap(sock_t fd,int isserver){
     return sock_new((intptr_t)fd,isserver);
 }
@@ -4494,22 +4512,6 @@ void net_socket_close_fd(Socket *s){
     free(s->rbuf); s->rbuf=NULL; s->rlen=s->rcap=0;
     free(s->frag); s->frag=NULL; s->fraglen=s->fragcap=0;
 }
-#else
-typedef struct { int unused; } TLSSession;
-static void tls_free_session(TLSSession *s){ (void)s; }
-static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
-                          char *err,size_t errcap){
-    (void)fd; (void)hostname; (void)out;
-    snprintf(err,errcap,"tls: https needs a Windows build in this version");
-    return -1;
-}
-static int tls_send(TLSSession *s,sock_t fd,const char *p,size_t n){
-    (void)s; (void)fd; (void)p; (void)n; return -1;
-}
-static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
-    (void)s; (void)fd; (void)out; (void)max; return -1;
-}
-#endif
 /* scheduler-pumped connect with timeout. */
 static sock_t net_connect_to(const char *host,int port,double timeout,char *err,size_t errcap){
     char ports[16]; snprintf(ports,sizeof ports,"%d",port);

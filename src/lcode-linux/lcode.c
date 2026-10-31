@@ -116,7 +116,7 @@ static void lc_linux_draw(const LcLinuxEditor *e, size_t top, int rows, int cols
     size_t line = 0, i = 0, cursor_line, cursor_col = 0, scan = 0;
     int row = 0;
     cursor_line = lc_linux_line_number(e, e->cursor);
-    while (scan < e.cursor && e->data[scan] != '\n') { cursor_col++; scan++; }
+    while (scan < e->cursor && e->data[scan] != '\n') { cursor_col++; scan++; }
 
     printf("\x1b[H\x1b[2J");
     while (row < rows - 1 && i < e->len + 1) {

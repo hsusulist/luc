@@ -1,3 +1,0 @@
--- for i = bắt đầu, kết thúc do
--- ..
--- end
