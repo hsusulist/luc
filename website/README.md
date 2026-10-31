@@ -80,9 +80,10 @@ website/
 └── public/
     ├── index.html         # shell, header, boot screen, footer
     ├── css/styles.css     # design system, components, responsive rules, light/dark themes
+    ├── css/home-refresh.css # landing-page-only layout and cream/dark palette
     ├── js/app.js          # hash router + page lifecycle
     ├── js/lib/            # icons, syntax highlighting, Markdown, shared UI (copy, toast, reveal)
-    ├── js/pages/          # one module per page
+    ├── js/pages/          # one module per page (home-refresh.js is the landing page)
     └── assets/            # logo, social card, self-hosted woff2 fonts
 ```
 
@@ -90,6 +91,12 @@ The front end is vanilla ES modules — no framework, no bundler, no runtime
 dependencies. Fonts are self-hosted (`Sora`, `Inter`, `JetBrains Mono`, SIL Open
 Font License 1.1 — see `public/assets/fonts/OFL.txt`), so the site makes no
 third-party requests.
+
+The landing page is a self-contained refresh. `home-refresh.css` is scoped to
+`body.home-refresh-active` (toggled by the router only on `/`), so the other
+routes keep the original component system. The refreshed page supports both the
+cream default and the dark theme, and shares the same header, footer, copy
+handlers and package cards as the rest of the site.
 
 ## Publishing a package
 

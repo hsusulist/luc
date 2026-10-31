@@ -1,5 +1,5 @@
 import { setupChrome, setActiveNav, observeReveal, icon } from './lib/ui.js';
-import { renderHome } from './pages/home.js';
+import { renderHome } from './pages/home-refresh.js';
 import { renderAbout } from './pages/about.js';
 import { renderDownload } from './pages/download.js';
 import { renderGuide } from './pages/guide.js';
@@ -102,6 +102,7 @@ async function renderRoute() {
   const token = ++renderToken;
   const { path, params, anchor } = parseLocation();
   const route = resolve(path, params);
+  document.body.classList.toggle('home-refresh-active', path === '/');
   const app = document.getElementById('app');
   if (!app) return;
 

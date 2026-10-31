@@ -307,12 +307,12 @@ export function setupChrome() {
       themeButton.setAttribute('title', theme === 'light' ? 'Dark mode' : 'Light mode');
     }
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', theme === 'light' ? '#faf7f2' : '#08070b');
+    if (meta) meta.setAttribute('content', theme === 'light' ? '#f2efdf' : '#08070b');
   };
 
-  let stored = 'dark';
-  try { stored = localStorage.getItem('luc-theme') || 'dark'; } catch { /* ignore */ }
-  applyTheme(stored === 'light' ? 'light' : 'dark');
+  let stored = 'light';
+  try { stored = localStorage.getItem('luc-theme') || 'light'; } catch { /* ignore */ }
+  applyTheme(stored === 'dark' ? 'dark' : 'light');
 
   themeButton?.addEventListener('click', () => {
     applyTheme(document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light');
