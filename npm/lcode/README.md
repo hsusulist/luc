@@ -21,5 +21,5 @@ To install or update the editor later, run:
 lcode --install
 ```
 
-To install the interpreter too, install `@hsusulist/luc`. Run `luc --install`
+To install the interpreter too, install `@hsusulist/luc`. Run `luc install`
 to choose **LCode support** in its component chooser, or use both npm packages.

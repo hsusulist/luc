@@ -41,7 +41,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/hsusulist/luc/main/install.p
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-`luc --install` opens the same installer once LUC is installed. The interactive
+`luc install` opens the same installer once LUC is installed. The interactive
 UI shows the Apache 2.0 license, a component selector, the install folder and a
 **Continue** button (English). Running `luc` with no arguments also opens it on
 the first run, then starts the REPL afterwards.
@@ -49,8 +49,8 @@ the first run, then starts the REPL afterwards.
 Unattended installs skip every prompt:
 
 ```powershell
-luc --install -y --no-path
-luc --install -c window,ai -d "D:\Tools\LUC" -y
+luc install -y --no-path
+luc install -c window,ai -d "D:\Tools\LUC" -y
 ```
 
 Components: `window`, `ai`, `discord`, `lcode`, `vscode`, `source` (the core

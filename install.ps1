@@ -1175,7 +1175,7 @@ try {
     Write-InstallManifest $script:Version $InstallPath $selected -LCodeOnly:$LCodeOnly
     Write-InstallState $script:Version $InstallPath $selected $Source -LCodeOnly:$LCodeOnly
 
-    # Keep a copy of this script next to luc.exe so that "luc --install" works
+    # Keep a copy of this script next to luc.exe so that "luc install" works
     # even when the archive was built before install.ps1 was bundled in it.
     if (-not $LCodeOnly) {
         try {

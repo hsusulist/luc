@@ -9,22 +9,22 @@ luc --version
 
 On Linux, the package compiles the runtime during installation. Install a C
 compiler such as GCC or Clang first; set `CC` if your compiler is not named
-`cc`. `luc --install` rebuilds the native runtime.
+`cc`. Run `luc install` to rebuild the native runtime.
 
 On Windows, the package installs the runtime into
 `%LOCALAPPDATA%\Programs\LUC` (no PATH changes, no admin rights). If the
 automatic install is skipped, run:
 
 ```powershell
-luc --install
+luc install
 ```
 
-`luc --install` opens the terminal installer (license, components, folder and a
+`luc install` opens the terminal installer (license, components, folder and a
 Continue button). Unattended installs:
 
 ```powershell
-luc --install -y --no-path
-luc --install -c window,ai -d "D:\Tools\LUC" -y
+luc install -y --no-path
+luc install -c window,ai -d "D:\Tools\LUC" -y
 ```
 
 Available components: `window`, `ai`, `discord`, `lcode`, `vscode`, `source`.
@@ -39,3 +39,17 @@ LUC and LCode C sources.
 
 The editor-only package uses the separate, signed `lcode-portable.zip` release
 asset on Windows. On Linux it compiles the included native terminal editor.
+
+## Registry
+
+```powershell
+luc login
+luc whoami
+luc install -p @username/packagename
+luc publish -p
+```
+
+`luc publish -p` uploads the `.luic` file and optional `README.md` from the
+current folder, then opens a browser to enter the package name and summary.
+Login state is scoped to the current terminal session. Set `LUC_REGISTRY_URL`
+to use a different registry (defaults to `http://localhost:3000`).

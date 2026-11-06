@@ -877,6 +877,7 @@ static void blk_add(Block *b,Stat *s){
 /* 8. PARSER  (tokens -> AST) */
 
 typedef struct { Lexer lx; int fndepth; int inkey; int strict;
+    int condition_eq;   /* permit single '=' as equality in if/while conditions */
     Str *makename;      /* `make <name>`: this chunk is a lib part */
     int nstats;         /* statements parsed (kept for diagnostics) */
     int intop, topdone; /* inside the main chunk's top-level block */
@@ -1164,6 +1165,7 @@ static Expr *parse_subexpr(Parser *ps,int limit){
 
     for(;;){
         int op=getbinop(ps->lx.t);
+        if(!op && ps->condition_eq && ps->lx.t=='=') op=TK_EQ;
         int notin=0;
         if(!op && ps->lx.t==TK_NOT && lx_peek(&ps->lx)==TK_IN) notin=1;
         if(!op && !notin) break;
@@ -1185,6 +1187,13 @@ static Expr *parse_subexpr(Parser *ps,int limit){
     return e;
 }
 static Expr *parse_expr(Parser *ps){ return parse_subexpr(ps,0); }
+static Expr *parse_condition(Parser *ps){
+    int saved=ps->condition_eq;
+    ps->condition_eq=1;
+    Expr *e=parse_expr(ps);
+    ps->condition_eq=saved;
+    return e;
+}
 
 /* statements */
 static Stat *new_stat(SKind k,int line){ Stat *s=(Stat*)anew(sizeof(Stat)); s->k=k; s->line=line; return s; }
@@ -1333,11 +1342,11 @@ static Stat *parse_statement(Parser *ps){
         case TK_IF: {
             Stat *s=new_stat(S_IF,line);
             lx_next(&ps->lx);
-            Expr *c=parse_expr(ps); expect(ps,TK_THEN);
+            Expr *c=parse_condition(ps); expect(ps,TK_THEN);
             clause_add(s,c,parse_block(ps));
             while(ps->lx.t==TK_ELSEIF){
                 lx_next(&ps->lx);
-                Expr *c2=parse_expr(ps); expect(ps,TK_THEN);
+                Expr *c2=parse_condition(ps); expect(ps,TK_THEN);
                 clause_add(s,c2,parse_block(ps));
             }
             if(opt(ps,TK_ELSE)) s->elseblk=parse_block(ps);
@@ -1347,7 +1356,7 @@ static Stat *parse_statement(Parser *ps){
         case TK_WHILE: {
             Stat *s=new_stat(S_WHILE,line);
             lx_next(&ps->lx);
-            s->e1=parse_expr(ps); expect(ps,TK_DO);
+            s->e1=parse_condition(ps); expect(ps,TK_DO);
             s->body=parse_block(ps); expect(ps,TK_END);
             return s; }
 
@@ -3696,7 +3705,7 @@ static void luc_list_user_lib_dir(const char *dir,int depth,int *count){
 }
 
 static int luc_cmd_libs(void){
-    static const char *core[]={"string","list","math","bit32","json","buffer","io","os","task","coroutine","net",NULL};
+    static const char *core[]={"string","list","math","numluc","bit32","json","buffer","io","os","task","coroutine","net",NULL};
     static const struct { const char *name,*marker; } large[]={
         {"window","SDL2.dll"},{"ai","luc_modules/ai.luc"},{"discord","luc_modules/discord.luc"},{NULL,NULL}
     };
@@ -4402,8 +4411,8 @@ static void print_banner_tail(void){
 "\n"
 "  luc <file>      run a LUC script\n"
 "  luc -e \"...\"    run code from the command line\n"
-"  luc --install   open the installer (components, license, folder)\n"
-"  luc install     install large libraries (window, ai, discord)\n"
+"  luc install     open the installer (components, license, folder)\n"
+"  luc install NAME install a large library (window, ai, discord)\n"
 "  luc --libs      list core, system, and user libraries\n"
 "  luc remove NAME remove an installed large or user library\n"
 "  luc uninstall   uninstall LUC (use -y to confirm, -n to cancel)\n"
@@ -4448,26 +4457,28 @@ static void print_banner(void){
 static void print_help(void){
     printf(
     "LUC %s\n\n"
-    "usage: luc [options] [script [args...]]\n\n"
-    "  script.luc          run a LUC source file\n"
-    "  -e \"chunk\"          execute LUC code from the command line\n"
-    "  lcode [path] / --lcode [path]  open the LCode editor\n"
-    "  --edit [path]       same as --lcode (legacy alias)\n"
-    "  --libs              list core, installed system, and user libraries\n"
-    "  --install           open the interactive installer\n"
-    "  --install -c window,ai -d FOLDER -y   unattended install\n"
-    "  install [pkg]       install a large system library (window, ai, discord)\n"
-    "  remove <name>       remove a large system or user library\n"
-    "  uninstall [-y|-n]   uninstall LUC after confirmation\n"
-    "  lcode uninstall     remove the LCode launcher after confirmation\n"
-    "  -v, --version       print version and exit\n"
-    "  -h, --help          print this help and exit\n\n"
+    "usage: luc [command] [options] [script [args...]]\n\n"
+    "run code\n"
+    "  luc script.luc [args...]   run a script; arguments follow the script name\n"
+    "  luc -e \"chunk\" [args...]   execute code; pass script args after the chunk\n"
+    "  luc                         start the interactive shell when connected to a terminal\n"
+    "  -v, --version               print version and exit\n"
+    "  -h, --help                  print this help (interactive help desk in a terminal)\n"
+    "  --libs                      list core, installed system, and user libraries\n\n"
+    "install and editor\n"
+    "  luc install                 open the installer/maintenance UI\n"
+    "  luc install -c window,ai -d FOLDER -y   unattended install\n"
+    "  luc install <pkg>           install an optional package: window, ai, discord\n"
+    "  luc remove <name>           remove an optional system or user library\n"
+    "  luc uninstall [-y|-n]       uninstall LUC; -y confirms, -n cancels\n"
+    "  luc lcode [path]            open the LCode editor (also --lcode / --edit)\n"
+    "  luc lcode uninstall         remove the LCode launcher\n\n"
     "variables\n"
     "  create x = 10       local variable\n"
     "  x = 10              global variable (forbidden under !strict)\n"
     "  create function f() local function\n"
-    "  command m()       procedure (no return, runs for effects)\n"
-    "  run m(1, 2)       run it (bare: m 1, 2; block: m: ... end)\n\n"
+    "  command m()         procedure (no return, runs for effects)\n"
+    "  run m(1, 2)         run it (bare: m 1, 2; block: m: ... end)\n\n"
     "directives (first line, each on its own line)\n"
     "  !strict             ultra-strict: 'create' required, dict keys quoted,\n"
     "                      bare 'function f()' forbidden, True/False/None rejected\n"
@@ -4477,6 +4488,13 @@ static void print_help(void){
     "  {key: value}        dict\n"
     "  \"text\" + num        string join\n"
     "  true  false  nil\n\n"
+    "conditions and loops\n"
+    "  if a = 1 and b = 2 then ... elseif a = 1 or b = 2 then ... end\n"
+    "  if a = 1 or b = 2 then ... end\n"
+    "  while a = 1 and b = 2 do ... end\n"
+    "  while a = 1 or b = 2 do ... end\n"
+    "  Use == for equality generally; a single = is also accepted in if/while\n"
+    "  conditions. and binds tighter than or; elseif may be repeated.\n\n"
     "repeat\n"
     "  repeat 5 do                        5 times, i = 0..4\n"
     "  repeat 1, 10 as i do               i = 0..9  (stops before 10)\n"
@@ -4498,6 +4516,11 @@ static void print_help(void){
     "  io.replace / clearline / eraseline / clear\n"
     "  task.*   buffer.*   bit32.*\n\n"
     "modules\n"
+    "  import numluc(\"nl\") numeric and string-length helpers (also built in)\n"
+    "  nl.length(123456789) -> 9; nl.length(\"hello\") -> 5\n"
+    "  nl.letter(2, \"hello\") -> \"e\" (letter positions start at 1)\n"
+    "  nl.round/floor/ceiling/abs/sqrt/sin/cos/tan/asin/acos/atan/log/clog\n"
+    "  math.length(value) is also available; numluc shares the math library\n"
     "  import window       system library (SDL2 graphics, build with -DLUC_WINDOW)\n"
     "  import window(\"w\")  same, bound to short name\n"
     "  import libs         user-library toolkit (unlocks make/get/pack/command)\n"
@@ -4799,9 +4822,10 @@ static const HelpTopic HELP_TOPICS[] = {
  "  luc --version               Show the LUC version.\n"
  "  luc --help                  Show command-line help.\n"
  "  luc --libs                  List core, installed system, and user libraries.\n"
- "  luc install [name]          Install a large library: window, ai, discord.\n"
+ "  luc install [name]          Open installer or install window, ai, discord.\n"
  "  luc remove <name>           Remove an installed system or user library.\n"
- "  luc --install               Open the installer/maintenance UI.\n"
+ "  luc install -c window,ai -d FOLDER -y   Unattended install.\n"
+ "  luc install                 Open the installer/maintenance UI.\n"
  "  luc uninstall [-y|-n]       Uninstall LUC; -y confirms, -n cancels.\n"
  "  lcode [path]                Open the LCode editor.\n"
  "  lcode uninstall [-y|-n]     Remove the LCode launcher; plugins are kept.\n"
@@ -4826,8 +4850,9 @@ static const HelpTopic HELP_TOPICS[] = {
  "run greet(\"bo\") runs the command greet.\n"
  "Same as greet(\"bo\") - just more explicit."},
 {"import",
- "import ai / window / net / discord loads system libs.\n"
+ "import numluc / ai / window / net / discord loads system libs.\n"
  "import window(\"w\") binds a short name.\n"
+ "import numluc(\"nl\") binds the numeric helpers as nl.\n"
  "import add from mymath loads from a user lib (needs `import libs`)."},
 {"libs",
  "import libs unlocks user libraries: make / get / pack / command.\n"
@@ -4846,9 +4871,18 @@ static const HelpTopic HELP_TOPICS[] = {
  "repeat 1, 10 as i do ... end counts with i (or 1(\"i\") import-style).\n"
  "repeat item, i in list do ... end iterates."},
 {"if",
- "if x > 0 then ... elseif ... else ... end."},
+ "if a = 1 and b = 2 then ... elseif a = 1 or b = 2 then ... else ... end.\n"
+ "if a = 1 or b = 2 then ... end.\n"
+ "Conditions accept == or a single = for equality. and binds tighter than or.\n"
+ "You can use any number of elseif clauses."},
 {"while",
- "while x > 0 do ... end loops until the condition is false."},
+ "while a = 1 and b = 2 do ... end loops while both conditions are true.\n"
+ "while a = 1 or b = 2 do ... end loops while either condition is true."},
+{"and",
+ "and combines conditions and short-circuits: if a = 1 and b = 2 then ... end.\n"
+ "and binds tighter than or."},
+{"or",
+ "or combines conditions and short-circuits: while a = 1 or b = 2 do ... end."},
 {"task",
  "task.spawn(function() ... end) runs code in the background.\n"
  "task.wait(seconds) pauses the current task."},
@@ -4856,8 +4890,13 @@ static const HelpTopic HELP_TOPICS[] = {
  "string.split(\"a,b\", \",\"), string.trim(s), string.upper(s).\n"
  "len(s) gives the length."},
 {"math",
- "math.floor/ceil/sqrt/sin/cos/random, math.pi.\n"
+ "math.floor/ceil/round/sqrt/sin/cos/random, math.pi.\n"
  "math.karatsuba(\"huge\", \"huge\") multiplies exactly."},
+{"numluc",
+ "import numluc(\"nl\") loads numeric helpers (also available from math).\n"
+ "nl.length(123456789) is 9; nl.length(\"hello\") is 5.\n"
+ "nl.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
+ "Includes floor, ceiling, round, abs, sqrt, trig/inverse trig, log, and clog (base 10)."},
 {"len",
  "len(x) counts lists, dicts and strings: len([1,2]), len(\"hi\")."},
 {"edit",
@@ -5208,7 +5247,7 @@ static int cmd_lcode_uninstall(int argc,char **argv,int first){
 
 static int install_option_value(const char *name,int argc,char **argv,int *index,const char **value){
     if(*index+1>=argc){
-        fprintf(stderr,"luc --install: %s needs a value\n",name);
+        fprintf(stderr,"luc install: %s needs a value\n",name);
         return 0;
     }
     *value=argv[++(*index)];
@@ -5219,7 +5258,7 @@ static int cmd_installer(int argc,char **argv){
     char script[1024];
     if(!luc_installer_script(script,sizeof script)){
         fprintf(stderr,
-            "luc --install: install.ps1 was not found next to luc.exe.\n"
+            "luc install: install.ps1 was not found next to luc.exe.\n"
             "Download it from:\n"
             "  https://raw.githubusercontent.com/hsusulist/luc/main/install.ps1\n");
         return 1;
@@ -5262,11 +5301,11 @@ static int cmd_installer(int argc,char **argv){
         } else if(!strcmp(a,"--allow-unsigned")){
             ps[n++]="-AllowUnsigned";
         } else {
-            fprintf(stderr,"luc --install: unknown option '%s'\n",a);
+            fprintf(stderr,"luc install: unknown option '%s'\n",a);
             return 1;
         }
         if(n>56){
-            fprintf(stderr,"luc --install: too many arguments\n");
+            fprintf(stderr,"luc install: too many arguments\n");
             return 1;
         }
     }
@@ -5276,13 +5315,13 @@ static int cmd_installer(int argc,char **argv){
     for(int i=0;i<n;i++){
         if(i>0) strncat(command," ",sizeof(command)-strlen(command)-1);
         if(!append_quoted_arg(command,sizeof command,ps[i])){
-            fprintf(stderr,"luc --install: command line is too long\n");
+            fprintf(stderr,"luc install: command line is too long\n");
             return 1;
         }
     }
     int rc=run_process_wait(command);
     if(rc==-1){
-        fprintf(stderr,"luc --install: could not start powershell.exe\n");
+        fprintf(stderr,"luc install: could not start powershell.exe\n");
         return 1;
     }
     return rc;
@@ -5292,7 +5331,7 @@ static int luc_state_exists(void){ return 1; }
 static int luc_installer_pending(void){ return 0; }
 static int cmd_installer(int argc,char **argv){
     (void)argc; (void)argv;
-    fprintf(stderr,"luc --install is only available on Windows.\n");
+    fprintf(stderr,"luc install is only available on Windows.\n");
     return 1;
 }
 static int cmd_uninstall(int argc,char **argv,int first){
@@ -5349,8 +5388,6 @@ int main(int argc,char **argv){
         print_help();
         return 0;
     }
-    if(strcmp(argv[1],"--install")==0)
-        return cmd_installer(argc,argv);
     if(strcmp(argv[1],"--libs")==0)
         return luc_cmd_libs();
     if(strcmp(argv[1],"remove")==0)
@@ -5383,8 +5420,11 @@ int main(int argc,char **argv){
     return rc;
     }
 
-    if(strcmp(argv[1],"install")==0)
+    if(strcmp(argv[1],"install")==0){
+        if(argc==2 || (argc>2 && argv[2][0]=='-'))
+            return cmd_installer(argc,argv);
         return cmd_install(argc,argv);
+    }
 
     {
         char libname[256];

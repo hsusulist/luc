@@ -41,7 +41,7 @@ if (process.platform !== 'win32' || findBinary()) {
 
 const script = path.join(__dirname, '..', 'install.ps1');
 if (!fs.existsSync(script)) {
-  console.warn('luc: install.ps1 is missing; run "luc --install" after installing.');
+  console.warn('luc: install.ps1 is missing; run "luc install" after installing.');
   process.exit(0);
 }
 
@@ -53,6 +53,6 @@ const result = spawnSync(
 );
 
 if (result.error || result.status !== 0) {
-  console.warn('luc: automatic install did not finish. Run "luc --install" to open the installer.');
+  console.warn('luc: automatic install did not finish. Run "luc install" to open the installer.');
 }
 process.exit(0);
