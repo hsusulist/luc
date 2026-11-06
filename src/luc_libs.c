@@ -166,10 +166,7 @@ LFN(f_import){ UNUSED_SELF;
     Value cached=tab_get(V.loaded,key);
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
     Value m=NIL;
-    if(strcmp(name->s,"numluc")==0){
-        m=tab_get(V.globals,cstrv("numluc"));
-        if(m.t!=LT_TABLE) luc_error("numluc: built-in library is unavailable");
-    }else if(strcmp(name->s,"window")==0){
+    if(strcmp(name->s,"window")==0){
         m=lucL_window_module();         /* fails without SDL2 */
     }else if(strcmp(name->s,"json")==0){
         m=lucL_json_module();
@@ -202,7 +199,7 @@ LFN(f_import){ UNUSED_SELF;
     }else if(strcmp(name->s,"libs")==0){
         m=libs_module();
     }else{
-        luc_error("module '%s' is not a LUC system library (system: numluc, window, ai, json, net, discord, libs)\n"
+        luc_error("module '%s' is not a LUC system library (system: window, ai, json, net, discord, libs)\n"
                   "third-party modules use: create %s = require(\"%s\")",
                   name->s,name->s,name->s);
     }
@@ -1470,7 +1467,7 @@ MATH1(f_m_floor,floor(x)) MATH1(f_m_ceil,ceil(x)) MATH1(f_m_sqrt,sqrt(x))
 MATH1(f_m_abs,fabs(x))    MATH1(f_m_sin,sin(x))   MATH1(f_m_cos,cos(x))
 MATH1(f_m_tan,tan(x))     MATH1(f_m_asin,asin(x)) MATH1(f_m_acos,acos(x))
 MATH1(f_m_exp,exp(x))     MATH1(f_m_atan,atan(x))
-MATH1(f_nl_round,round(x)) MATH1(f_nl_clog,log10(x))
+MATH1(f_m_round,round(x)) MATH1(f_m_clog,log10(x))
 LFN(f_m_log){ UNUSED_SELF;
     double x=checknum(L,base,nargs,0,"log");
     if(nargs>=2){ double b=checknum(L,base,nargs,1,"log"); RET(0,mknum(log(x)/log(b))); }
@@ -1492,30 +1489,30 @@ static int utf8_width(const unsigned char *s,int remaining){
     return width;
 }
 
-static Str *numluc_text(Value v,const char *fn){
+static Str *math_text(Value v,const char *fn){
     if(v.t!=LT_STR&&v.t!=LT_NUM)
         luc_error("%s: expected a string or number (got %s)",fn,type_name(v));
     return v.t==LT_STR?AS_STR(v):tostr(v);
 }
 
-LFN(f_nl_length){ UNUSED_SELF;
-    Str *s=numluc_text(AR(0),"numluc.length");
+LFN(f_m_length){ UNUSED_SELF;
+    Str *s=math_text(AR(0),"math.length");
     int count=0;
     for(int i=0;i<s->len;count++)
         i+=utf8_width((const unsigned char*)s->s+i,s->len-i);
     RET(0,mknum((double)count)); return 1;
 }
 
-LFN(f_nl_letter){ UNUSED_SELF;
-    int index=checkint(L,base,nargs,0,"numluc.letter");
-    Str *s=numluc_text(AR(1),"numluc.letter");
+LFN(f_m_letter){ UNUSED_SELF;
+    int index=checkint(L,base,nargs,0,"math.letter");
+    Str *s=math_text(AR(1),"math.letter");
     int pos=0, count=0, width=0;
     while(pos<s->len){
         width=utf8_width((const unsigned char*)s->s+pos,s->len-pos);
         if(++count==index) break;
         pos+=width;
     }
-    if(index<1||count!=index) luc_error("numluc.letter: index out of range");
+    if(index<1||count!=index) luc_error("math.letter: index out of range");
     RET(0,strv(s->s+pos,width)); return 1;
 }
 
@@ -1876,19 +1873,14 @@ void lucL_open_math(void){
     reg(m,"max",f_m_max);     reg(m,"min",f_m_min);
     reg(m,"random",f_m_random); reg(m,"randomseed",f_m_randomseed);
     reg(m,"karatsuba",f_m_karatsuba);
-    reg(m,"round",f_nl_round); reg(m,"clog",f_nl_clog);
-    reg(m,"length",f_nl_length);
+    reg(m,"round",f_m_round); reg(m,"clog",f_m_clog);
+    reg(m,"length",f_m_length);
+    reg(m,"ceiling",f_m_ceil); reg(m,"letter",f_m_letter);
     tab_set(m,cstrv("pi"),mknum(3.14159265358979323846));
     tab_set(m,cstrv("huge"),mknum(HUGE_VAL));
     reg(m,"tointeger",f_m_tointeger); reg(m,"type",f_m_type);
     tab_set(m,cstrv("maxinteger"),mknum(9007199254740992.0));
     tab_set(m,cstrv("mininteger"),mknum(-9007199254740992.0));
-/* numluc shares math functions and adds compatibility aliases. */
-    Table *nl=newlib("numluc");
-    Value key=NIL,k,v;
-    while(tab_next(m,key,&k,&v)){ key=k; tab_set(nl,k,v); }
-    tab_set(nl,cstrv("ceiling"),tab_get(m,cstrv("ceil")));
-    reg(nl,"letter",f_nl_letter);
 /* bit32 */
     Table *b=newlib("bit32");
     reg(b,"band",f_b_band);   reg(b,"bor",f_b_bor);     reg(b,"bxor",f_b_bxor);

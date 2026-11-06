@@ -3705,7 +3705,7 @@ static void luc_list_user_lib_dir(const char *dir,int depth,int *count){
 }
 
 static int luc_cmd_libs(void){
-    static const char *core[]={"string","list","math","numluc","bit32","json","buffer","io","os","task","coroutine","net",NULL};
+    static const char *core[]={"string","list","math","bit32","json","buffer","io","os","task","coroutine","net",NULL};
     static const struct { const char *name,*marker; } large[]={
         {"window","SDL2.dll"},{"ai","luc_modules/ai.luc"},{"discord","luc_modules/discord.luc"},{NULL,NULL}
     };
@@ -4516,11 +4516,9 @@ static void print_help(void){
     "  io.replace / clearline / eraseline / clear\n"
     "  task.*   buffer.*   bit32.*\n\n"
     "modules\n"
-    "  import numluc(\"nl\") numeric and string-length helpers (also built in)\n"
-    "  nl.length(123456789) -> 9; nl.length(\"hello\") -> 5\n"
-    "  nl.letter(2, \"hello\") -> \"e\" (letter positions start at 1)\n"
-    "  nl.round/floor/ceiling/abs/sqrt/sin/cos/tan/asin/acos/atan/log/clog\n"
-    "  math.length(value) is also available; numluc shares the math library\n"
+    "  math.length(123456789) -> 9; math.length(\"hello\") -> 5\n"
+    "  math.letter(2, \"hello\") -> \"e\" (letter positions start at 1)\n"
+    "  math.round/floor/ceiling/abs/sqrt/sin/cos/tan/asin/acos/atan/log/clog\n"
     "  import window       system library (SDL2 graphics, build with -DLUC_WINDOW)\n"
     "  import window(\"w\")  same, bound to short name\n"
     "  import libs         user-library toolkit (unlocks make/get/pack/command)\n"
@@ -4850,9 +4848,8 @@ static const HelpTopic HELP_TOPICS[] = {
  "run greet(\"bo\") runs the command greet.\n"
  "Same as greet(\"bo\") - just more explicit."},
 {"import",
- "import numluc / ai / window / net / discord loads system libs.\n"
+ "import ai / window / net / discord loads system libs.\n"
  "import window(\"w\") binds a short name.\n"
- "import numluc(\"nl\") binds the numeric helpers as nl.\n"
  "import add from mymath loads from a user lib (needs `import libs`)."},
 {"libs",
  "import libs unlocks user libraries: make / get / pack / command.\n"
@@ -4891,12 +4888,10 @@ static const HelpTopic HELP_TOPICS[] = {
  "len(s) gives the length."},
 {"math",
  "math.floor/ceil/round/sqrt/sin/cos/random, math.pi.\n"
- "math.karatsuba(\"huge\", \"huge\") multiplies exactly."},
-{"numluc",
- "import numluc(\"nl\") loads numeric helpers (also available from math).\n"
- "nl.length(123456789) is 9; nl.length(\"hello\") is 5.\n"
- "nl.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
- "Includes floor, ceiling, round, abs, sqrt, trig/inverse trig, log, and clog (base 10)."},
+ "math.karatsuba(\"huge\", \"huge\") multiplies exactly.\n"
+ "math.length(123456789) is 9; math.length(\"hello\") is 5.\n"
+ "math.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
+ "Also: ceiling, abs, trig/inverse trig, log, clog (base 10), max, min, pow, fmod, modf, exp."},
 {"len",
  "len(x) counts lists, dicts and strings: len([1,2]), len(\"hi\")."},
 {"edit",

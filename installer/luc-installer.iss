@@ -100,7 +100,7 @@ Name: "custom"; Description: "Custom installation"; Flags: iscustom
 ; tick only what you need instead of one bundled "download all".
 ; All three can be added later without this installer:
 ;   "luc install window|ai|discord".
-Name: "main"; Description: "LUC interpreter + core libraries (string, list, math, numluc, bit32, JSON, buffer, IO, OS, task, coroutine, net) - prebuilt"; Types: full; Flags: fixed
+Name: "main"; Description: "LUC interpreter + core libraries (string, list, math, bit32, JSON, buffer, IO, OS, task, coroutine, net) - prebuilt"; Types: full; Flags: fixed
 Name: "window"; Description: "Window support - SDL2 2D graphics, PNG/JPG sprites, TTF text, WAV/OGG/MP3 sound + Pong demo (optional; add later with: luc install window)"
 Name: "ailib"; Description: "lanternl AI library - 'import ai': neural nets, LMTrain, BPE tokenizer (optional; add later with: luc install ai)"
 Name: "discord"; Description: "Discord bot library - 'import discord': bot, slash commands, gateway (optional; add later with: luc install discord)"
