@@ -24,7 +24,7 @@ if (fs.existsSync(target)) {
   throw new Error('refusing to overwrite existing npm/src directory');
 }
 fs.mkdirSync(target);
-for (const name of ['luc_core.c', 'luc_libs.c', 'luc_trans.c', 'luc.h']) {
+for (const name of ['luc_core.c', 'luc_libs.c', 'luc_nums.c', 'luc_trans.c', 'luc.h']) {
   const from = path.join(source, name);
   if (!fs.existsSync(from)) throw new Error('missing release source: ' + from);
   fs.copyFileSync(from, path.join(target, name));

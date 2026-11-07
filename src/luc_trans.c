@@ -472,9 +472,10 @@ static int ana_region(Ana *a,int startpc){
                 break; }
             case OP_FORPREP: {
                 if(A+3>=n){ ok=ana_fail(a,"loop registers out of frame",pc); break; }
-                if(!KISNUM(cur[A])||!KISNUM(cur[A+1])){ ok=ana_fail(a,"non-numeric loop bounds",pc); break; }
-                /* integral if st/tg integral */
-                unsigned char kk=(cur[A]==K_INT&&cur[A+1]==K_INT)?K_INT:K_NUM;
+                if(!KISNUM(cur[A])||!KISNUM(cur[A+1])||!KISNUM(cur[A+2])){
+                    ok=ana_fail(a,"non-numeric loop bounds",pc); break;
+                }
+                unsigned char kk=(cur[A]==K_INT&&cur[A+1]==K_INT&&cur[A+2]==K_INT)?K_INT:K_NUM;
                 cur[A]=cur[A+1]=cur[A+2]=cur[A+3]=kk;
                 ok=succ_to(a,pc+1+GET_sBx(ins),cur);
                 goto region_done; }
@@ -937,27 +938,17 @@ static int gen_body(Gen *g){
                 JCCTO(op==OP_JMPIF?CC_NE:CC_E,tgt);
                 break; }
             case OP_FORPREP: {
-                /* FORPREP normalizes loop; step 0/NaN bails. */
-                g_ldx(g,4,A);                                 /* xmm4=st */
+                /* FORPREP biases the starting index; step 0/NaN bails. */
+                g_ldx(g,4,A);                                 /* xmm4=step */
                 sse_rr(b,0x66,SSE_XORPD,1,1);
                 sse_rr(b,0x66,SSE_COMISD,4,1);
                 BAILCC(CC_P);
                 BAILCC(CC_E);
-                int jpos=emit_jcc(b,CC_A);
-                g_ldx(g,2,A+1);                               /* tg */
-                sse_rr(b,0xF2,SSE_SUB,2,4);                   /* tg-st */
+                g_ldx(g,2,A+2);                               /* xmm2=start */
+                sse_rr(b,0xF2,SSE_SUB,2,4);                   /* start-step */
                 g_stx(g,A,2);
-                sse_rr(b,0x66,SSE_XORPD,1,1);
-                g_stx(g,A+1,1);
-                int jend=emit_jmp(b);
-                patch_rel(b,jpos,b->n);
-                sse_rr(b,0xF2,SSE_MOVSD_LD,0,4);
-                emit_neg_x0(g);
-                g_stx(g,A,0);                                 /* A=-st */
-                patch_rel(b,jend,b->n);
                 g_stx(g,A+2,4);
-                g_const(g,A+3,0.0);
-                for(int k=0;k<4;k++) g_kill(g,A+k);
+                for(int k=0;k<3;k++) g_kill(g,A+k);
                 JUMPTO(pc+1+GET_sBx(ins));
                 break; }
             case OP_FORLOOP: {
@@ -974,7 +965,7 @@ static int gen_body(Gen *g){
                 patch_rel(b,jdown,b->n);
                 g_ldx(g,1,A+1);
                 sse_rr(b,0x66,SSE_COMISD,0,1);                /* idx vs lim */
-                int jt2=emit_jcc(b,CC_AE);
+                int jt2=emit_jcc(b,CC_A);
                 int jo2=emit_jmp(b);
                 patch_rel(b,jt1,b->n);
                 patch_rel(b,jt2,b->n);

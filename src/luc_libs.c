@@ -8,6 +8,9 @@
 #endif
 #include "luc.h"
 
+static void luc_nums_open(Table *math,Table *random);
+static void luc_nums_bind(Table *nums);
+
 
 /* luc_lib_base.c */
 /* base lib: print, tostring, pcall, require, xpcall */
@@ -163,13 +166,16 @@ LFN(f_import){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"import");
     char keybuf[512]; snprintf(keybuf,sizeof keybuf,"system:%s",name->s);
     Value key=cstrv(keybuf);            /* own slot (not require) */
+    if(strcmp(name->s,"nums")==0){
+        Value nums=tab_get(V.loaded,key);
+        if(nums.t!=LT_TABLE) luc_error("nums: built-in library is unavailable");
+        luc_nums_bind(AS_TAB(nums));
+        RET(0,nums); return 1;
+    }
     Value cached=tab_get(V.loaded,key);
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
     Value m=NIL;
-    if(strcmp(name->s,"numluc")==0){
-        m=tab_get(V.globals,cstrv("numluc"));
-        if(m.t!=LT_TABLE) luc_error("numluc: built-in library is unavailable");
-    }else if(strcmp(name->s,"window")==0){
+    if(strcmp(name->s,"window")==0){
         m=lucL_window_module();         /* fails without SDL2 */
     }else if(strcmp(name->s,"json")==0){
         m=lucL_json_module();
@@ -202,7 +208,7 @@ LFN(f_import){ UNUSED_SELF;
     }else if(strcmp(name->s,"libs")==0){
         m=libs_module();
     }else{
-        luc_error("module '%s' is not a LUC system library (system: numluc, window, ai, json, net, discord, libs)\n"
+        luc_error("module '%s' is not a LUC system library (system: nums, window, ai, json, net, discord, libs)\n"
                   "third-party modules use: create %s = require(\"%s\")",
                   name->s,name->s,name->s);
     }
@@ -1465,12 +1471,37 @@ static double rnd(void){
     rngstate^=rngstate>>12; rngstate^=rngstate<<25; rngstate^=rngstate>>27;
     return (double)((rngstate*2685821657736338717ULL)>>11)/9007199254740992.0;
 }
+static uint64_t nums_rngstate=0x9E3779B97F4A7C15ULL;
+static double nums_rnd(void){
+    nums_rngstate^=nums_rngstate>>12; nums_rngstate^=nums_rngstate<<25; nums_rngstate^=nums_rngstate>>27;
+    return (double)((nums_rngstate*2685821657736338717ULL)>>11)/9007199254740992.0;
+}
 #define MATH1(nm,expr) LFN(nm){ UNUSED_SELF; double x=checknum(L,base,nargs,0,"math"); RET(0,mknum(expr)); return 1; }
 MATH1(f_m_floor,floor(x)) MATH1(f_m_ceil,ceil(x)) MATH1(f_m_sqrt,sqrt(x))
 MATH1(f_m_abs,fabs(x))    MATH1(f_m_sin,sin(x))   MATH1(f_m_cos,cos(x))
 MATH1(f_m_tan,tan(x))     MATH1(f_m_asin,asin(x)) MATH1(f_m_acos,acos(x))
 MATH1(f_m_exp,exp(x))     MATH1(f_m_atan,atan(x))
-MATH1(f_nl_round,round(x)) MATH1(f_nl_clog,log10(x))
+MATH1(f_m_round,round(x)) MATH1(f_m_clog,log10(x))
+MATH1(f_m_cbrt,cbrt(x))   MATH1(f_m_exp2,exp2(x)) MATH1(f_m_log2,log2(x))
+MATH1(f_m_trunc,trunc(x))
+MATH1(f_m_sinh,sinh(x))   MATH1(f_m_cosh,cosh(x)) MATH1(f_m_tanh,tanh(x))
+MATH1(f_m_asinh,asinh(x)) MATH1(f_m_acosh,acosh(x)) MATH1(f_m_atanh,atanh(x))
+MATH1(f_m_radians,x*(3.14159265358979323846/180.0))
+MATH1(f_m_degrees,x*(180.0/3.14159265358979323846))
+LFN(f_m_sign){ UNUSED_SELF;
+    double x=checknum(L,base,nargs,0,"sign");
+    RET(0,mknum(isnan(x)?x:(x>0?1:x<0?-1:0))); return 1;
+}
+LFN(f_m_hypot){ UNUSED_SELF;
+    double x=checknum(L,base,nargs,0,"hypot");
+    double y=checknum(L,base,nargs,1,"hypot");
+    RET(0,mknum(hypot(x,y))); return 1;
+}
+LFN(f_m_atan2){ UNUSED_SELF;
+    double y=checknum(L,base,nargs,0,"atan2");
+    double x=checknum(L,base,nargs,1,"atan2");
+    RET(0,mknum(atan2(y,x))); return 1;
+}
 LFN(f_m_log){ UNUSED_SELF;
     double x=checknum(L,base,nargs,0,"log");
     if(nargs>=2){ double b=checknum(L,base,nargs,1,"log"); RET(0,mknum(log(x)/log(b))); }
@@ -1492,30 +1523,30 @@ static int utf8_width(const unsigned char *s,int remaining){
     return width;
 }
 
-static Str *numluc_text(Value v,const char *fn){
+static Str *math_text(Value v,const char *fn){
     if(v.t!=LT_STR&&v.t!=LT_NUM)
         luc_error("%s: expected a string or number (got %s)",fn,type_name(v));
     return v.t==LT_STR?AS_STR(v):tostr(v);
 }
 
-LFN(f_nl_length){ UNUSED_SELF;
-    Str *s=numluc_text(AR(0),"numluc.length");
+LFN(f_m_length){ UNUSED_SELF;
+    Str *s=math_text(AR(0),"math.length");
     int count=0;
     for(int i=0;i<s->len;count++)
         i+=utf8_width((const unsigned char*)s->s+i,s->len-i);
     RET(0,mknum((double)count)); return 1;
 }
 
-LFN(f_nl_letter){ UNUSED_SELF;
-    int index=checkint(L,base,nargs,0,"numluc.letter");
-    Str *s=numluc_text(AR(1),"numluc.letter");
+LFN(f_m_letter){ UNUSED_SELF;
+    int index=checkint(L,base,nargs,0,"math.letter");
+    Str *s=math_text(AR(1),"math.letter");
     int pos=0, count=0, width=0;
     while(pos<s->len){
         width=utf8_width((const unsigned char*)s->s+pos,s->len-pos);
         if(++count==index) break;
         pos+=width;
     }
-    if(index<1||count!=index) luc_error("numluc.letter: index out of range");
+    if(index<1||count!=index) luc_error("math.letter: index out of range");
     RET(0,strv(s->s+pos,width)); return 1;
 }
 
@@ -1526,14 +1557,231 @@ LFN(f_m_fmod){ UNUSED_SELF;
 LFN(f_m_modf){ UNUSED_SELF;
     double ip; double fp=modf(checknum(L,base,nargs,0,"modf"),&ip);
     RET(0,mknum(ip)); RET(1,mknum(fp)); return 2; }
+static uint64_t math_gcd_u64(uint64_t a,uint64_t b){
+    while(b){uint64_t r=a%b;a=b;b=r;}
+    return a;
+}
+static uint64_t math_integer_magnitude(LucState *L,int base,int nargs,int arg,const char *fn){
+    double d=checknum(L,base,nargs,arg,fn);
+    if(!isfinite(d)||d!=floor(d)||fabs(d)>9007199254740992.0){
+        luc_error("math.%s: arguments must be safe integers",fn);
+        return 0;
+    }
+    int64_t n=(int64_t)d;
+    return n<0?(uint64_t)(-(n+1))+1:(uint64_t)n;
+}
+LFN(f_m_gcd){ UNUSED_SELF;
+    uint64_t a=math_integer_magnitude(L,base,nargs,0,"gcd");
+    uint64_t b=math_integer_magnitude(L,base,nargs,1,"gcd");
+    RET(0,mknum((double)math_gcd_u64(a,b))); return 1;
+}
+LFN(f_m_lcm){ UNUSED_SELF;
+    uint64_t a=math_integer_magnitude(L,base,nargs,0,"lcm");
+    uint64_t b=math_integer_magnitude(L,base,nargs,1,"lcm");
+    uint64_t gcd=math_gcd_u64(a,b),limit=9007199254740992ULL;
+    if(!a||!b){RET(0,mknum(0));return 1;}
+    uint64_t q=a/gcd;
+    if(q>limit/b) luc_error("math.lcm: result exceeds the exact integer range");
+    RET(0,mknum((double)(q*b))); return 1;
+}
 LFN(f_m_max){ UNUSED_SELF;
+    if(nargs==1&&AR(0).t==LT_LIST){
+        Table *t=AS_TAB(AR(0));
+        if(!t->alen){luc_error("math.max: list must not be empty");return 0;}
+        if(t->arr[0].t!=LT_NUM){luc_error("math.max: list values must be numbers");return 0;}
+        double m=t->arr[0].u.n;
+        for(int i=1;i<t->alen;i++){
+            if(t->arr[i].t!=LT_NUM){luc_error("math.max: list values must be numbers");return 0;}
+            if(t->arr[i].u.n>m) m=t->arr[i].u.n;
+        }
+        RET(0,mknum(m));return 1;
+    }
     double m=checknum(L,base,nargs,0,"max");
     for(int i=1;i<nargs;i++){ double d=checknum(L,base,nargs,i,"max"); if(d>m) m=d; }
     RET(0,mknum(m)); return 1; }
 LFN(f_m_min){ UNUSED_SELF;
+    if(nargs==1&&AR(0).t==LT_LIST){
+        Table *t=AS_TAB(AR(0));
+        if(!t->alen){luc_error("math.min: list must not be empty");return 0;}
+        if(t->arr[0].t!=LT_NUM){luc_error("math.min: list values must be numbers");return 0;}
+        double m=t->arr[0].u.n;
+        for(int i=1;i<t->alen;i++){
+            if(t->arr[i].t!=LT_NUM){luc_error("math.min: list values must be numbers");return 0;}
+            if(t->arr[i].u.n<m) m=t->arr[i].u.n;
+        }
+        RET(0,mknum(m));return 1;
+    }
     double m=checknum(L,base,nargs,0,"min");
     for(int i=1;i<nargs;i++){ double d=checknum(L,base,nargs,i,"min"); if(d<m) m=d; }
     RET(0,mknum(m)); return 1; }
+static double *math_copy_values(LucState *L,int base,int nargs,int arg,const char *fn,int *count){
+    Value v=AR(arg);
+    if(v.t!=LT_LIST){luc_error("math.%s: expected a list",fn);return NULL;}
+    Table *t=AS_TAB(v);
+    if(t->alen>10000000){luc_error("math.%s: list is too large",fn);return NULL;}
+    double *values=(double*)malloc((size_t)(t->alen?t->alen:1)*sizeof(double));
+    if(!values){luc_error("math.%s: out of memory",fn);return NULL;}
+    for(int i=0;i<t->alen;i++){
+        if(t->arr[i].t!=LT_NUM||!isfinite(t->arr[i].u.n)){
+            free(values);luc_error("math.%s: values must be finite numbers",fn);return NULL;
+        }
+        values[i]=t->arr[i].u.n;
+    }
+    *count=t->alen;
+    return values;
+}
+static int math_double_cmp(const void *pa,const void *pb){
+    double a=*(const double*)pa,b=*(const double*)pb;
+    return (a>b)-(a<b);
+}
+static void reg_math_case(Table *t,const char *name,CFn fn){
+    char lower[64],upper[64],alllower[64];
+    size_t n=strlen(name);
+    if(n>=sizeof lower){luc_error("math: function name too long");return;}
+    memcpy(lower,name,n+1);memcpy(upper,name,n+1);memcpy(alllower,name,n+1);
+    lower[0]=(char)tolower((unsigned char)lower[0]);
+    upper[0]=(char)toupper((unsigned char)upper[0]);
+    for(size_t i=0;i<n;i++) alllower[i]=(char)tolower((unsigned char)alllower[i]);
+    tab_set(t,cstrv(name),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
+    if(strcmp(name,lower))tab_set(t,cstrv(lower),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
+    if(strcmp(name,upper)&&strcmp(lower,upper))tab_set(t,cstrv(upper),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
+    if(strcmp(name,alllower)&&strcmp(lower,alllower))tab_set(t,cstrv(alllower),mkobj(LT_CFUNC,cfunc_new(fn,name,0)));
+}
+static double math_sorted_quantile(const double *sorted,int n,double q){
+    double pos=q*(double)(n-1);
+    int lo=(int)floor(pos),hi=(int)ceil(pos);
+    return sorted[lo]+(sorted[hi]-sorted[lo])*(pos-(double)lo);
+}
+LFN(f_m_sum){ UNUSED_SELF;
+    double sum=0;
+    if(nargs==1&&AR(0).t==LT_LIST){
+        Table *t=AS_TAB(AR(0));
+        for(int i=0;i<t->alen;i++){
+            if(t->arr[i].t!=LT_NUM){luc_error("math.sum: values must be numbers");return 0;}
+            sum+=t->arr[i].u.n;
+        }
+    }else for(int i=0;i<nargs;i++) sum+=checknum(L,base,nargs,i,"sum");
+    RET(0,mknum(sum));return 1;
+}
+LFN(f_m_prod){ UNUSED_SELF;
+    double product=1;
+    if(nargs==1&&AR(0).t==LT_LIST){
+        Table *t=AS_TAB(AR(0));
+        for(int i=0;i<t->alen;i++){
+            if(t->arr[i].t!=LT_NUM){luc_error("math.prod: values must be numbers");return 0;}
+            product*=t->arr[i].u.n;
+        }
+    }else for(int i=0;i<nargs;i++) product*=checknum(L,base,nargs,i,"prod");
+    RET(0,mknum(product));return 1;
+}
+LFN(f_m_mean){ UNUSED_SELF;
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"mean",&n);
+    if(n==0){free(v);luc_error("math.mean: list must not be empty");return 0;}
+    double sum=0;for(int i=0;i<n;i++)sum+=v[i];
+    free(v);RET(0,mknum(sum/(double)n));return 1;
+}
+LFN(f_m_median){ UNUSED_SELF;
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"median",&n);
+    if(n==0){free(v);luc_error("math.median: list must not be empty");return 0;}
+    qsort(v,(size_t)n,sizeof(double),math_double_cmp);
+    double result=n%2?v[n/2]:v[n/2-1]/2.0+v[n/2]/2.0;
+    free(v);RET(0,mknum(result));return 1;
+}
+LFN(f_m_mode){ UNUSED_SELF;
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"mode",&n);
+    if(n==0){free(v);luc_error("math.mode: list must not be empty");return 0;}
+    qsort(v,(size_t)n,sizeof(double),math_double_cmp);
+    double best=v[0];int best_count=0;
+    for(int i=0;i<n;){
+        int j=i+1;while(j<n&&v[j]==v[i])j++;
+        if(j-i>best_count){best=v[i];best_count=j-i;}
+        i=j;
+    }
+    free(v);RET(0,mknum(best));return 1;
+}
+LFN(f_m_variance){ UNUSED_SELF;
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"variance",&n);
+    if(n==0){free(v);luc_error("math.variance: list must not be empty");return 0;}
+    double mean=0;for(int i=0;i<n;i++)mean+=v[i];mean/=(double)n;
+    double sum=0;for(int i=0;i<n;i++){double d=v[i]-mean;sum+=d*d;}
+    free(v);RET(0,mknum(sum/(double)n));return 1;
+}
+LFN(f_m_stddev){ UNUSED_SELF;
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"stdDev",&n);
+    if(n==0){free(v);luc_error("math.stdDev: list must not be empty");return 0;}
+    double mean=0;for(int i=0;i<n;i++)mean+=v[i];mean/=(double)n;
+    double sum=0;for(int i=0;i<n;i++){double d=v[i]-mean;sum+=d*d;}
+    free(v);RET(0,mknum(sqrt(sum/(double)n)));return 1;
+}
+LFN(f_m_percentile){ UNUSED_SELF;
+    double p=checknum(L,base,nargs,1,"percentile");
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"percentile",&n);
+    if(n==0){free(v);luc_error("math.percentile: list must not be empty");return 0;}
+    if(!isfinite(p)||p<0||p>100){free(v);luc_error("math.percentile: percentile must be in [0, 100]");return 0;}
+    qsort(v,(size_t)n,sizeof(double),math_double_cmp);
+    double result=math_sorted_quantile(v,n,p/100.0);
+    free(v);RET(0,mknum(result));return 1;
+}
+LFN(f_m_quantile){ UNUSED_SELF;
+    double q=checknum(L,base,nargs,1,"quantile");
+    int n=0; double *v=math_copy_values(L,base,nargs,0,"quantile",&n);
+    if(n==0){free(v);luc_error("math.quantile: list must not be empty");return 0;}
+    if(!isfinite(q)||q<0||q>1){free(v);luc_error("math.quantile: q must be in [0, 1]");return 0;}
+    qsort(v,(size_t)n,sizeof(double),math_double_cmp);
+    double result=math_sorted_quantile(v,n,q);
+    free(v);RET(0,mknum(result));return 1;
+}
+LFN(f_m_covariance){ UNUSED_SELF;
+    int nx=0,ny=0;double *x=math_copy_values(L,base,nargs,0,"covariance",&nx);
+    double *y=math_copy_values(L,base,nargs,1,"covariance",&ny);
+    if(nx==0||nx!=ny){free(x);free(y);luc_error("math.covariance: lists must have equal nonzero lengths");return 0;}
+    double mx=0,my=0;for(int i=0;i<nx;i++){mx+=x[i];my+=y[i];}
+    mx/=(double)nx;my/=(double)nx;
+    double sum=0;for(int i=0;i<nx;i++)sum+=(x[i]-mx)*(y[i]-my);
+    free(x);free(y);RET(0,mknum(sum/(double)nx));return 1;
+}
+LFN(f_m_correlation){ UNUSED_SELF;
+    int nx=0,ny=0;double *x=math_copy_values(L,base,nargs,0,"correlation",&nx);
+    double *y=math_copy_values(L,base,nargs,1,"correlation",&ny);
+    if(nx<2||nx!=ny){free(x);free(y);luc_error("math.correlation: lists must have equal lengths >= 2");return 0;}
+    double mx=0,my=0;for(int i=0;i<nx;i++){mx+=x[i];my+=y[i];}
+    mx/=(double)nx;my/=(double)nx;
+    double cross=0,sx=0,sy=0;
+    for(int i=0;i<nx;i++){double dx=x[i]-mx,dy=y[i]-my;cross+=dx*dy;sx+=dx*dx;sy+=dy*dy;}
+    free(x);free(y);
+    if(sx==0||sy==0){luc_error("math.correlation: inputs must have nonzero variance");return 0;}
+    RET(0,mknum(cross/sqrt(sx*sy)));return 1;
+}
+LFN(f_m_average_weighted){ UNUSED_SELF;
+    int nv=0,nw=0;double *v=math_copy_values(L,base,nargs,0,"averageWeighted",&nv);
+    double *w=math_copy_values(L,base,nargs,1,"averageWeighted",&nw);
+    if(nv==0||nv!=nw){free(v);free(w);luc_error("math.averageWeighted: lists must have equal nonzero lengths");return 0;}
+    double weighted=0,total=0;
+    for(int i=0;i<nv;i++){weighted+=v[i]*w[i];total+=w[i];}
+    free(v);free(w);
+    if(total==0){luc_error("math.averageWeighted: weights must not sum to zero");return 0;}
+    RET(0,mknum(weighted/total));return 1;
+}
+LFN(f_m_histogram){ UNUSED_SELF;
+    int n=0;double *v=math_copy_values(L,base,nargs,0,"histogram",&n);
+    int bins=checkint(L,base,nargs,1,"histogram");
+    if(n==0){free(v);luc_error("math.histogram: list must not be empty");return 0;}
+    if(bins<1||bins>1000000){free(v);luc_error("math.histogram: bins must be in [1, 1000000]");return 0;}
+    double lo=v[0],hi=v[0];
+    for(int i=1;i<n;i++){if(v[i]<lo)lo=v[i];if(v[i]>hi)hi=v[i];}
+    if(lo==hi){lo-=0.5;hi+=0.5;}
+    if(!isfinite(hi-lo)||hi<=lo){free(v);luc_error("math.histogram: data range is too large");return 0;}
+    double width=(hi-lo)/(double)bins;
+    Table *counts=tab_new(1),*edges=tab_new(1);
+    for(int i=0;i<bins;i++)list_push(counts,mknum(0));
+    for(int i=0;i<=bins;i++)list_push(edges,mknum(lo+width*(double)i));
+    for(int i=0;i<n;i++){
+        int bin=v[i]==hi?bins-1:(int)((v[i]-lo)/width);
+        if(bin<0)bin=0;if(bin>=bins)bin=bins-1;
+        counts->arr[bin]=mknum(counts->arr[bin].u.n+1);
+    }
+    free(v);RET(0,mkobj(LT_LIST,counts));RET(1,mkobj(LT_LIST,edges));return 2;
+}
 LFN(f_m_random){ UNUSED_SELF;
     double r=rnd();
     if(nargs==0){ RET(0,mknum(r)); return 1; }
@@ -1544,6 +1792,173 @@ LFN(f_m_random){ UNUSED_SELF;
 }
 LFN(f_m_randomseed){ UNUSED_SELF;
     rngstate=(uint64_t)(int64_t)checknum(L,base,nargs,0,"randomseed")|1ULL; return 0; }
+
+static double nums_normal(void){
+    double u1;
+    do { u1=nums_rnd(); } while(u1<=0.0);
+    return sqrt(-2.0*log(u1))*cos(6.2831853071795864769*nums_rnd());
+}
+LFN(f_nums_random){ UNUSED_SELF;
+    if(nargs) luc_error("random.Random: expected no arguments");
+    RET(0,mknum(nums_rnd())); return 1;
+}
+LFN(f_nums_randomint){ UNUSED_SELF;
+    int lo=checkint(L,base,nargs,0,"random.RandomInt");
+    int hi=checkint(L,base,nargs,1,"random.RandomInt");
+    if(nargs!=2) luc_error("random.RandomInt: expected two arguments");
+    if(hi<lo) luc_error("random.RandomInt: upper bound must be >= lower bound");
+    uint64_t span=(uint64_t)((int64_t)hi-(int64_t)lo)+1;
+    uint64_t offset=(uint64_t)(nums_rnd()*(double)span);
+    if(offset>=span) offset=span-1;
+    RET(0,mknum((double)((int64_t)lo+(int64_t)offset))); return 1;
+}
+LFN(f_nums_uniform){ UNUSED_SELF;
+    double lo=checknum(L,base,nargs,0,"random.Uniform");
+    double hi=checknum(L,base,nargs,1,"random.Uniform");
+    if(nargs!=2) luc_error("random.Uniform: expected two arguments");
+    if(!isfinite(lo)||!isfinite(hi)||hi<lo)
+        luc_error("random.Uniform: bounds must be finite and upper >= lower");
+    RET(0,mknum(lo+(hi-lo)*nums_rnd())); return 1;
+}
+static Table *nums_check_list(LucState *L,int base,int nargs,int arg,const char *fn){
+    Value v=AR(arg);
+    if(v.t!=LT_LIST) luc_error("%s: expected a list (got %s)",fn,type_name(v));
+    return AS_TAB(v);
+}
+LFN(f_nums_choice){ UNUSED_SELF;
+    Table *t=nums_check_list(L,base,nargs,0,"random.Choice");
+    if(nargs!=1) luc_error("random.Choice: expected one argument");
+    if(t->alen==0) luc_error("random.Choice: cannot choose from an empty list");
+    int i=(int)(nums_rnd()*(double)t->alen);
+    if(i>=t->alen) i=t->alen-1;
+    RET(0,t->arr[i]); return 1;
+}
+LFN(f_nums_shuffle){ UNUSED_SELF;
+    Table *t=nums_check_list(L,base,nargs,0,"random.Shuffle");
+    if(nargs!=1) luc_error("random.Shuffle: expected one argument");
+    for(int i=t->alen-1;i>0;i--){
+        int j=(int)(nums_rnd()*(double)(i+1));
+        if(j!=i){ Value v=t->arr[i]; t->arr[i]=t->arr[j]; t->arr[j]=v; }
+    }
+    RET(0,AR(0)); return 1;
+}
+LFN(f_nums_permutation){ UNUSED_SELF;
+    Table *src=nums_check_list(L,base,nargs,0,"random.Permutation");
+    if(nargs!=1) luc_error("random.Permutation: expected one argument");
+    Table *dst=tab_new(1);
+    for(int i=0;i<src->alen;i++) list_push(dst,src->arr[i]);
+    for(int i=dst->alen-1;i>0;i--){
+        int j=(int)(nums_rnd()*(double)(i+1));
+        if(j!=i){ Value v=dst->arr[i]; dst->arr[i]=dst->arr[j]; dst->arr[j]=v; }
+    }
+    RET(0,mkobj(LT_LIST,dst)); return 1;
+}
+LFN(f_nums_seed){ UNUSED_SELF;
+    int seed=checkint(L,base,nargs,0,"random.Seed");
+    if(nargs!=1) luc_error("random.Seed: expected one argument");
+    nums_rngstate=(uint64_t)(int64_t)seed;
+    if(nums_rngstate==0) nums_rngstate=0x9E3779B97F4A7C15ULL;
+    return 0;
+}
+LFN(f_nums_normal){ UNUSED_SELF;
+    double mean=checknum(L,base,nargs,0,"random.Normal");
+    double sd=checknum(L,base,nargs,1,"random.Normal");
+    if(nargs!=2) luc_error("random.Normal: expected mean and standard deviation");
+    if(!isfinite(mean)||!isfinite(sd)||sd<0)
+        luc_error("random.Normal: mean must be finite and standard deviation finite and >= 0");
+    RET(0,mknum(mean+sd*nums_normal())); return 1;
+}
+LFN(f_nums_binomial){ UNUSED_SELF;
+    int n=checkint(L,base,nargs,0,"random.Binomial");
+    double p=checknum(L,base,nargs,1,"random.Binomial");
+    if(nargs!=2) luc_error("random.Binomial: expected trial count and probability");
+    if(n<0||!isfinite(p)||p<0||p>1)
+        luc_error("random.Binomial: trial count must be >= 0 and probability in [0, 1]");
+    int successes=0;
+    for(int i=0;i<n;i++) if(nums_rnd()<p) successes++;
+    RET(0,mknum((double)successes)); return 1;
+}
+static double nums_poisson(double lambda){
+    if(lambda==0.0) return 0.0;
+    if(lambda<10.0){
+        double limit=exp(-lambda), product=1.0;
+        int count=0;
+        do { count++; product*=nums_rnd(); } while(product>limit);
+        return (double)(count-1);
+    }
+    {
+        double root=sqrt(lambda);
+        double b=0.931+2.53*root;
+        double a=-0.059+0.02483*b;
+        double inv_alpha=1.1239+1.1328/(b-3.4);
+        double vr=0.9277-3.6224/(b-2.0);
+        for(;;){
+            double u=nums_rnd()-0.5, v=nums_rnd();
+            double us=0.5-fabs(u);
+            if(us<=0.0) continue;
+            double k=floor((2.0*a/us+b)*u+lambda+0.43);
+            if(us>=0.07&&v<=vr) return k;
+            if(k<0.0||(us<0.013&&v>us)) continue;
+            if(log(v*inv_alpha/(a/(us*us)+b))<=
+               -lambda+k*log(lambda)-lgamma(k+1.0)) return k;
+        }
+    }
+}
+LFN(f_nums_poisson){ UNUSED_SELF;
+    double lambda=checknum(L,base,nargs,0,"random.Poisson");
+    if(nargs!=1) luc_error("random.Poisson: expected one argument");
+    if(!isfinite(lambda)||lambda<0||lambda>1.0e12)
+        luc_error("random.Poisson: mean must be finite and in [0, 1e12]");
+    RET(0,mknum(nums_poisson(lambda))); return 1;
+}
+LFN(f_nums_exponential){ UNUSED_SELF;
+    double rate=checknum(L,base,nargs,0,"random.Exponential");
+    if(nargs!=1) luc_error("random.Exponential: expected one argument");
+    if(!isfinite(rate)||rate<=0)
+        luc_error("random.Exponential: rate must be finite and > 0");
+    RET(0,mknum(-log1p(-nums_rnd())/rate)); return 1;
+}
+LFN(f_nums_gaussian){ UNUSED_SELF;
+    if(nargs) luc_error("random.Gaussian: expected no arguments");
+    RET(0,mknum(nums_normal())); return 1;
+}
+LFN(f_nums_randombytes){ UNUSED_SELF;
+    int n=checkint(L,base,nargs,0,"random.RandomBytes");
+    if(nargs!=1) luc_error("random.RandomBytes: expected one argument");
+    if(n<0){ luc_error("random.RandomBytes: length must be >= 0"); return 0; }
+    size_t size=(size_t)n;
+    char *bytes=(char*)malloc(size?size:1);
+    if(!bytes) luc_error("random.RandomBytes: out of memory");
+#if defined(_WIN32)
+    for(int i=0;i<n;i++){
+        unsigned int value;
+        if(rand_s(&value)!=0){ free(bytes); luc_error("random.RandomBytes: secure random source failed"); }
+        bytes[i]=(char)(value&0xFFu);
+    }
+#else
+    FILE *source=fopen("/dev/urandom","rb");
+    if(!source){ free(bytes); luc_error("random.RandomBytes: cannot open secure random source"); }
+    size_t got=fread(bytes,1,(size_t)n,source);
+    int failed=(got!=(size_t)n)||ferror(source);
+    fclose(source);
+    if(failed){ free(bytes); luc_error("random.RandomBytes: secure random source failed"); }
+#endif
+    Value result=mkobj(LT_STR,str_new(bytes,n));
+    free(bytes);
+    RET(0,result); return 1;
+}
+static void reg_nums_random(Table *t,const char *name,CFn fn){
+    char lower[64], lowercase[64];
+    size_t n=strlen(name);
+    if(n>=sizeof lower){ luc_error("nums: random function name is too long"); return; }
+    memcpy(lower,name,n+1);
+    memcpy(lowercase,name,n+1);
+    lower[0]=(char)tolower((unsigned char)lower[0]);
+    for(size_t i=0;i<n;i++) lowercase[i]=(char)tolower((unsigned char)lowercase[i]);
+    reg(t,name,fn);
+    if(strcmp(name,lower)!=0) reg(t,lower,fn);
+    if(strcmp(name,lowercase)!=0&&strcmp(lower,lowercase)!=0) reg(t,lowercase,fn);
+}
 
 /* !karatsuba big-int *: naive vs Karatsuba. */
 #define KBASE 1000000000u
@@ -1867,28 +2282,53 @@ LFN(f_m_type){ UNUSED_SELF;
 
 void lucL_open_math(void){
     rngstate ^= (uint64_t)time(NULL)*2654435761u | 1ULL;   /* seed once */
+    nums_rngstate ^= ((uint64_t)time(NULL)*0x9E3779B97F4A7C15ULL) | 1ULL;
     Table *m=newlib("math");
     reg(m,"floor",f_m_floor); reg(m,"ceil",f_m_ceil);  reg(m,"sqrt",f_m_sqrt);
     reg(m,"abs",f_m_abs);     reg(m,"sin",f_m_sin);    reg(m,"cos",f_m_cos);
     reg(m,"tan",f_m_tan);     reg(m,"asin",f_m_asin);  reg(m,"acos",f_m_acos);
     reg(m,"atan",f_m_atan);   reg(m,"exp",f_m_exp);    reg(m,"log",f_m_log);
+    reg(m,"atan2",f_m_atan2);
+    reg(m,"sinh",f_m_sinh); reg(m,"cosh",f_m_cosh); reg(m,"tanh",f_m_tanh);
+    reg(m,"asinh",f_m_asinh); reg(m,"acosh",f_m_acosh); reg(m,"atanh",f_m_atanh);
+    reg_math_case(m,"toRadians",f_m_radians); reg_math_case(m,"toDegrees",f_m_degrees);
     reg(m,"pow",f_m_pow);     reg(m,"fmod",f_m_fmod);  reg(m,"modf",f_m_modf);
     reg(m,"max",f_m_max);     reg(m,"min",f_m_min);
+    reg(m,"mean",f_m_mean); reg(m,"median",f_m_median); reg(m,"mode",f_m_mode);
+    reg(m,"sum",f_m_sum); reg(m,"prod",f_m_prod);
+    reg(m,"variance",f_m_variance); reg_math_case(m,"stdDev",f_m_stddev);
+    reg(m,"percentile",f_m_percentile); reg(m,"quantile",f_m_quantile);
+    reg(m,"correlation",f_m_correlation); reg(m,"covariance",f_m_covariance);
+    reg_math_case(m,"averageWeighted",f_m_average_weighted); reg(m,"histogram",f_m_histogram);
     reg(m,"random",f_m_random); reg(m,"randomseed",f_m_randomseed);
     reg(m,"karatsuba",f_m_karatsuba);
-    reg(m,"round",f_nl_round); reg(m,"clog",f_nl_clog);
-    reg(m,"length",f_nl_length);
+    reg(m,"round",f_m_round); reg(m,"clog",f_m_clog);
+    reg(m,"cbrt",f_m_cbrt); reg(m,"exp2",f_m_exp2); reg(m,"log2",f_m_log2);
+    reg(m,"trunc",f_m_trunc); reg(m,"sign",f_m_sign); reg(m,"hypot",f_m_hypot);
+    reg(m,"gcd",f_m_gcd); reg(m,"lcm",f_m_lcm);
+    reg(m,"length",f_m_length);
+    reg(m,"ceiling",f_m_ceil); reg(m,"letter",f_m_letter);
     tab_set(m,cstrv("pi"),mknum(3.14159265358979323846));
     tab_set(m,cstrv("huge"),mknum(HUGE_VAL));
     reg(m,"tointeger",f_m_tointeger); reg(m,"type",f_m_type);
     tab_set(m,cstrv("maxinteger"),mknum(9007199254740992.0));
     tab_set(m,cstrv("mininteger"),mknum(-9007199254740992.0));
-/* numluc shares math functions and adds compatibility aliases. */
-    Table *nl=newlib("numluc");
-    Value key=NIL,k,v;
-    while(tab_next(m,key,&k,&v)){ key=k; tab_set(nl,k,v); }
-    tab_set(nl,cstrv("ceiling"),tab_get(m,cstrv("ceil")));
-    reg(nl,"letter",f_nl_letter);
+/* nums keeps math and its independent random API under one importable namespace. */
+    Table *r=tab_new(0);
+    reg_nums_random(r,"Random",f_nums_random);
+    reg_nums_random(r,"RandomInt",f_nums_randomint);
+    reg_nums_random(r,"Uniform",f_nums_uniform);
+    reg_nums_random(r,"Choice",f_nums_choice);
+    reg_nums_random(r,"Shuffle",f_nums_shuffle);
+    reg_nums_random(r,"Permutation",f_nums_permutation);
+    reg_nums_random(r,"Seed",f_nums_seed);
+    reg_nums_random(r,"Normal",f_nums_normal);
+    reg_nums_random(r,"Binomial",f_nums_binomial);
+    reg_nums_random(r,"Poisson",f_nums_poisson);
+    reg_nums_random(r,"Exponential",f_nums_exponential);
+    reg_nums_random(r,"Gaussian",f_nums_gaussian);
+    reg_nums_random(r,"RandomBytes",f_nums_randombytes);
+    luc_nums_open(m,r);
 /* bit32 */
     Table *b=newlib("bit32");
     reg(b,"band",f_b_band);   reg(b,"bor",f_b_bor);     reg(b,"bxor",f_b_bxor);
@@ -5316,3 +5756,5 @@ void lucL_open_net(void){
     V.socklib=tab_new(0);
     reg(V.socklib,"send",f_sock_send); reg(V.socklib,"close",f_sock_close);
 }
+
+#include "luc_nums.c"

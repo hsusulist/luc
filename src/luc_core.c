@@ -1375,8 +1375,9 @@ static Stat *parse_statement(Parser *ps){
             return NULL;
 
         case TK_REPEAT: {
-/* repeat [step,] dest [as i] do: step>0 counts up to dest, step<0 counts down to 0 */
+/* repeat count | step,end | step,start,end */
             Stat *s=NULL;
+            Str *al=NULL;
             lx_next(&ps->lx);
             Expr *e1=parse_subexpr(ps,3);
             if(ps->lx.t==TK_IN){
@@ -1405,27 +1406,40 @@ static Stat *parse_statement(Parser *ps){
                     s->e1=parse_expr(ps);
                 } else {
                     s=new_stat(S_RANGE,line);
-                    Expr *b1; Str *al=repeat_alias(ps,e1,&b1);
-                    s->e1=b1; s->e2=e2;
-                    if(ps->lx.t==',') perr(ps,"repeat takes at most two numbers (step, destination) - no third");
-                    if(opt(ps,TK_AS)){
-                        if(al) perr(ps,"repeat index is already named \"%s\" - drop 'as ...'", al->s);
-                        s->names=(Str**)anew(sizeof(Str*));
-                        s->names[0]=expect_name(ps); s->nnames=1;
-                    } else if(al){
-                        s->names=(Str**)anew(sizeof(Str*));
-                        s->names[0]=al; s->nnames=1;
+                    Expr *step; al=repeat_alias(ps,e1,&step);
+                    s->e1=step;
+                    if(opt(ps,',')){
+                        s->e3=e2;
+                        s->e2=parse_subexpr(ps,3);
+                    } else {
+                        s->e2=e2;
+                        if(step->k==E_NUM && step->num<0){
+                            /* Keep the two-argument countdown form ending at zero. */
+                            s->e3=e2;
+                            s->e2=new_expr(E_NUM,line);
+                            s->e2->num=-1;
+                        }else{
+                            s->e3=new_expr(E_NUM,line);
+                            s->e3->num=0;
+                        }
                     }
                 }
             } else {
                 s=new_stat(S_RANGE,line);
-                Expr *b1; Str *al=repeat_alias(ps,e1,&b1);
-                s->e2=b1;
-                Expr *one=new_expr(E_NUM,line); one->num=1;
-                s->e1=one;
-                if(al){
-                    s->names=(Str**)anew(sizeof(Str*));
-                    s->names[0]=al; s->nnames=1;
+                Expr *count; al=repeat_alias(ps,e1,&count);
+                s->e1=new_expr(E_NUM,line); s->e1->num=1;
+                s->e2=count;
+                s->e3=new_expr(E_NUM,line); s->e3->num=0;
+            }
+            if(s->k==S_RANGE){
+                if(opt(ps,TK_AS)){
+                    if(al) perr(ps,"repeat index is already named \"%s\" - drop 'as ...'",al->s);
+                    s->names=(Str**)anew(sizeof(Str*)); s->names[0]=expect_name(ps); s->nnames=1;
+                }else if(al){
+                    s->names=(Str**)anew(sizeof(Str*)); s->names[0]=al; s->nnames=1;
+                }
+                if(!s->nnames){
+                    s->names=(Str**)anew(sizeof(Str*)); s->names[0]=str_fromc("i"); s->nnames=1;
                 }
             }
             expect(ps,TK_DO);
@@ -1528,27 +1542,50 @@ static Stat *parse_statement(Parser *ps){
             return s; }
 
         case TK_IMPORT: {
-/* import a, b("x"): alias binds short name; `from` is contextual */
+/* import a, a.b, or a.b/c: paths bind their final name unless aliased. */
             lx_next(&ps->lx);
-            Str *bnames[64]; Str *balias[64]; int nn=0, has_alias=0;
+            Str *bnames[64]; Str *balias[64]; Expr *imports[64];
+            int nn=0, has_alias=0, has_path=0;
             do{
                 if(nn>=64) perr(ps,"too many import names");
-                Str *n=expect_name(ps);
-                Str *alias=n;
+                Str *root=expect_name(ps);
+                Str *parts[32]; int nparts=0;
+                while(opt(ps,'.')){
+                    if(nparts>=31) perr(ps,"import path is too long");
+                    parts[nparts++]=expect_name(ps);
+                }
+                if(opt(ps,'/')){
+                    if(nparts>=32) perr(ps,"import path is too long");
+                    parts[nparts++]=expect_name(ps);
+                }
+                Str *alias=nparts?parts[nparts-1]:root;
                 if(opt(ps,'(')){
                     if(ps->lx.t!=TK_STRING)
-                        perr(ps,"expected an alias string after the module name - use import window(\"w\")");
+                        perr(ps,"expected an alias string after the import path");
                     alias=ps->lx.str;
                     lx_next(&ps->lx);
                     expect(ps,')');
                     has_alias=1;
                 }
-                bnames[nn]=n; balias[nn]=alias; nn++;
+                bnames[nn]=root; balias[nn]=alias;
+                if(nparts) has_path=1;
+                Expr *fn=new_expr(E_NAME,line); fn->name=str_fromc("__import");
+                Expr *arg=new_expr(E_STR,line); arg->str=root;
+                Expr *value=new_expr(E_CALL,line); value->a=fn; el_add(&value->args,arg);
+                for(int p=0;p<nparts;p++){
+                    Expr *key=new_expr(E_STR,line); key->str=parts[p];
+                    Expr *index=new_expr(E_INDEX,line); index->a=value; index->b=key;
+                    value=index;
+                }
+                imports[nn]=value;
+                nn++;
             }while(opt(ps,','));
             if(ps->lx.t==TK_NAME && ps->lx.tline==line &&
                ps->lx.str->len==4 && !memcmp(ps->lx.str->s,"from",4)){
                 if(!ps->libs_on)
                     perr(ps,"'import ... from ...' needs 'import libs' first");
+                if(has_path)
+                    perr(ps,"qualified imports cannot use 'from'");
                 if(has_alias)
                     perr(ps,"from-imports take no aliases - use import a, b from lib");
                 lx_next(&ps->lx);
@@ -1583,12 +1620,9 @@ static Stat *parse_statement(Parser *ps){
             for(int i=0;i<nn;i++){
                 if(!strcmp(bnames[i]->s,"libs")) ps->libs_on=1;
                 Expr *target=new_expr(E_NAME,line); target->name=balias[i];
-                Expr *fn=new_expr(E_NAME,line); fn->name=str_fromc("__import");
-                Expr *arg=new_expr(E_STR,line); arg->str=bnames[i];
-                Expr *call=new_expr(E_CALL,line); call->a=fn; el_add(&call->args,arg);
                 Stat *as=new_stat(S_ASSIGN,line);
                 as->is_import=1;      /* !strict allows import bindings */
-                el_add(&as->lhs,target); el_add(&as->rhs,call);
+                el_add(&as->lhs,target); el_add(&as->rhs,imports[i]);
                 blk_add(s->body,as);
             }
             if(nn==1 && !strcmp(bnames[0]->s,"libs")) s->is_libs_import=1;
@@ -2240,11 +2274,12 @@ static void comp_stat(FuncState *fs,Stat *s){
             patch_breaks(fs,&bl,here(fs));
             break; }
         case S_RANGE: {
-/* repeat [step,] dest [as i]: FORPREP checks step, picks dir */
+/* FORPREP receives step, exclusive limit, and initial index. */
             int base=fs->nlocals;
             fs->freereg=base;
             int r0=reserve(fs,1); exprd(fs,s->e1,r0);
             int r1=reserve(fs,1); exprd(fs,s->e2,r1);
+            int r2=reserve(fs,1); exprd(fs,s->e3,r2);
             BlockCnt bl; enterblock(fs,&bl,1);
             newlocal(fs,str_fromc("(for state)"));
             newlocal(fs,str_fromc("(for limit)"));
@@ -2648,6 +2683,7 @@ static int f_dict_values(LucState *L,int base,int nargs,CFunc *self){
 /* len(x) replaces Lua '#' */
 static int f_core_len(LucState *L,int base,int nargs,CFunc *self){
     (void)self;
+    if(nargs<1) luc_error("bad argument #1 to 'len' (value expected)");
     RET(0,mknum((double)vm_len(AR(0)))); return 1;
 }
 
@@ -3193,18 +3229,19 @@ static void vm_execute(LucState *L,int baselevel){
             if(want>=0) L->top=ci->base+pr->maxstack;
         } VM_NEXT;
         VM_LABEL(FORPREP) {
-/* repeat up stops before dest, down lands on 0 */
+/* Start at the requested index and stop before the exclusive limit. */
             double st=arith_num(base[A]), tg=arith_num(base[A+1]);
+            double start=arith_num(base[A+2]);
             if(st==0) luc_error("repeat: step cannot be zero");
-            if(st>0){ base[A]=mknum(-st); base[A+1]=mknum(tg); }
-            else { base[A]=mknum(tg-st); base[A+1]=mknum(0); }
+            base[A]=mknum(start-st);
+            base[A+1]=mknum(tg);
             base[A+2]=mknum(st);
             pc+=GET_sBx(ins);
         } VM_NEXT;
         VM_LABEL(FORLOOP) {
             double idx=base[A].u.n+base[A+2].u.n;
             double lim=base[A+1].u.n, st=base[A+2].u.n;
-            if(st>0? idx<lim : idx>=lim){
+            if(st>0? idx<lim : idx>lim){
                 base[A]=mknum(idx); base[A+3]=mknum(idx);
                 pc+=GET_sBx(ins);
             }
@@ -3705,7 +3742,7 @@ static void luc_list_user_lib_dir(const char *dir,int depth,int *count){
 }
 
 static int luc_cmd_libs(void){
-    static const char *core[]={"string","list","math","numluc","bit32","json","buffer","io","os","task","coroutine","net",NULL};
+    static const char *core[]={"string","list","math","nums","bit32","json","buffer","io","os","task","coroutine","net",NULL};
     static const struct { const char *name,*marker; } large[]={
         {"window","SDL2.dll"},{"ai","luc_modules/ai.luc"},{"discord","luc_modules/discord.luc"},{NULL,NULL}
     };
@@ -4516,11 +4553,9 @@ static void print_help(void){
     "  io.replace / clearline / eraseline / clear\n"
     "  task.*   buffer.*   bit32.*\n\n"
     "modules\n"
-    "  import numluc(\"nl\") numeric and string-length helpers (also built in)\n"
-    "  nl.length(123456789) -> 9; nl.length(\"hello\") -> 5\n"
-    "  nl.letter(2, \"hello\") -> \"e\" (letter positions start at 1)\n"
-    "  nl.round/floor/ceiling/abs/sqrt/sin/cos/tan/asin/acos/atan/log/clog\n"
-    "  math.length(value) is also available; numluc shares the math library\n"
+    "  math.length(123456789) -> 9; math.length(\"hello\") -> 5\n"
+    "  math.letter(2, \"hello\") -> \"e\" (letter positions start at 1)\n"
+    "  math.round/floor/ceiling/abs/sqrt/sin/cos/tan/asin/acos/atan/log/clog\n"
     "  import window       system library (SDL2 graphics, build with -DLUC_WINDOW)\n"
     "  import window(\"w\")  same, bound to short name\n"
     "  import libs         user-library toolkit (unlocks make/get/pack/command)\n"
@@ -4850,10 +4885,47 @@ static const HelpTopic HELP_TOPICS[] = {
  "run greet(\"bo\") runs the command greet.\n"
  "Same as greet(\"bo\") - just more explicit."},
 {"import",
- "import numluc / ai / window / net / discord loads system libs.\n"
+ "import nums / ai / window / net / discord loads system libs.\n"
+ "math is built in; import nums enables random and binds nums.math/nums.random.\n"
+ "import nums.random binds random; import nums.random/randomint binds randomint directly.\n"
  "import window(\"w\") binds a short name.\n"
- "import numluc(\"nl\") binds the numeric helpers as nl.\n"
  "import add from mymath loads from a user lib (needs `import libs`)."},
+{"nums",
+ "import nums enables list, random, matrix, sets and finance; nums also exposes math, search, string and time.\n"
+ "These groups bind as globals (for example finance.payment) and as nums.finance.payment.\n"
+ "List helpers are added to list after import nums; search, string and time are global groups.\n"
+ "Array-named helpers use List names: rangeList, zeroList, readList, listString."},
+{"random",
+ "After import nums: random.Random(), RandomInt(lo,hi), Uniform(lo,hi),\n"
+ "Choice(list), Shuffle(list), Permutation(list), Seed(n), Normal(mean,sd),\n"
+ "Binomial(n,p), Poisson(mean), Exponential(rate), Gaussian(), RandomBytes(n).\n"
+ "Names accept CamelCase, lower-camel, or all-lowercase forms."},
+{"list",
+ "After import nums: list.make(...), rangeList(start,end,step) (inclusive), zeroList(n),\n"
+ "spread(start,end,count), reshape(values, dimensions), flatten(matrix), transpose(matrix).\n"
+ "List indices are 0-based; reshape and matrix helpers use nested lists.\n"
+ "readList/writeList use a tagged text encoding; writeCompressed uses RLE.\n"
+ "readText/writeText and readBinary/writeBinary handle raw string data."},
+{"search",
+ "search.order(list), orderIndex(list), maxIndex(list), minIndex(list),\n"
+ "insertIndex(sorted, value), distinct(list), findNonzero(list), filter(list, predicate)."},
+{"matrix",
+ "After import nums: matrix.dot(a,b), matMul(a,b), det(a), inverse(a), transpose(a),\n"
+ "solve(a,b), eigen(a), qr(a), svd(a), cholesky(a), matrixPower(a,n), norm(a), rank(a).\n"
+ "Matrices are rectangular nested numeric lists. eigen requires a real symmetric matrix.\n"
+ "eigen returns eigenvalues and eigenvectors; qr returns Q,R; svd returns U,S,Vt.\n"
+ "eigen is limited to 32x32; SVD supports up to 32 columns."},
+{"sets",
+ "After import nums: union(a,b), intersect(a,b), difference(a,b), symmetricDiff(a,b),\n"
+ "isSubset(a,b), isSuperset(a,b), isDisjoint(a,b), setEqual(a,b).\n"
+ "unique(list) aliases search.distinct. Sets are lists; results keep first-seen order."},
+{"finance",
+ "After import nums; Excel cash-flow signs. presentValue(rate,n,pmt,fv=0,type=0),\n"
+ "futureValue(rate,n,pmt,pv=0,type=0), payment(rate,n,pv,fv=0,type=0).\n"
+ "netPresentValue(rate,flows) discounts flow 1 at the end of period 1; internalRate uses flow 0 at time 0.\n"
+ "interestRate(n,pmt,pv,fv=0,type=0,guess=0.1), periodCount(rate,pmt,pv,fv=0,type=0).\n"
+ "principal/interest(rate,period,n,pv,fv=0,type=0), compound(p,rate,n,frequency=1) returns future value,\n"
+ "discount(fv,rate,n). `type` is 0=end or 1=beginning."},
 {"libs",
  "import libs unlocks user libraries: make / get / pack / command.\n"
  "libs.info(\"lib\") lists parts. See demos/libs_libaries/."},
@@ -4867,8 +4939,10 @@ static const HelpTopic HELP_TOPICS[] = {
  "get add, sub then pack mymath writes mymath.luic next to your file.\n"
  "Share that one file; others load it with import-from."},
 {"repeat",
- "repeat 5 do ... end runs 5 times.\n"
- "repeat 1, 10 as i do ... end counts with i (or 1(\"i\") import-style).\n"
+ "repeat 20 do ... end runs 20 times; its index i starts at 0.\n"
+ "repeat 1, 20 do ... end uses step 1 and exclusive end 20.\n"
+ "repeat 1, 10, 20 do ... end starts at 10 and stops before 20.\n"
+ "Name the index with repeat 1(\"i\"), 20 do ... end.\n"
  "repeat item, i in list do ... end iterates."},
 {"if",
  "if a = 1 and b = 2 then ... elseif a = 1 or b = 2 then ... else ... end.\n"
@@ -4888,15 +4962,21 @@ static const HelpTopic HELP_TOPICS[] = {
  "task.wait(seconds) pauses the current task."},
 {"string",
  "string.split(\"a,b\", \",\"), string.trim(s), string.upper(s).\n"
- "len(s) gives the length."},
+ "Also: capitalize, repeatText, replaceText, splitText, encodeText (hex), decodeText."},
+{"time",
+ "time.dateTime(timestamp) returns UTC date fields; time.dateString(timestamp, format).\n"
+ "time.timeSpan(start, end) returns seconds; workDaysBetween and workDayOffset use Unix timestamps."},
 {"math",
  "math.floor/ceil/round/sqrt/sin/cos/random, math.pi.\n"
- "math.karatsuba(\"huge\", \"huge\") multiplies exactly."},
-{"numluc",
- "import numluc(\"nl\") loads numeric helpers (also available from math).\n"
- "nl.length(123456789) is 9; nl.length(\"hello\") is 5.\n"
- "nl.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
- "Includes floor, ceiling, round, abs, sqrt, trig/inverse trig, log, and clog (base 10)."},
+ "math.karatsuba(\"huge\", \"huge\") multiplies exactly.\n"
+ "math.length(123456789) is 9; math.length(\"hello\") is 5.\n"
+ "math.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
+ "Also: cbrt, exp2, log2, trunc, sign, hypot, gcd, lcm, ceiling, abs, trig/inverse trig,\n"
+ "atan2, sinh/cosh/tanh, asinh/acosh/atanh, toRadians/toDegrees, log, clog (base 10),\n"
+ "max/min accept variadic numbers or one list. Stats: sum/prod, mean/median/mode,\n"
+ "variance/stdDev (population), percentile(p: 0..100), quantile(q: 0..1),\n"
+ "covariance/correlation(x,y), averageWeighted(values,weights), histogram(list,bins).\n"
+ "Histogram returns counts and bin edges; list statistics expect flat numeric lists."},
 {"len",
  "len(x) counts lists, dicts and strings: len([1,2]), len(\"hi\")."},
 {"edit",
