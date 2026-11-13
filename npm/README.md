@@ -19,8 +19,9 @@ automatic install is skipped, run:
 luc install
 ```
 
-`luc install` opens the terminal installer (license, components, folder and a
-Continue button). Unattended installs:
+`luc install` opens the full-screen terminal installer. When LUC is already
+installed, it offers component management and repair; installs made with the
+Windows installer also include an uninstall option. Unattended installs:
 
 ```powershell
 luc install -y --no-path

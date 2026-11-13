@@ -1,0 +1,286 @@
+-- LUC MINESWEEPER
+-- left click: open, right click: flag | Click in number has been open: fast open (chord)
+-- R: Again | ESC: Left
+import window
+
+create COLS = 16
+create ROWS = 16
+create MINES = 40
+create CELL = 32
+create TOP = 64
+create W = COLS * CELL
+create H = TOP + ROWS * CELL
+create N = COLS * ROWS
+
+create G = {"state": "ready", "revealed": 0, "flags": 0, "elapsed": 0, "hit": -1}
+
+create mine = []
+create cnt = []
+create opened = []
+create flagged = []
+repeat 1, N as i do
+  mine:append(false)
+  cnt:append(0)
+  opened:append(false)
+  flagged:append(false)
+end
+
+create NUMCOL = ["#1976d2", "#388e3c", "#d32f2f", "#7b1fa2", "#ff8f00", "#00838f", "black", "gray"]
+
+create function reset()
+  repeat 1, N as i do
+    mine[i] = false
+    cnt[i] = 0
+    opened[i] = false
+    flagged[i] = false
+  end
+  G.state = "ready"
+  G.revealed = 0
+  G.flags = 0
+  G.elapsed = 0
+  G.hit = -1
+end
+
+create function neighbors(idx)
+  create out = []
+  create x = idx % COLS
+  create y = math.floor(idx / COLS)
+  repeat 1, -1, 2 as dy do
+    repeat 1, -1, 2 as dx do
+      if not (dx == 0 and dy == 0) then
+        create nx = x + dx
+        create ny = y + dy
+        if nx >= 0 and nx < COLS and ny >= 0 and ny < ROWS then
+          out:append(ny * COLS + nx)
+        end
+      end
+    end
+  end
+  return out
+end
+
+create function place_mines(safe)
+  create sx = safe % COLS
+  create sy = math.floor(safe / COLS)
+  create placed = 0
+  while placed < MINES do
+    create r = math.random(0, N - 1)
+    create rx = r % COLS
+    create ry = math.floor(r / COLS)
+    if mine[r] == false and not (math.abs(rx - sx) <= 1 and math.abs(ry - sy) <= 1) then
+      mine[r] = true
+      placed += 1
+    end
+  end
+  repeat 1, N as i do
+    create c = 0
+    if mine[i] == false then
+      create nb = neighbors(i)
+      repeat v, k in nb do
+        if mine[v] then c += 1 end
+      end
+    end
+    cnt[i] = c
+  end
+end
+
+create function reveal(start)
+  if opened[start] or flagged[start] then return end
+  if mine[start] then
+    G.state = "lost"
+    G.hit = start
+    return
+  end
+  create queue = [start]
+  opened[start] = true
+  G.revealed += 1
+  create head = 0
+  while head < len(queue) do
+    create cur = queue[head]
+    head += 1
+    if cnt[cur] == 0 then
+      create nb = neighbors(cur)
+      repeat v, k in nb do
+        if opened[v] == false and flagged[v] == false and mine[v] == false then
+          opened[v] = true
+          G.revealed += 1
+          queue:append(v)
+        end
+      end
+    end
+  end
+  if G.revealed == N - MINES then G.state = "won" end
+end
+
+create function chord(idx)
+  if opened[idx] == false or cnt[idx] == 0 then return end
+  create nb = neighbors(idx)
+  create f = 0
+  repeat v, k in nb do
+    if flagged[v] then f += 1 end
+  end
+  if f == cnt[idx] then
+    repeat v, k in nb do
+      if G.state == "play" then reveal(v) end
+    end
+  end
+end
+
+create function toggle_flag(idx)
+  if opened[idx] then return end
+  if flagged[idx] then
+    flagged[idx] = false
+    G.flags -= 1
+  else
+    flagged[idx] = true
+    G.flags += 1
+  end
+end
+
+
+create function draw_flag(cx, cy)
+  window.line(cx, cy - 9, cx, cy + 9, "black")
+  window.triangle(cx, cy - 10, cx, cy + 1, cx - 10, cy - 5, "red")
+  window.rect(cx - 6, cy + 9, 12, 3, "black")
+end
+
+create function draw_mine(cx, cy)
+  window.circle(cx, cy, 8, "black")
+  window.line(cx - 11, cy, cx + 11, cy, "black")
+  window.line(cx, cy - 11, cx, cy + 11, "black")
+  window.line(cx - 8, cy - 8, cx + 8, cy + 8, "black")
+  window.line(cx - 8, cy + 8, cx + 8, cy - 8, "black")
+  window.circle(cx - 3, cy - 3, 2, "white")
+end
+
+create function draw_cell(idx)
+  create x = (idx % COLS) * CELL
+  create y = TOP + math.floor(idx / COLS) * CELL
+  create cx = x + CELL / 2
+  create cy = y + CELL / 2
+  create over = G.state == "lost" or G.state == "won"
+
+  if opened[idx] then
+    window.rect(x + 1, y + 1, CELL - 2, CELL - 2, "#d9dcec")
+    if cnt[idx] > 0 then
+      create s = tostring(cnt[idx])
+      create tw, th = window.text_size(s, 22)
+      window.text(s, cx - tw / 2, cy - th / 2, NUMCOL[cnt[idx] - 1], 22)
+    end
+  else
+    if over and mine[idx] then
+      if idx == G.hit then
+        window.rect(x + 1, y + 1, CELL - 2, CELL - 2, "red")
+      else
+        window.rect(x + 1, y + 1, CELL - 2, CELL - 2, "#d9dcec")
+      end
+      if G.state == "won" then draw_flag(cx, cy) else draw_mine(cx, cy) end
+    else
+      window.rect(x + 1, y + 1, CELL - 2, CELL - 2, "#6f7aa6")
+      window.rect(x + 1, y + 1, CELL - 4, CELL - 4, "#b4bce0")
+      window.rect(x + 4, y + 4, CELL - 8, CELL - 8, "#97a1cf")
+      if flagged[idx] then
+        draw_flag(cx, cy)
+        if G.state == "lost" and mine[idx] == false then
+          window.line(x + 5, y + 5, x + CELL - 5, y + CELL - 5, "red")
+          window.line(x + 5, y + CELL - 5, x + CELL - 5, y + 5, "red")
+        end
+      end
+    end
+  end
+end
+
+create function draw_face()
+  create fx = W / 2
+  create fy = 32
+  window.circle(fx, fy, 21, "black")
+  window.circle(fx, fy, 19, "yellow")
+  if G.state == "won" then
+    window.rect(fx - 13, fy - 9, 11, 7, "black")
+    window.rect(fx + 2, fy - 9, 11, 7, "black")
+    window.line(fx - 2, fy - 7, fx + 2, fy - 7, "black")
+    window.arc_outline(fx, fy + 1, 10, 0.3, math.pi - 0.3, "black")
+  elseif G.state == "lost" then
+    window.line(fx - 10, fy - 9, fx - 4, fy - 3, "black")
+    window.line(fx - 10, fy - 3, fx - 4, fy - 9, "black")
+    window.line(fx + 4, fy - 9, fx + 10, fy - 3, "black")
+    window.line(fx + 4, fy - 3, fx + 10, fy - 9, "black")
+    window.arc_outline(fx, fy + 12, 8, math.pi, 2 * math.pi, "black")
+  else
+    window.circle(fx - 7, fy - 6, 3, "black")
+    window.circle(fx + 7, fy - 6, 3, "black")
+    window.arc_outline(fx, fy + 1, 10, 0.3, math.pi - 0.3, "black")
+  end
+end
+
+create function draw_counter(x, value)
+  window.rect(x, 14, 88, 38, "black")
+  create v = value
+  if v > 999 then v = 999 end
+  if v < -99 then v = -99 end
+  window.text(string.format("%03d", v), x + 8, 16, "red", 34)
+end
+
+
+math.randomseed(os.time())
+window.start("LUC Minesweeper", W, H)
+reset()
+
+while window.running() do
+  create dt = window.delta()
+
+  if window.key_pressed("escape") then window.quit() end
+  if window.key_pressed("r") then reset() end
+
+  create mx, my = window.mouse()
+  create lp = window.mouse_pressed("left")
+  create rp = window.mouse_pressed("right")
+
+  if G.state == "play" then G.elapsed += dt end
+
+  if lp and my < TOP then
+    create dx = mx - W / 2
+    create dy = my - 32
+    if dx * dx + dy * dy <= 22 * 22 then reset() end
+  end
+
+  if (lp or rp) and my >= TOP and mx >= 0 and mx < W then
+    create cx = math.floor(mx / CELL)
+    create cy = math.floor((my - TOP) / CELL)
+    if cx >= 0 and cx < COLS and cy >= 0 and cy < ROWS then
+      create idx = cy * COLS + cx
+      if G.state == "ready" or G.state == "play" then
+        if lp then
+          if G.state == "ready" then
+            place_mines(idx)
+            G.state = "play"
+          end
+          if opened[idx] then chord(idx) else reveal(idx) end
+        else
+          toggle_flag(idx)
+        end
+      end
+    end
+  end
+
+  window.clear("#2b2f4a")
+  draw_counter(16, MINES - G.flags)
+  draw_counter(W - 104, math.floor(G.elapsed))
+  draw_face()
+  repeat 1, N as i do
+    draw_cell(i)
+  end
+
+  if G.state == "won" then
+    window.rect(0, TOP + 190, W, 80, {"r": 0, "g": 0, "b": 0, "a": 150})
+    window.text_center("YOU WIN!", TOP + 200, "lime", 44)
+    window.text_center("Click R to play again", TOP + 248, "white", 18)
+  elseif G.state == "lost" then
+    window.rect(0, TOP + 190, W, 80, {"r": 0, "g": 0, "b": 0, "a": 150})
+    window.text_center("BOOM!", TOP + 200, "red", 44)
+    window.text_center("Click R to play again", TOP + 248, "white", 18)
+  end
+
+  window.update()
+end
+window.close()

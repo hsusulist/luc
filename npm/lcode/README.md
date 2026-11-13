@@ -9,7 +9,9 @@ lcode path/to/file.luc
 
 On Linux, the package compiles the included terminal editor during installation.
 Install GCC or Clang first (or set `CC` to your compiler). `lcode --install`
-rebuilds it.
+rebuilds it. Enter keeps the current indentation and adds four spaces inside
+common language blocks, including matching closers for languages such as LUC,
+Lua, C, and Rust.
 
 The package downloads and verifies the dedicated `lcode-portable.zip` release
 asset and installs it to `%LOCALAPPDATA%\Programs\LCode` on Windows. It does

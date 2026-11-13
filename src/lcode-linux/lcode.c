@@ -63,6 +63,298 @@ static void lc_linux_insert(LcLinuxEditor *e, char c) {
     e->dirty = 1;
 }
 
+static int lc_linux_word_char(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static unsigned char lc_linux_lower(unsigned char c) {
+    return c >= 'A' && c <= 'Z' ? (unsigned char)(c + ('a' - 'A')) : c;
+}
+
+static int lc_linux_starts_word(const char *s, const char *word) {
+    size_t i = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    while (word[i] && lc_linux_lower((unsigned char)s[i]) == lc_linux_lower((unsigned char)word[i])) i++;
+    return word[i] == 0 && !lc_linux_word_char((unsigned char)s[i]);
+}
+
+static int lc_linux_ends_word(const char *s, const char *word) {
+    size_t n = strlen(s), m = strlen(word), i;
+    while (n && (s[n - 1] == ' ' || s[n - 1] == '\t')) n--;
+    if (n < m) return 0;
+    for (i = 0; i < m; i++) {
+        if (lc_linux_lower((unsigned char)s[n - m + i]) != lc_linux_lower((unsigned char)word[i])) return 0;
+    }
+    return n == m || !lc_linux_word_char((unsigned char)s[n - m - 1]);
+}
+
+static int lc_linux_has_word(const char *s, const char *word) {
+    size_t i, n = strlen(s), m = strlen(word), j;
+    if (!m || m > n) return 0;
+    for (i = 0; i + m <= n; i++) {
+        if (i && lc_linux_word_char((unsigned char)s[i - 1])) continue;
+        if (i + m < n && lc_linux_word_char((unsigned char)s[i + m])) continue;
+        for (j = 0; j < m; j++) {
+            if (lc_linux_lower((unsigned char)s[i + j]) != lc_linux_lower((unsigned char)word[j])) break;
+        }
+        if (j == m) return 1;
+    }
+    return 0;
+}
+
+static int lc_linux_ext(const char *path, const char *ext) {
+    const char *dot = strrchr(path, '.');
+    size_t i, n = strlen(ext);
+    if (!dot || strlen(dot + 1) != n) return 0;
+    for (i = 0; i < n; i++) {
+        if (lc_linux_lower((unsigned char)dot[i + 1]) != lc_linux_lower((unsigned char)ext[i])) return 0;
+    }
+    return 1;
+}
+
+static void lc_linux_strip_comment(char *s, const char *path) {
+    int quote = 0, escape = 0;
+    int hash = lc_linux_ext(path, "py") || lc_linux_ext(path, "sh") ||
+               lc_linux_ext(path, "bash") || lc_linux_ext(path, "zsh") ||
+               lc_linux_ext(path, "rb") || lc_linux_ext(path, "pl") ||
+               lc_linux_ext(path, "r") || lc_linux_ext(path, "yaml") ||
+               lc_linux_ext(path, "yml");
+    int dash = !path[0] || lc_linux_ext(path, "luc") || lc_linux_ext(path, "lua") ||
+               lc_linux_ext(path, "sql");
+    int slash = lc_linux_ext(path, "c") || lc_linux_ext(path, "h") ||
+                lc_linux_ext(path, "cpp") || lc_linux_ext(path, "hpp") ||
+                lc_linux_ext(path, "cc") || lc_linux_ext(path, "cxx") ||
+                lc_linux_ext(path, "js") || lc_linux_ext(path, "ts") ||
+                lc_linux_ext(path, "java") || lc_linux_ext(path, "go") ||
+                lc_linux_ext(path, "rs") || lc_linux_ext(path, "cs") ||
+                lc_linux_ext(path, "kt") || lc_linux_ext(path, "swift") ||
+                lc_linux_ext(path, "dart") || lc_linux_ext(path, "scala") ||
+                lc_linux_ext(path, "php") || lc_linux_ext(path, "css") ||
+                lc_linux_ext(path, "scss") || lc_linux_ext(path, "less") ||
+                lc_linux_ext(path, "tf") || lc_linux_ext(path, "hcl");
+    size_t i, n = strlen(s);
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (quote) {
+            if (escape) escape = 0;
+            else if (c == '\\') escape = 1;
+            else if (c == (unsigned char)quote) quote = 0;
+            continue;
+        }
+        if (c == '\'' || c == '"' || c == '`') { quote = c; continue; }
+        if (hash && c == '#') { s[i] = 0; return; }
+        if (dash && c == '-' && s[i + 1] == '-') { s[i] = 0; return; }
+        if (slash && c == '/' && s[i + 1] == '/') { s[i] = 0; return; }
+        if (slash && c == '/' && s[i + 1] == '*') { s[i] = 0; return; }
+    }
+}
+
+static int lc_linux_html_block(const char *s, char *closer, size_t cap) {
+    static const char *voids[] = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr", NULL
+    };
+    char tag[128];
+    size_t n = strlen(s), i = 1, j = 0, k;
+    if (n < 3 || s[0] != '<' || s[1] == '/' || s[1] == '!' ||
+        s[1] == '?' || s[n - 1] != '>') return 0;
+    while (i < n - 1 && ((s[i] >= 'a' && s[i] <= 'z') ||
+           (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') ||
+           s[i] == ':' || s[i] == '-')) {
+        if (j + 1 >= sizeof tag) return 0;
+        tag[j++] = s[i++];
+    }
+    if (!j || s[n - 2] == '/') return 0;
+    tag[j] = 0;
+    for (k = 0; voids[k]; k++) {
+        size_t a = strlen(tag), b = strlen(voids[k]), x;
+        if (a != b) continue;
+        for (x = 0; x < a; x++) {
+            if (lc_linux_lower((unsigned char)tag[x]) != lc_linux_lower((unsigned char)voids[k][x])) break;
+        }
+        if (x == a) return 0;
+    }
+    return snprintf(closer, cap, "</%s>", tag) < (int)cap;
+}
+
+static int lc_linux_block(const char *path, char *code, char *closer, size_t cap) {
+    static const char *py_blocks[] = {
+        "if", "elif", "else", "for", "while", "def", "class", "try",
+        "except", "finally", "with", "match", "case", NULL
+    };
+    static const char *end_blocks[] = {
+        "def", "class", "module", "if", "unless", "while", "until",
+        "for", "begin", "case", NULL
+    };
+    size_t n = strlen(code), i;
+    const char *p = code;
+    closer[0] = 0;
+    while (n && (code[n - 1] == ' ' || code[n - 1] == '\t' || code[n - 1] == '\r')) code[--n] = 0;
+    if (!n) return 0;
+    if (code[n - 1] == '{') return snprintf(closer, cap, "}") < (int)cap;
+    if ((lc_linux_ext(path, "json") || lc_linux_ext(path, "js") ||
+         lc_linux_ext(path, "py") || lc_linux_ext(path, "c") ||
+         lc_linux_ext(path, "h") || lc_linux_ext(path, "go") ||
+         lc_linux_ext(path, "rs") || lc_linux_ext(path, "java") ||
+         lc_linux_ext(path, "cs") || lc_linux_ext(path, "ts") ||
+         lc_linux_ext(path, "php")) && code[n - 1] == '[') {
+        return snprintf(closer, cap, "]") < (int)cap;
+    }
+    if (lc_linux_ext(path, "html") || lc_linux_ext(path, "htm") ||
+        lc_linux_ext(path, "xml") || lc_linux_ext(path, "svg")) {
+        return lc_linux_html_block(code, closer, cap);
+    }
+    if (lc_linux_ext(path, "py")) {
+        if (code[n - 1] != ':') return 0;
+        if (lc_linux_starts_word(p, "async")) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+        for (i = 0; py_blocks[i]; i++) if (lc_linux_starts_word(p, py_blocks[i])) return 1;
+        return 0;
+    }
+    if (lc_linux_ext(path, "yaml") || lc_linux_ext(path, "yml")) return code[n - 1] == ':';
+    if (!path[0] || lc_linux_ext(path, "luc") || lc_linux_ext(path, "lua")) {
+        if (lc_linux_starts_word(code, "else") || lc_linux_starts_word(code, "elseif")) return 1;
+        if (lc_linux_ext(path, "lua") && lc_linux_ends_word(code, "repeat")) {
+            return snprintf(closer, cap, "until") < (int)cap;
+        }
+        if (lc_linux_ends_word(code, "then") || lc_linux_ends_word(code, "do") ||
+            (lc_linux_has_word(code, "function") && code[n - 1] == ')') ||
+            (lc_linux_starts_word(code, "command") && code[n - 1] == ')')) {
+            return snprintf(closer, cap, "end") < (int)cap;
+        }
+        return 0;
+    }
+    if (lc_linux_ext(path, "rb") || lc_linux_ext(path, "pl")) {
+        if (lc_linux_starts_word(code, "else") || lc_linux_starts_word(code, "elsif") ||
+            lc_linux_starts_word(code, "when") || lc_linux_starts_word(code, "rescue") ||
+            lc_linux_starts_word(code, "ensure") || lc_linux_starts_word(code, "continue")) return 1;
+        for (i = 0; end_blocks[i]; i++) {
+            if (lc_linux_starts_word(code, end_blocks[i])) return snprintf(closer, cap, "end") < (int)cap;
+        }
+        if (lc_linux_ends_word(code, "do") || lc_linux_has_word(code, "do")) {
+            return snprintf(closer, cap, "end") < (int)cap;
+        }
+        if ((lc_linux_ext(path, "pl") && lc_linux_starts_word(code, "sub")) ||
+            (lc_linux_ext(path, "rb") && lc_linux_starts_word(code, "def"))) {
+            return snprintf(closer, cap, "end") < (int)cap;
+        }
+    }
+    if (lc_linux_ext(path, "sh") || lc_linux_ext(path, "bash") || lc_linux_ext(path, "zsh")) {
+        if (lc_linux_starts_word(code, "else") || lc_linux_starts_word(code, "elif")) return 1;
+        if (lc_linux_starts_word(code, "case") && lc_linux_ends_word(code, "in")) {
+            return snprintf(closer, cap, "esac") < (int)cap;
+        }
+        if (lc_linux_ends_word(code, "then")) return snprintf(closer, cap, "fi") < (int)cap;
+        if (lc_linux_ends_word(code, "do")) return snprintf(closer, cap, "done") < (int)cap;
+    }
+    if (lc_linux_ext(path, "sql")) {
+        if (lc_linux_starts_word(code, "else") || lc_linux_starts_word(code, "when")) return 1;
+        if (lc_linux_ends_word(code, "case") || lc_linux_ends_word(code, "begin")) {
+            return snprintf(closer, cap, "END;") < (int)cap;
+        }
+        if (lc_linux_ends_word(code, "then")) {
+            return snprintf(closer, cap, lc_linux_has_word(code, "if") ? "END IF;" : "END;") < (int)cap;
+        }
+        if (lc_linux_ends_word(code, "loop")) return snprintf(closer, cap, "END LOOP;") < (int)cap;
+    }
+    return 0;
+}
+
+static int lc_linux_tail_closer(const char *tail, const char *closer) {
+    size_t i = 0, j, n = strlen(tail), m = strlen(closer);
+    while (i < n && (tail[i] == ' ' || tail[i] == '\t' || tail[i] == '\r')) i++;
+    if (n - i < m) return 0;
+    for (j = 0; j < m; j++) {
+        if (lc_linux_lower((unsigned char)tail[i + j]) != lc_linux_lower((unsigned char)closer[j])) return 0;
+    }
+    i += m;
+    while (i < n && (tail[i] == ' ' || tail[i] == '\t' || tail[i] == '\r')) i++;
+    if (i < n && tail[i] == ';') i++;
+    while (i < n && (tail[i] == ' ' || tail[i] == '\t' || tail[i] == '\r')) i++;
+    return i == n;
+}
+
+static void lc_linux_newline(LcLinuxEditor *e) {
+    size_t start = lc_linux_line_start(e, e->cursor);
+    size_t end = lc_linux_line_end(e, e->cursor);
+    size_t prefix_len = e->cursor - start, tail_len = end - e->cursor;
+    size_t base_len = 0, inner_len, close_len = 0, i, insert_len;
+    char closer[256], *prefix, *code_buf, *code, *tail, *base, *insert;
+    int block, has_closer, tail_blank = 1, make_closer;
+    const char *path = e->path;
+    prefix = (char *)malloc(prefix_len + 1);
+    code_buf = (char *)malloc(prefix_len + 1);
+    tail = (char *)malloc(tail_len + 1);
+    if (!prefix || !code_buf || !tail) {
+        free(prefix); free(code_buf); free(tail);
+        snprintf(e->status, sizeof e->status, "out of memory");
+        return;
+    }
+    memcpy(prefix, e->data + start, prefix_len); prefix[prefix_len] = 0;
+    memcpy(code_buf, prefix, prefix_len + 1); code = code_buf;
+    memcpy(tail, e->data + e->cursor, tail_len); tail[tail_len] = 0;
+    lc_linux_strip_comment(code, path);
+    while (*code == ' ' || *code == '\t') code++;
+    block = lc_linux_block(path, code, closer, sizeof closer);
+    while (e->data[start + base_len] == ' ' || e->data[start + base_len] == '\t') base_len++;
+    base = (char *)malloc(base_len + 1);
+    if (!base) {
+        free(prefix); free(code_buf); free(tail);
+        snprintf(e->status, sizeof e->status, "out of memory");
+        return;
+    }
+    memcpy(base, e->data + start, base_len); base[base_len] = 0;
+    for (i = 0; i < tail_len; i++) {
+        if (tail[i] != ' ' && tail[i] != '\t' && tail[i] != '\r') { tail_blank = 0; break; }
+    }
+    has_closer = block && closer[0] && lc_linux_tail_closer(tail, closer);
+    if (block && !tail_blank && !has_closer) block = 0;
+    make_closer = block && closer[0];
+    inner_len = base_len + (block ? 4 : 0);
+    insert_len = 1 + inner_len;
+    if (make_closer) {
+        if (has_closer) {
+            size_t first = 0, last = tail_len;
+            while (first < last && (tail[first] == ' ' || tail[first] == '\t' || tail[first] == '\r')) first++;
+            while (last > first && (tail[last - 1] == ' ' || tail[last - 1] == '\t' || tail[last - 1] == '\r')) last--;
+            close_len = last - first;
+            memmove(tail, tail + first, close_len);
+        } else {
+            close_len = strlen(closer);
+        }
+        insert_len += 1 + base_len + close_len;
+    }
+    insert = (char *)malloc(insert_len);
+    if (!insert || !lc_linux_reserve(e, insert_len)) {
+        free(prefix); free(code_buf); free(tail); free(base); free(insert);
+        snprintf(e->status, sizeof e->status, "out of memory");
+        return;
+    }
+    i = 0;
+    insert[i++] = '\n';
+    memcpy(insert + i, base, base_len); i += base_len;
+    if (block) { memcpy(insert + i, "    ", 4); i += 4; }
+    if (make_closer) {
+        insert[i++] = '\n';
+        memcpy(insert + i, base, base_len); i += base_len;
+        memcpy(insert + i, has_closer ? tail : closer, close_len); i += close_len;
+    }
+    if (block && tail_len) {
+        memmove(e->data + e->cursor, e->data + end, e->len - end + 1);
+        e->len -= tail_len;
+    }
+    memmove(e->data + e->cursor + insert_len, e->data + e->cursor,
+            e->len - e->cursor + 1);
+    memcpy(e->data + e->cursor, insert, insert_len);
+    e->cursor += 1 + inner_len;
+    e->len += insert_len;
+    e->dirty = 1;
+    free(prefix); free(code_buf); free(tail); free(base); free(insert);
+}
+
 static int lc_linux_save(LcLinuxEditor *e) {
     FILE *f;
     if (!e->path[0]) {
@@ -271,7 +563,7 @@ static void lc_code(const char *start) {
                 e.dirty = 1;
             }
         } else if (key == 13) {
-            lc_linux_insert(&e, '\n');
+            lc_linux_newline(&e);
         } else if (key >= 32 && key <= 255) {
             lc_linux_insert(&e, (char)key);
         }

@@ -97,20 +97,33 @@ static unsigned strhash(const char *s,int len){
     return h;
 }
 static void strtab_grow(void){
-    int nc = V.strcap*2, i;
-    Str **nt = (Str**)lcalloc(sizeof(Str*)*nc);
-    for(i=0;i<V.strcap;i++){
-        Str *s=V.strtab[i];
-        while(s){ Str *nx=s->snext; unsigned k=s->hash&(nc-1);
+    int oldcap=V.strcap, nc;
+    if(oldcap<=0) nc=16;
+    else {
+        if(oldcap>INT_MAX/2){
+            fputs("luc: too many interned strings\n",stderr);
+            exit(1);
+        }
+        nc=oldcap*2;
+    }
+    if((size_t)nc > ((size_t)-1)/sizeof(Str*)) luc_error("out of memory");
+    Str **nt = (Str**)lcalloc(sizeof(Str*)*(size_t)nc);
+    for(int i=0;i<oldcap;i++){
+        Str *s=V.strtab ? V.strtab[i] : NULL;
+        while(s){ Str *nx=s->snext; unsigned k=s->hash&(unsigned)(nc-1);
                   s->snext=nt[k]; nt[k]=s; s=nx; }
     }
     free(V.strtab); V.strtab=nt; V.strcap=nc;
 }
 Str *str_new(const char *s,int len){
+    if(len<0||!s) luc_error("invalid string");
+    if(V.strcap <= 0 || !V.strtab) strtab_grow();
     unsigned h=strhash(s,len);
     unsigned k=h&(unsigned)(V.strcap-1);
     for(Str *p=V.strtab[k];p;p=p->snext)
         if(p->len==len && memcmp(p->s,s,(size_t)len)==0) return p;
+    if(V.nstr>=V.strcap-V.strcap/4-1) strtab_grow();
+    k=h&(unsigned)(V.strcap-1);
     Str *ns=(Str*)lmalloc(sizeof(Str)+(size_t)len);
     ns->o.type=LT_STR; ns->o.marked=0; ns->o.next=NULL;
     ns->len=len; ns->hash=h;
@@ -118,7 +131,6 @@ Str *str_new(const char *s,int len){
     ns->s[len]=0;
     ns->snext=V.strtab[k]; V.strtab[k]=ns;
     V.nstr++; V.nalloc++;
-    if(V.nstr > V.strcap) strtab_grow();
     return ns;
 }
 

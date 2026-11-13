@@ -1,3 +1,235 @@
+static int ed_indent_word_char(unsigned char c){
+    return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_';
+}
+static unsigned char ed_indent_lower(unsigned char c){
+    return c>='A'&&c<='Z'?(unsigned char)(c+('a'-'A')):c;
+}
+static int ed_indent_starts_word(const char *s,const char *word){
+    size_t i=0;
+    while(*s==' '||*s=='\t') s++;
+    while(word[i]&&ed_indent_lower((unsigned char)s[i])==ed_indent_lower((unsigned char)word[i])) i++;
+    return word[i]==0&&!ed_indent_word_char((unsigned char)s[i]);
+}
+static int ed_indent_ends_word(const char *s,const char *word){
+    size_t n=strlen(s),m=strlen(word),i;
+    while(n&& (s[n-1]==' '||s[n-1]=='\t')) n--;
+    if(n<m) return 0;
+    for(i=0;i<m;i++) if(ed_indent_lower((unsigned char)s[n-m+i])!=ed_indent_lower((unsigned char)word[i])) return 0;
+    return n==m||!ed_indent_word_char((unsigned char)s[n-m-1]);
+}
+static int ed_indent_has_word(const char *s,const char *word){
+    size_t i,n=strlen(s),m=strlen(word),j;
+    if(!m||m>n) return 0;
+    for(i=0;i+m<=n;i++){
+        if(i&&ed_indent_word_char((unsigned char)s[i-1])) continue;
+        if(i+m<n&&ed_indent_word_char((unsigned char)s[i+m])) continue;
+        for(j=0;j<m;j++) if(ed_indent_lower((unsigned char)s[i+j])!=ed_indent_lower((unsigned char)word[j])) break;
+        if(j==m) return 1;
+    }
+    return 0;
+}
+static int ed_indent_hash_comment(int lang){
+    return lang==L_PY||lang==L_SH||lang==L_PS||lang==L_RUBY||lang==L_PERL||
+           lang==L_R||lang==L_YAML||lang==L_TOML||lang==L_INI||
+           lang==L_DOCKER||lang==L_MAKE;
+}
+static int ed_indent_dash_comment(int lang){
+    return lang==L_LUC||lang==L_LUA||lang==L_SQL;
+}
+static int ed_indent_slash_comment(int lang){
+    return lang==L_C||lang==L_JS||lang==L_JAVA||lang==L_GO||lang==L_RUST||
+           lang==L_CS||lang==L_KOTLIN||lang==L_SWIFT||lang==L_DART||
+           lang==L_SCALA||lang==L_PHP||lang==L_CSS||lang==L_HCL;
+}
+static void ed_indent_strip_comment(char *s,int lang){
+    int quote=0,escape=0;
+    size_t i,n=strlen(s);
+    for(i=0;i<n;i++){
+        unsigned char c=(unsigned char)s[i];
+        if(quote){
+            if(escape) escape=0;
+            else if(c=='\\') escape=1;
+            else if(c==(unsigned char)quote) quote=0;
+            continue;
+        }
+        if(c=='\''||c=='"'||c=='`'){ quote=c; continue; }
+        if(ed_indent_hash_comment(lang)&&c=='#'){ s[i]=0; return; }
+        if(ed_indent_dash_comment(lang)&&c=='-'&&s[i+1]=='-'){ s[i]=0; return; }
+        if(ed_indent_slash_comment(lang)&&c=='/'&&s[i+1]=='/'){ s[i]=0; return; }
+        if(ed_indent_slash_comment(lang)&&c=='/'&&s[i+1]=='*'){ s[i]=0; return; }
+        if(lang==L_HTML&&c=='<'&&i+3<n&&s[i+1]=='!'&&s[i+2]=='-'&&s[i+3]=='-'){ s[i]=0; return; }
+    }
+}
+static int ed_indent_html_block(const char *s,char *closer,size_t cap){
+    static const char *voids[]={"area","base","br","col","embed","hr","img","input","link","meta","param","source","track","wbr",NULL};
+    char tag[128];
+    size_t n=strlen(s),i=1,j=0,k;
+    if(n<3||s[0]!='<'||s[1]=='/'||s[1]=='!'||s[1]=='?'||s[n-1]!='>') return 0;
+    while(i<n-1&&((s[i]>='a'&&s[i]<='z')||(s[i]>='A'&&s[i]<='Z')||
+                  (s[i]>='0'&&s[i]<='9')||s[i]==':'||s[i]=='-')){
+        if(j+1>=sizeof tag) return 0;
+        tag[j++]=s[i++];
+    }
+    if(!j||s[n-2]=='/') return 0;
+    tag[j]=0;
+    for(k=0;voids[k];k++){
+        size_t a=strlen(tag),b=strlen(voids[k]),x;
+        if(a!=b) continue;
+        for(x=0;x<a;x++) if(ed_indent_lower((unsigned char)tag[x])!=ed_indent_lower((unsigned char)voids[k][x])) break;
+        if(x==a) return 0;
+    }
+    if(snprintf(closer,cap,"</%s>",tag)>=(int)cap) return 0;
+    return 1;
+}
+static int ed_indent_block(int lang,char *code,char *closer,size_t cap){
+    static const char *py_blocks[]={"if","elif","else","for","while","def","class","try","except","finally","with","match","case",NULL};
+    static const char *end_blocks[]={"def","class","module","if","unless","while","until","for","begin","case",NULL};
+    size_t n=strlen(code),i;
+    const char *p=code;
+    closer[0]=0;
+    while(n&&(code[n-1]==' '||code[n-1]=='\t')) code[--n]=0;
+    if(!n) return 0;
+    if(code[n-1]=='{'){ snprintf(closer,cap,"}"); return 1; }
+    if((lang==L_JSON||lang==L_JS||lang==L_PY||lang==L_C||lang==L_GO||
+        lang==L_RUST||lang==L_CS||lang==L_JAVA||lang==L_KOTLIN||lang==L_SWIFT||
+        lang==L_DART||lang==L_SCALA||lang==L_PHP)&&code[n-1]=='['){
+        snprintf(closer,cap,"]"); return 1;
+    }
+    if(lang==L_HTML) return ed_indent_html_block(code,closer,cap);
+    if(lang==L_PY){
+        if(code[n-1]!=':') return 0;
+        if(ed_indent_starts_word(p,"async")){ p+=5; while(*p==' '||*p=='\t') p++; }
+        for(i=0;py_blocks[i];i++) if(ed_indent_starts_word(p,py_blocks[i])) return 1;
+        return 0;
+    }
+    if(lang==L_YAML) return code[n-1]==':';
+    if(lang==L_LUC||lang==L_LUA){
+        if(ed_indent_starts_word(code,"else")||ed_indent_starts_word(code,"elseif")) return 1;
+        if(lang==L_LUA&&ed_indent_ends_word(code,"repeat")){
+            snprintf(closer,cap,"until"); return 1;
+        }
+        if(ed_indent_ends_word(code,"then")||ed_indent_ends_word(code,"do")||
+           (ed_indent_has_word(code,"function")&&code[n-1]==')')||
+           (ed_indent_starts_word(code,"command")&&code[n-1]==')')){
+            snprintf(closer,cap,"end"); return 1;
+        }
+        return 0;
+    }
+    if(lang==L_RUBY||lang==L_PERL){
+        if(ed_indent_starts_word(code,"else")||ed_indent_starts_word(code,"elsif")||
+           ed_indent_starts_word(code,"when")||ed_indent_starts_word(code,"rescue")||
+           ed_indent_starts_word(code,"ensure")||ed_indent_starts_word(code,"continue")) return 1;
+        for(i=0;end_blocks[i];i++) if(ed_indent_starts_word(code,end_blocks[i])){
+            snprintf(closer,cap,"end"); return 1;
+        }
+        if(ed_indent_ends_word(code,"do")||ed_indent_has_word(code,"do")){ snprintf(closer,cap,"end"); return 1; }
+        if((lang==L_PERL&&ed_indent_starts_word(code,"sub"))||
+           (lang==L_RUBY&&ed_indent_starts_word(code,"def"))){
+            snprintf(closer,cap,"end"); return 1;
+        }
+        return 0;
+    }
+    if(lang==L_SH){
+        if(ed_indent_starts_word(code,"else")||ed_indent_starts_word(code,"elif")) return 1;
+        if(ed_indent_starts_word(code,"case")&&ed_indent_ends_word(code,"in")){
+            snprintf(closer,cap,"esac"); return 1;
+        }
+        if(ed_indent_ends_word(code,"then")){ snprintf(closer,cap,"fi"); return 1; }
+        if(ed_indent_ends_word(code,"do")){ snprintf(closer,cap,"done"); return 1; }
+        return 0;
+    }
+    if(lang==L_SQL){
+        if(ed_indent_starts_word(code,"else")||ed_indent_starts_word(code,"when")) return 1;
+        if(ed_indent_ends_word(code,"case")){ snprintf(closer,cap,"END;"); return 1; }
+        if(ed_indent_ends_word(code,"begin")){ snprintf(closer,cap,"END;"); return 1; }
+        if(ed_indent_ends_word(code,"then")){
+            snprintf(closer,cap,ed_indent_has_word(code,"if")?"END IF;":"END;");
+            return 1;
+        }
+        if(ed_indent_ends_word(code,"loop")){ snprintf(closer,cap,"END LOOP;"); return 1; }
+    }
+    return 0;
+}
+static int ed_indent_tail_closer(const char *tail,const char *closer){
+    size_t i=0,j=0,n=strlen(tail),m=strlen(closer);
+    while(i<n&&(tail[i]==' '||tail[i]=='\t')) i++;
+    if(n-i<m) return 0;
+    for(j=0;j<m;j++) if(ed_indent_lower((unsigned char)tail[i+j])!=ed_indent_lower((unsigned char)closer[j])) return 0;
+    i+=m;
+    while(i<n&&(tail[i]==' '||tail[i]=='\t')) i++;
+    if(i<n&&tail[i]==';') i++;
+    while(i<n&&(tail[i]==' '||tail[i]=='\t')) i++;
+    return i==n;
+}
+static void ed_newline_smart(Editor *e){
+    EdLine *line;
+    size_t cy,cx,tailLen,baseLen=0,innerLen,closeLen=0,i;
+    char *prefix,*code,*codeBuf,*tail,*base,*inner,*closing;
+    char closer[256];
+    int lang,block,hasCloser,tailBlank=1;
+    ed_clamp(e);
+    if(e->is_binary){ snprintf(e->status,sizeof e->status,"binary file is read-only"); return; }
+    ed_undo_push(e,0);
+    if(e->sel_on) ed_sel_delete(e);
+    e->sel_on=0;
+    ed_clamp(e);
+    cy=e->cy; cx=e->cx; line=&e->ln[cy];
+    tailLen=line->len-cx;
+    prefix=(char*)lmalloc(cx+1); memcpy(prefix,line->b,cx); prefix[cx]=0;
+    tail=(char*)lmalloc(tailLen+1); memcpy(tail,line->b+cx,tailLen); tail[tailLen]=0;
+    codeBuf=(char*)lmalloc(cx+1); memcpy(codeBuf,prefix,cx+1); code=codeBuf;
+    lang=e->path[0]?ed_lang(e->path):L_LUC;
+    ed_indent_strip_comment(code,lang);
+    while(*code==' '||*code=='\t') code++;
+    block=ed_indent_block(lang,code,closer,sizeof closer);
+    while(prefix[baseLen]==' '||prefix[baseLen]=='\t') baseLen++;
+    base=(char*)lmalloc(baseLen+1); memcpy(base,prefix,baseLen); base[baseLen]=0;
+    for(i=0;i<tailLen;i++) if(tail[i]!=' '&&tail[i]!='\t'){ tailBlank=0; break; }
+    hasCloser=block&&closer[0]&&ed_indent_tail_closer(tail,closer);
+    if(block&&!tailBlank&&!hasCloser) block=0;
+    innerLen=baseLen+(block?4:0);
+    inner=(char*)lmalloc(innerLen+1); memcpy(inner,base,baseLen);
+    if(block) memcpy(inner+baseLen,"    ",4);
+    inner[innerLen]=0;
+    if(block&&closer[0]){
+        if(hasCloser){
+            size_t start=0,end=tailLen;
+            while(start<end&&(tail[start]==' '||tail[start]=='\t')) start++;
+            while(end>start&&(tail[end-1]==' '||tail[end-1]=='\t')) end--;
+            closeLen=end-start;
+            closing=(char*)lmalloc(baseLen+closeLen+1);
+            memcpy(closing,base,baseLen); memcpy(closing+baseLen,tail+start,closeLen);
+        } else {
+            closeLen=strlen(closer);
+            closing=(char*)lmalloc(baseLen+closeLen+1);
+            memcpy(closing,base,baseLen); memcpy(closing+baseLen,closer,closeLen);
+        }
+        closing[baseLen+closeLen]=0;
+    } else {
+        closing=NULL;
+    }
+
+    line->b[cx]=0; line->len=cx;
+    ed_ins_line(e,cy+1);
+    if(closing) ed_ins_line(e,cy+2);
+    line=&e->ln[cy]; line->b[cx]=0; line->len=cx;
+    { EdLine *next=&e->ln[cy+1];
+      size_t nextLen=innerLen+(closing?0:tailLen);
+      ed_line_reserve(next,nextLen);
+      memcpy(next->b,inner,innerLen);
+      if(!closing&&tailLen) memcpy(next->b+innerLen,tail,tailLen);
+      next->b[nextLen]=0; next->len=nextLen; }
+    if(closing){
+        EdLine *last=&e->ln[cy+2];
+        ed_line_reserve(last,baseLen+closeLen);
+        memcpy(last->b,closing,baseLen+closeLen);
+        last->b[baseLen+closeLen]=0; last->len=baseLen+closeLen;
+    }
+    e->cy=cy+1; e->cx=innerLen;
+    e->dirty=1; ed_note_edit(e); e->diag_pending=1; e->recovery_pending=1; e->status[0]=0;
+    free(prefix); free(codeBuf); free(tail); free(base); free(inner); free(closing);
+}
+
 /* Keyboard: 1 quits editor */
 static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
     int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
@@ -139,7 +371,7 @@ static int ed_key(Editor *e,HANDLE hin,DWORD old,WORD vk,WCHAR ch,DWORD ctl){
         else if(vk==VK_RIGHT){ ed_move_right(e); e->status[0]=0; }
         return 0;
     }
-    if(ch==13){ if(e->sug_on){ ed_sug_accept(e); return 0; } ed_newline(e); return 0; }
+    if(ch==13){ if(e->sug_on){ ed_sug_accept(e); return 0; } ed_newline_smart(e); return 0; }
     if(ch==8){ ed_backspace(e); ed_sug_update(e); return 0; }
     if(ch==9){ if(e->sug_on){ ed_sug_accept(e); return 0; } ed_insert_bytes(e,"    ",4); ed_sug_update(e); return 0; }
     if(ed_bind_match(e,KB_COPY,vk,ctl)){ if(!ed_sel_empty(e)) ed_copy_sel(e); else ed_copy_line(e); return 0; }
@@ -667,6 +899,38 @@ static void lc_code(const char *start){
                   if(e.naming&&!wasnam) break;   /* naming began: full repaint */
                   if(e.menu||e.naming){ ed_draw_modal(&e); continue; }
                   break; }
+            }
+            if(e.show_git){
+                /* :git modal owns input until dismissed */
+                if(ir.EventType==MOUSE_EVENT){
+                    WORD f=ir.Event.MouseEvent.dwEventFlags;
+                    if(f==MOUSE_MOVED) continue;
+                    if(f==MOUSE_WHEELED){
+                        ed_git_wheel(&e,((short)(ir.Event.MouseEvent.dwButtonState>>16))>0);
+                        ed_draw_modal(&e); continue;
+                    }
+                    if(f==0||f==DOUBLE_CLICK){
+                        DWORD bs=ir.Event.MouseEvent.dwButtonState;
+                        HANDLE hh=GetStdHandle(STD_OUTPUT_HANDLE);
+                        CONSOLE_SCREEN_BUFFER_INFO bb;
+                        int wx=0,wy=0;
+                        if(GetConsoleScreenBufferInfo(hh,&bb)){ wx=bb.srWindow.Left; wy=bb.srWindow.Top; }
+                        if(!(bs&FROM_LEFT_1ST_BUTTON_PRESSED)) continue; /* ignore release/right */
+                        ed_git_click(&e,
+                            (int)ir.Event.MouseEvent.dwMousePosition.X-wx,
+                            (int)ir.Event.MouseEvent.dwMousePosition.Y-wy,
+                            e.vw>0?e.vw:80, e.vh>0?e.vh:24);
+                        if(!e.show_git) e.click_eat=1;
+                        if(e.show_git){ ed_draw_modal(&e); continue; }
+                        break;
+                    }
+                    continue;
+                }
+                if(ir.EventType==WINDOW_BUFFER_SIZE_EVENT) break;
+                if(ir.EventType!=KEY_EVENT||!ir.Event.KeyEvent.bKeyDown) continue;
+                ed_git_key(&e,ir.Event.KeyEvent.wVirtualKeyCode,ir.Event.KeyEvent.uChar.UnicodeChar);
+                if(e.show_git){ ed_draw_modal(&e); continue; }
+                break;
             }
             if(e.show_plugins){
                 /* :plugin modal owns input until dismissed */                if(ir.EventType==MOUSE_EVENT){

@@ -115,34 +115,34 @@ Source: "..\dist\app\luc-win.exe"; DestDir: "{app}"; DestName: "luc.exe"; Compon
 ; SDL2 runtime that goes with it (loaded from the install folder)
 Source: "..\dist\app\SDL2.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
 ; Satellite media DLLs (runtime-bound: TTF text, PNG/JPG images, WAV/OGG/MP3 sound)
-Source: "..\dist\app\SDL2_ttf.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\SDL2_image.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\SDL2_mixer.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libfreetype-6.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libharfbuzz-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbz2-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libpng16-16.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\zlib1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbrotlidec.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbrotlicommon.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libgraphite2.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libglib-2.0-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libintl-8.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libpcre2-8-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libiconv-2.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libjpeg-8.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libmpg123-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libogg-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libopus-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libopusfile-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libvorbis-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libvorbisfile-3.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libFLAC.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libgcc_s_seh-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\app\SDL2_ttf.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\SDL2_image.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\SDL2_mixer.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libfreetype-6.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libharfbuzz-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libbz2-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libpng16-16.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\zlib1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libbrotlidec.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libbrotlicommon.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libgraphite2.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libglib-2.0-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libintl-8.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libpcre2-8-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libiconv-2.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libjpeg-8.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libmpg123-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libogg-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libopus-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libopusfile-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libvorbis-0.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libvorbisfile-3.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libFLAC.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libgcc_s_seh-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
+Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}"; Components: window; Flags: ignoreversion
 ; Default TTF font (Vietnamese-capable) used when the user picks no font
-Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}"; Components: window; Flags: ignoreversion
 ; Console-only build, installed as luc.exe when "window" is unticked
 Source: "..\dist\app\luc-core.exe"; DestDir: "{app}"; DestName: "luc.exe"; Check: ConsoleSelected; Flags: ignoreversion
 ; Optional LCode command; the core build is also used when luc.exe has window support.
@@ -169,33 +169,33 @@ Source: "..\packages\ai.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion
 Source: "..\packages\discord.lucpkg"; DestDir: "{app}\packages"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\dist\app\luc-win.exe"; DestDir: "{app}\packages\window"; DestName: "luc-win.exe"; Flags: ignoreversion
 Source: "..\dist\app\SDL2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
-Source: "..\dist\app\SDL2_ttf.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\SDL2_image.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\SDL2_mixer.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libfreetype-6.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libharfbuzz-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbz2-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libpng16-16.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\zlib1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbrotlidec.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libbrotlicommon.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libgraphite2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libglib-2.0-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libintl-8.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libpcre2-8-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libiconv-2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libjpeg-8.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libmpg123-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libogg-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libopus-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libopusfile-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libvorbis-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libvorbisfile-3.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libFLAC.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libgcc_s_seh-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
-Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}\packages\window"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\dist\app\SDL2_ttf.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\SDL2_image.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\SDL2_mixer.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libfreetype-6.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libharfbuzz-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libbz2-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libpng16-16.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\zlib1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libbrotlidec.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libbrotlicommon.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libgraphite2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libglib-2.0-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libintl-8.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libpcre2-8-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libiconv-2.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libjpeg-8.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libmpg123-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libogg-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libopus-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libopusfile-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libvorbis-0.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libvorbisfile-3.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libFLAC.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libgcc_s_seh-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libstdc++-6.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\libwinpthread-1.dll"; DestDir: "{app}\packages\window"; Flags: ignoreversion
+Source: "..\dist\app\DejaVuSans.ttf"; DestDir: "{app}\packages\window"; Flags: ignoreversion
 ; FiraCode Nerd Font for lcode file icons (registered with Windows, kept on uninstall)
 Source: "..\fonts\FiraCodeNerdFontMono-Regular.ttf"; DestDir: "{fonts}"; FontInstall: "FiraCode Nerd Font Mono"; Flags: skipifsourcedoesntexist uninsneveruninstall sharedfile; Components: lcodefont
 ; LCode plugins (built-in luc example: suggestions, syntax colors, themes)

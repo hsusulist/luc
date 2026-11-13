@@ -1,6 +1,6 @@
 {
   "name": "@hsusulist/luc",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "LUC language installer and launcher",
   "bin": {
     "luc": "bin/luc.js"

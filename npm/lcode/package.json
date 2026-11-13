@@ -1,6 +1,6 @@
 {
   "name": "@hsusulist/lcode",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Standalone LCode terminal editor",
   "bin": {
     "lcode": "bin/lcode.js"

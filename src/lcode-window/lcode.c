@@ -32,6 +32,7 @@ typedef struct { char *data; size_t len, cy, cx, top; int dirty; } EdUndo;
 #define ED_SHHIST 32  /* shell command history */
 #define ED_PFIND_MAX 1000
 #define ED_DIAG_MAX 32
+#define ED_GITFILES 40   /* changed files listed in the :git modal */
 
 typedef struct {
     char text[192];
@@ -140,6 +141,11 @@ typedef struct {
     char set_buf[64]; size_t set_len, set_cur;
     int set_cur_x, set_cur_y; /* caret cell while editing (1-based) */
     int set_full;             /* one full-frame repaint pending after a change */
+    /* :git modal: Commit tab (message) + Sync tab (pull/push) */
+    int show_git, git_tab, git_row, git_left, git_row_top, git_edit, git_cur_x, git_cur_y;
+    char git_msg[256]; size_t git_len, git_cur, git_off;
+    char git_note[160], git_branch[96], git_err[160];
+    char git_files[ED_GITFILES][100]; int git_nfiles, git_nchanged;
     /* Keybind editor: 1 = waiting for a combo, 2 = combo captured, Enter confirms */
     int set_key_cap;
     EdBind set_key_pending;
@@ -241,6 +247,7 @@ static void ed_clamp(Editor *e){
 #include "editor/lcode_render.c"
 #include "explorer/lcode_explorer.c"
 #include "features/lcode_settings.c"
+#include "features/lcode_git.c"
 #include "features/lcode_shell.c"
 #include "editor/lcode_input.c"
 #else

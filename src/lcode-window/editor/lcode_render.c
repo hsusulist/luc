@@ -151,6 +151,7 @@ static void ed_log(Editor *e,const char *fmt,...){    char b[240]; va_list ap;
 static void ed_popup_draw(Editor *e,int W,int H);
 static void ed_plug_draw(Editor *e,int W,int H);
 static void ed_set_draw(Editor *e,int W,int H);
+static void ed_git_draw(Editor *e,int W,int H);
 static void ed_set_click(Editor *e,int x,int y,int W,int H);
 static int ed_set_nrows(Editor *e,int tab);
 static int ed_ex_item_draw(Editor *e,size_t ei,int cwmax);
@@ -168,6 +169,7 @@ static void ed_draw_modal(Editor *e){
     else if(e->naming) ed_nam_draw(e,W,H);
     else if(e->show_plugins) ed_plug_draw(e,W,H);
     else if(e->show_settings) ed_set_draw(e,W,H);
+    else if(e->show_git) ed_git_draw(e,W,H);
     if(sync) printf("\x1b[?2026l");
     fflush(stdout);
 }
@@ -534,13 +536,15 @@ static void ed_draw(Editor *e){
       else if(e->naming) ed_nam_draw(e,W,H);
       if(e->show_plugins) ed_plug_draw(e,W,H);
       if(e->show_settings) ed_set_draw(e,W,H);
+      if(e->show_git) ed_git_draw(e,W,H);
       if(e->fnd_on) ed_fnd_draw(e,W,H);
       if(e->pf_on) ed_pfind_draw(e,W,H);
-      if(!e->fnd_on&&!e->pf_on&&!e->show_settings&&!e->show_plugins&&!e->menu)
+      if(!e->fnd_on&&!e->pf_on&&!e->show_settings&&!e->show_git&&!e->show_plugins&&!e->menu)
           ed_cmd_hint_draw(e,W,H);
       /* Cursor hidden with no file or open menu */
       { size_t dc2=ed_dcol(e);
         if(e->menu||e->show_plugins||e->show_settings) { /* hidden */ }
+        else if(e->show_git){ /* the git modal positions its own caret */ }
         else if(e->fnd_on){ /* the find panel positions its own caret */ }
         else if(e->find_bar){ if(e->find_cx>0) printf("\x1b[%d;%dH\x1b[?25h",e->find_cy,e->find_cx); }
         else if(e->pf_on) { /* pfind draw positions the caret */ }

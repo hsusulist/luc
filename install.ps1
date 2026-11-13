@@ -43,6 +43,10 @@ $script:UseAnsi = $false
 $script:InAltScreen = $false
 $script:Interactive = $false
 $script:Version = ''
+$script:MaintenanceAction = 'install'
+$script:ExistingComponents = @()
+$script:ExistingInstall = $null
+$script:ScriptDirectory = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { $null }
 
 # ---------------------------------------------------------------------------
 # Console helpers
@@ -251,6 +255,153 @@ function Show-SourcePage {
             'Q'         { return -1 }
         }
     }
+}
+
+function Get-InstalledDetails {
+    param([string]$RequestedPath)
+
+    $state = $null
+    $stateFile = Join-Path (Join-Path $env:LOCALAPPDATA 'LUC') 'state.json'
+    if (Test-Path -LiteralPath $stateFile -PathType Leaf) {
+        try {
+            $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Write-Note "Could not read the install state: $($_.Exception.Message)" 'warn'
+        }
+    }
+
+    $path = $RequestedPath
+    if (-not $path -and $script:ScriptDirectory -and
+        (Test-Path -LiteralPath (Join-Path $script:ScriptDirectory 'luc.exe') -PathType Leaf)) {
+        $path = $script:ScriptDirectory
+    }
+    if (-not $path -and $state -and $state.installPath) { $path = [string]$state.installPath }
+    if (-not $path) { $path = $defaultInstallPath }
+    $path = Resolve-InstallPathValue $path
+    if (-not (Test-Path -LiteralPath (Join-Path $path 'luc.exe') -PathType Leaf)) { return $null }
+
+    if ($state -and $state.installPath) {
+        try {
+            $statePath = Resolve-InstallPathValue ([string]$state.installPath)
+            if (-not [string]::Equals($statePath, $path, [StringComparison]::OrdinalIgnoreCase)) {
+                $state = $null
+            }
+        } catch {
+            Write-Note "Could not resolve the install state path: $($_.Exception.Message)" 'warn'
+            $state = $null
+        }
+    } elseif ($RequestedPath) {
+        $state = $null
+    }
+
+    $uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Luc_is1'
+    $registeredPath = $null
+    $registeredVersion = $null
+    try {
+        $registration = Get-ItemProperty -LiteralPath $uninstallKey -ErrorAction Stop
+        $registeredPath = [string]$registration.InstallLocation
+        $registeredVersion = [string]$registration.DisplayVersion
+    } catch { }
+    $registeredMatches = $false
+    if ($registeredPath) {
+        try {
+            $registeredMatches = [string]::Equals(
+                (Resolve-InstallPathValue $registeredPath), $path, [StringComparison]::OrdinalIgnoreCase)
+            if (-not $registeredMatches) { $registeredVersion = $null }
+        } catch {
+            Write-Note "Could not resolve the Windows installer path: $($_.Exception.Message)" 'warn'
+            $registeredPath = $null
+            $registeredVersion = $null
+        }
+    }
+    $innoStateMatches = $state -and $state.source -eq 'inno' -and $state.installPath
+
+    $rawComponents = @()
+    if ($state -and $state.components) {
+        $rawComponents = @($state.components)
+    } else {
+        $manifestFile = Join-Path $path '.luc-manifest.json'
+        if (Test-Path -LiteralPath $manifestFile -PathType Leaf) {
+            try {
+                $manifest = Get-Content -LiteralPath $manifestFile -Raw | ConvertFrom-Json -ErrorAction Stop
+                if ($manifest.components) { $rawComponents = @($manifest.components) }
+            } catch {
+                Write-Note "Could not read the install manifest: $($_.Exception.Message)" 'warn'
+            }
+        }
+    }
+    if ($rawComponents.Count -eq 0) {
+        if ($registeredMatches -or ($innoStateMatches -and -not $registeredPath)) {
+            try {
+                $saved = (Get-ItemProperty -LiteralPath 'HKCU:\Software\LUC' -Name Components -ErrorAction Stop).Components
+                if ($saved) { $rawComponents = @([string]$saved -split '[,\s]+') }
+            } catch { }
+        }
+    }
+
+    $components = @()
+    foreach ($name in $rawComponents) {
+        $name = ([string]$name).ToLowerInvariant()
+        if ($name -eq 'ailib') { $name = 'ai' }
+        if ($optionalComponents -contains $name -and $components -notcontains $name) {
+            $components += $name
+        }
+    }
+
+    $uninstaller = $null
+    if ($innoStateMatches -or $registeredMatches) {
+        $uninstaller = Get-ChildItem -LiteralPath $path -Filter 'unins*.exe' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+    }
+    return [pscustomobject]@{
+        Path        = $path
+        Version     = if ($state -and $state.version) { [string]$state.version } elseif ($registeredVersion) { $registeredVersion } else { 'unknown' }
+        Components  = $components
+        Uninstaller = $uninstaller
+    }
+}
+
+function Show-MaintenancePage {
+    param($Install)
+
+    $items = @(
+        @{ Action = 'libraries'; Label = 'Install libraries'; Desc = 'Add or remove optional components' },
+        @{ Action = 'repair';    Label = 'Fix / reinstall';   Desc = 'Reinstall the current components' }
+    )
+    if ($Install.Uninstaller) {
+        $items += @{ Action = 'uninstall'; Label = 'Uninstall'; Desc = 'Remove LUC from this computer' }
+    }
+    $items += @{ Action = 'cancel'; Label = 'Cancel'; Desc = 'Exit without making changes' }
+    $index = 0
+    while ($true) {
+        Clear-Tui
+        Write-TuiHeader 'LUC is installed' 'Choose an action'
+        Write-Tui ("  Version   {0}" -f $Install.Version)
+        Write-Tui ("  Folder    {0}" -f $Install.Path) '90'
+        Write-Tui ''
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            $marker = if ($i -eq $index) { '>' } else { ' ' }
+            $code = if ($i -eq $index) { '1;36' } else { '' }
+            Write-Tui ("  $marker " + $items[$i].Label) $code
+            Write-Tui ("      " + $items[$i].Desc) '90'
+            Write-Tui ''
+        }
+        Write-TuiFooter 'Up/Down move   Enter select   q quit'
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            'UpArrow'   { $index = ($index - 1 + $items.Count) % $items.Count }
+            'DownArrow' { $index = ($index + 1) % $items.Count }
+            'Enter'     { return $items[$index].Action }
+            'Escape'    { return 'cancel' }
+            'Q'         { return 'cancel' }
+        }
+    }
+}
+
+function Start-InnoUninstaller {
+    param($Install)
+    if (-not $Install.Uninstaller) { throw 'The Windows installer uninstaller was not found.' }
+    Start-Process -FilePath $Install.Uninstaller.FullName -ArgumentList '/NORESTART' | Out-Null
 }
 
 function Show-LicenseEntry {
@@ -846,7 +997,7 @@ public static extern bool MoveFileEx(string existingFileName, string newFileName
 }
 
 function Install-ArchivePlan {
-    param([object[]]$Items)
+    param([object[]]$Items, [string[]]$RemovePaths = @())
     $journal = New-Object System.Collections.ArrayList
     try {
         foreach ($item in $Items) {
@@ -864,6 +1015,13 @@ function Install-ArchivePlan {
             [void]$journal.Add([pscustomobject]@{ Destination = $destination; Old = $old })
             try { Move-Item -LiteralPath $item.Staging -Destination $destination -Force }
             catch { throw "Cannot write '$destination': $($_.Exception.Message)" }
+        }
+        foreach ($destination in $RemovePaths) {
+            if (-not (Test-Path -LiteralPath $destination -PathType Leaf)) { continue }
+            $old = "$destination.luc-old-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            try { Move-Item -LiteralPath $destination -Destination $old -Force }
+            catch { throw "Cannot remove '$destination'. Close the program using it and try again." }
+            [void]$journal.Add([pscustomobject]@{ Destination = $destination; Old = $old })
         }
     } catch {
         $failure = $_
@@ -966,6 +1124,26 @@ $downloadTemp = $null
 $tempChecksumFile = $null
 $zip = $null
 try {
+    if ($script:Interactive -and -not $LCodeOnly -and -not $Components) {
+        $script:ExistingInstall = Get-InstalledDetails -RequestedPath $InstallPath
+        if ($script:ExistingInstall) {
+            Enter-AltScreen
+            $script:MaintenanceAction = Show-MaintenancePage $script:ExistingInstall
+            Exit-AltScreen
+            if ($script:MaintenanceAction -eq 'cancel') {
+                Write-Note 'Installation cancelled.' 'warn'
+                exit 2
+            }
+            if ($script:MaintenanceAction -eq 'uninstall') {
+                Start-InnoUninstaller $script:ExistingInstall
+                Write-Note 'LUC uninstaller started.' 'ok'
+                exit 0
+            }
+            $InstallPath = $script:ExistingInstall.Path
+            $script:ExistingComponents = @($script:ExistingInstall.Components)
+        }
+    }
+
     $sourceSpecified = $PSBoundParameters.ContainsKey('Source')
     if (-not $Source) {
         if ($ArchivePath) { $Source = 'local' } else { $Source = 'github' }
@@ -1081,7 +1259,13 @@ try {
     $licenseText = Read-ZipEntryText $zip 'LICENCE'
     if (-not $licenseText) { $licenseText = 'LUC is free software released under the Apache License 2.0.' }
 
-    $selected = if ($LCodeOnly) { @('lcode') } else { @() }
+    if ($LCodeOnly) {
+        $selected = @('lcode')
+    } elseif ($script:MaintenanceAction -ne 'install') {
+        $selected = @($script:ExistingComponents)
+    } else {
+        $selected = @()
+    }
     if (-not $LCodeOnly -and $Components) {
         foreach ($item in $Components) {
             foreach ($name in ($item -split '[,\s]+')) {
@@ -1094,7 +1278,8 @@ try {
         }
     }
 
-    if (-not $LCodeOnly -and $script:Interactive -and -not $Components) {
+    if (-not $LCodeOnly -and $script:Interactive -and -not $Components -and
+        $script:MaintenanceAction -ne 'repair') {
         Enter-AltScreen
         $picked = Show-ComponentPage -Preselected $selected -LicenseText $licenseText
         Exit-AltScreen
@@ -1113,6 +1298,14 @@ try {
         }
     } else {
         $InstallPath = Resolve-InstallPathValue $InstallPath
+    }
+
+    if (-not $script:ExistingInstall -or
+        -not [string]::Equals($script:ExistingInstall.Path, $InstallPath, [StringComparison]::OrdinalIgnoreCase)) {
+        $script:ExistingInstall = Get-InstalledDetails -RequestedPath $InstallPath
+    }
+    if ($script:ExistingInstall) {
+        $script:ExistingComponents = @($script:ExistingInstall.Components)
     }
 
     $vsCodeTarget = Join-Path $env:USERPROFILE '.vscode\extensions\hsusulist.luc'
@@ -1140,6 +1333,10 @@ try {
             Exit-AltScreen
             if ($null -eq $picked -or -not $InstallPath) { Write-Note 'Installation cancelled.' 'warn'; exit 2 }
             $selected = @($picked)
+            $InstallPath = Resolve-InstallPathValue $InstallPath
+            $script:ExistingInstall = Get-InstalledDetails -RequestedPath $InstallPath
+            $script:ExistingComponents = if ($script:ExistingInstall) { @($script:ExistingInstall.Components) } else { @() }
+            $upgrade = Test-Path -LiteralPath (Join-Path $InstallPath $binaryName) -PathType Leaf
         }
     }
 
@@ -1149,10 +1346,24 @@ try {
         throw "Installation archive did not produce $binaryName."
     }
 
+    $removePaths = @()
+    if ($upgrade -and -not $LCodeOnly -and $script:ExistingComponents.Count -gt 0) {
+        $previousPlan = Get-ArchivePlan -Zip $zip -SelectedComponents $script:ExistingComponents -Target $InstallPath -VsCodeTarget $vsCodeTarget
+        $newDestinations = @{}
+        foreach ($item in $archivePlan.Items) { $newDestinations[$item.Destination.ToLowerInvariant()] = $true }
+        foreach ($item in $previousPlan.Items) {
+            if (-not $newDestinations.ContainsKey($item.Destination.ToLowerInvariant()) -and
+                (Test-Path -LiteralPath $item.Destination -PathType Leaf)) {
+                $removePaths += $item.Destination
+            }
+        }
+    }
+
     $roots = @($InstallPath)
-    if ($selected -contains 'vscode') { $roots += $vsCodeTarget }
+    if (($selected -contains 'vscode') -or ($script:ExistingComponents -contains 'vscode')) { $roots += $vsCodeTarget }
+    $lockItems = @($archivePlan.Items) + @($removePaths | ForEach-Object { @{ Destination = $_ } })
     Write-Step 'Checking for running programs and locked files'
-    Test-InstallLocks -Items $archivePlan.Items -Roots $roots
+    Test-InstallLocks -Items $lockItems -Roots $roots
     Write-StepDone 'No running LUC process blocks the install'
 
     Test-DiskSpace $InstallPath $archivePlan.TotalBytes
@@ -1165,15 +1376,17 @@ try {
     Write-StepDone "Extracted $($archivePlan.Items.Count) files"
 
     Write-Step 'Installing files'
-    Install-ArchivePlan $archivePlan.Items
-    Write-StepDone 'Files installed'
+    Install-ArchivePlan -Items $archivePlan.Items -RemovePaths $removePaths
+    if ($removePaths.Count) { Write-StepDone "Files installed; removed $($removePaths.Count) deselected files" }
+    else { Write-StepDone 'Files installed' }
 
     if (-not (Test-Path -LiteralPath (Join-Path $InstallPath $binaryName) -PathType Leaf)) {
         throw "Installation finished without $binaryName. The previous version was restored."
     }
 
     Write-InstallManifest $script:Version $InstallPath $selected -LCodeOnly:$LCodeOnly
-    Write-InstallState $script:Version $InstallPath $selected $Source -LCodeOnly:$LCodeOnly
+    $stateSource = if ($script:ExistingInstall -and $script:ExistingInstall.Uninstaller) { 'inno' } else { $Source }
+    Write-InstallState $script:Version $InstallPath $selected $stateSource -LCodeOnly:$LCodeOnly
 
     # Keep a copy of this script next to luc.exe so that "luc install" works
     # even when the archive was built before install.ps1 was bundled in it.

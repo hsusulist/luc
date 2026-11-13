@@ -129,6 +129,7 @@ static void ed_cmd_run(Editor *e,const char *cmd){
     if(!strncmp(cmd,"git",3)&&(cmd[3]==0||cmd[3]==' '||cmd[3]=='\t')){
         const char *a=cmd+3,*message=NULL; char action[32]="status";
         while(*a==' '||*a=='\t') a++;
+        if(!*a){ ed_git_open(e); return; }   /* plain :git opens the Commit / Sync window */
         if(*a){
             size_t n=0;
             while(a[n]&&a[n]!=' '&&a[n]!='\t'&&n+1<sizeof action){ action[n]=a[n]; n++; }
@@ -215,7 +216,8 @@ static void ed_cmd_run(Editor *e,const char *cmd){
         ed_log(e,":ff [text] - find files by name");
         ed_log(e,":pf / :pfind - search all project files (Ctrl+Shift+F)");
         ed_log(e,":replace old => new - preview and replace throughout project (F4 twice)");
-        ed_log(e,":git [status|diff|stage|commit <message>] - basic Git actions");
+        ed_log(e,":git - Git window (Commit tab, Sync tab with Pull/Push)");
+        ed_log(e,":git [status|diff|stage|commit <message>] - Git actions printed here");
         ed_log(e,":run - run the current file (F5)");
         ed_log(e,"Ctrl+Tab / Ctrl+Shift+Tab - switch open file tabs");
         ed_log(e,"Ctrl+X/C/V - cut, copy, paste selected code");

@@ -119,22 +119,6 @@ static void ed_backspace(Editor *e){
     }
 }
 
-static void ed_newline(Editor *e){
-    ed_clamp(e);
-    if(e->is_binary){ snprintf(e->status,sizeof e->status,"binary file is read-only"); return; }
-    ed_undo_push(e,0);
-    if(e->sel_on) ed_sel_delete(e);
-    { EdLine *l=&e->ln[e->cy];
-      ed_ins_line(e,e->cy+1);
-      l=&e->ln[e->cy];
-      EdLine *nl=&e->ln[e->cy+1];
-      size_t tail=l->len-e->cx;
-      ed_line_reserve(nl,tail);
-      memcpy(nl->b,l->b+e->cx,tail); nl->b[tail]=0; nl->len=tail;
-      l->b[e->cx]=0; l->len=e->cx;
-      e->cy++; e->cx=0; e->dirty=1; ed_note_edit(e); e->diag_pending=1; e->recovery_pending=1; e->status[0]=0; }
-}
-
 static void ed_copy_line(Editor *e){
     ed_clamp(e);
     { EdLine *l=&e->ln[e->cy];
