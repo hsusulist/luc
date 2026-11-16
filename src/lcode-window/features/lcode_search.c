@@ -207,8 +207,8 @@ static void ed_find_draw(Editor *e,int W,int H){
         if(col+w0>startw){ startw=col; break; }
         col+=w0; first++;
     }
-    printf("\x1b[%d;%dH\x1b[48;2;28;28;28m",y0+1,x0+1);
-    printf("\x1b[90m find \x1b[97m");
+    printf("\x1b[%d;%dH%s",y0+1,x0+1,EC_X[XI_POP]);
+    printf("%s find %s",EC_X[XI_MDIM],EC_X[XI_MFG]);
     for(k=first;k<e->find_len;k++){
         int w0=ed_chw((unsigned char)e->find_buf[k],col);
         if(drawn+w0>qw) break;
@@ -221,10 +221,10 @@ static void ed_find_draw(Editor *e,int W,int H){
     if(e->find_n>0&&e->find_idx>0)
         snprintf(cnt,sizeof cnt," %d/%d found",e->find_idx,e->find_n);
     else snprintf(cnt,sizeof cnt," %d found",e->find_n);
-    printf("\x1b[%d;%dH\x1b[48;2;22;22;22m\x1b[90m",y0+2,x0+1);
+    printf("\x1b[%d;%dH%s%s",y0+2,x0+1,EC_X[XI_MODF],EC_X[XI_MDIM]);
     fputs(cnt,stdout);
     { int lw=(int)strlen(cnt), hw=(int)strlen(hint), pad=bw-lw-hw;
-      if(pad>=2){ for(i=0;i<pad;i++) fputc(' ',stdout); printf("\x1b[90m%s",hint); }
+      if(pad>=2){ for(i=0;i<pad;i++) fputc(' ',stdout); printf("%s%s",EC_X[XI_MDIM],hint); }
       else for(i=lw;i<bw;i++) fputc(' ',stdout); }
     printf("\x1b[0m");
 }
@@ -396,7 +396,6 @@ static void ed_pfind_scroll(Editor *e){
 static int ed_pfind_key(Editor *e,WORD vk,WCHAR ch,DWORD ctl){
     int ctrl=(ctl&(LEFT_CTRL_PRESSED|RIGHT_CTRL_PRESSED))!=0;
     int alt=(ctl&(LEFT_ALT_PRESSED|RIGHT_ALT_PRESSED))!=0;
-    int shift=(ctl&SHIFT_PRESSED)!=0;
     int rows=ed_pfind_rows(e);
     if(ed_bind_match(e,KB_PFIND,vk,ctl)){ ed_pfind_close(e); return 0; }
     if(ch==27||(ch==0&&vk==VK_ESCAPE)){ ed_pfind_close(e); return 0; }
@@ -472,7 +471,7 @@ static int ed_pfind_put_hl(const char *s,const char *q,int maxw){
         if(w+cw>maxw) break;
         if(ql&&matched&&i>=hl&&i<hl+ql) printf("%s",EC_FINDALL);
         fputc(s[i],stdout); w+=cw;
-        if(ql&&matched&&i>=hl&&i<hl+ql) printf("\x1b[97m");
+        if(ql&&matched&&i>=hl&&i<hl+ql) fputs(EC_X[XI_MFG],stdout);
     }
     return w;
 }
@@ -501,7 +500,8 @@ static void ed_pfind_draw(Editor *e,int W,int H){
     lw=6;
     fw=24;
     tw=inner-fw-12; if(tw<10){ tw=10; fw=inner-tw-12; if(fw<8) fw=8; }
-    if(fw>inner-20) fw=inner-20; if(fw<8) fw=8;
+    if(fw>inner-20) fw=inner-20;
+    if(fw<8) fw=8;
     if(e->pf_sel<e->pf_top) e->pf_top=e->pf_sel;
     if(e->pf_sel>=e->pf_top+rows) e->pf_top=e->pf_sel-rows+1;
     if(e->pf_top<0) e->pf_top=0;
@@ -509,12 +509,12 @@ static void ed_pfind_draw(Editor *e,int W,int H){
         snprintf(cnt,sizeof cnt,"%d%s matches / %d files",e->pf_total,e->pf_trunc?"+":"",e->pf_scanned);
     else snprintf(cnt,sizeof cnt,"type to search");
     /* top border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x8c",y0+1,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x90\x1b[0m");
     /* title */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+2,x0+1,TH_TDIM);
-    printf("\x1b[48;2;45;45;45m\x1b[97m");
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+2,x0+1,EC_X[XI_MODB],TH_TDIM);
+    printf("%s%s",EC_X[XI_PAN],EC_X[XI_MFG]);
     { const char *title=" PROJECT SEARCH ";
       const char *hint="Up/Down select  Enter open  Esc close";
       int tl=(int)strlen(title),hl=(int)strlen(hint),hintstart=inner-hl;
@@ -522,10 +522,10 @@ static void ed_pfind_draw(Editor *e,int W,int H){
       for(i=tl;i<inner;i++)
           fputc(inner>tl+hl+1&&i>=hintstart?hint[i-hintstart]:' ',stdout);
     }
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     /* column header */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+3,x0+1,TH_TDIM);
-    printf("\x1b[48;2;30;30;30m\x1b[90m");
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+3,x0+1,EC_X[XI_MODB],TH_TDIM);
+    printf("%s%s",EC_X[XI_MOD],EC_X[XI_MDIM]);
     printf(" TEXT");
     for(i=5;i<tw;i++) fputc(' ',stdout);
     printf(" \xe2\x94\x82 ");
@@ -535,18 +535,18 @@ static void ed_pfind_draw(Editor *e,int W,int H){
     printf("FILE");
     for(i=4;i<fw;i++) fputc(' ',stdout);
     printf("\x1b[0m");
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,EC_X[XI_MODB],TH_TDIM);
     /* separator */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+4,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+4,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     /* results */
     for(r=0;r<rows;r++){
         int idx=e->pf_top+r;
         int yy=y0+5+r,used=0;
         printf("\x1b[%d;%dH",yy,x0+1);
-        if(idx==e->pf_sel&&idx<e->pf_n) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else printf("\x1b[48;2;30;30;30m\x1b[97m");
+        if(idx==e->pf_sel&&idx<e->pf_n) fputs(EC_X[XI_ACC],stdout);
+        else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
         printf("\xe2\x94\x82");
         if(idx<e->pf_n){
             EdPFind *p=&e->pf_res[idx];
@@ -560,17 +560,17 @@ static void ed_pfind_draw(Editor *e,int W,int H){
         } else {
             if(r==0){
                 const char *empty=e->pf_len?"No matches for this query":"Type text to search all project files";
-                printf("\x1b[90m"); used=ed_pfind_put(empty,inner); printf("\x1b[97m");
+                fputs(EC_X[XI_MDIM],stdout); used=ed_pfind_put(empty,inner); fputs(EC_X[XI_MFG],stdout);
             }
         }
         for(i=used;i<inner;i++) fputc(' ',stdout);
         printf("\x1b[0m");
-        printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",yy,x0+bw,EC_X[XI_MODB],TH_TDIM);
     }
     /* input bar under results */
     barrow=y0+5+rows;
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",barrow,x0+1,TH_TDIM);
-    printf("\x1b[48;2;28;28;28m\x1b[97m");
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",barrow,x0+1,EC_X[XI_MODB],TH_TDIM);
+    printf("%s%s",EC_X[XI_POP],EC_X[XI_MFG]);
     printf(" text> ");
     qx=x0+9;
     statusw=(int)strlen(cnt);
@@ -590,14 +590,14 @@ static void ed_pfind_draw(Editor *e,int W,int H){
         fputc(e->pf_buf[f],stdout); drawn+=w0;
         while(f+1<e->pf_len && ed_is_cont((unsigned char)e->pf_buf[f+1])){ f++; fputc(e->pf_buf[f],stdout); }
     }
-    if(e->pf_len==0){ printf("\x1b[90m"); drawn=ed_pfind_put("search project files",qwidth); }
-    printf("\x1b[48;2;30;30;30m");
+    if(e->pf_len==0){ fputs(EC_X[XI_MDIM],stdout); drawn=ed_pfind_put("search project files",qwidth); }
+    fputs(EC_X[XI_MOD],stdout);
     for(;drawn<qwidth;drawn++) fputc(' ',stdout);
-    printf("\x1b[%d;%dH\x1b[48;2;30;30;30m\x1b[90m",barrow,qx+qwidth+1);
+    printf("\x1b[%d;%dH%s%s",barrow,qx+qwidth+1,EC_X[XI_MOD],EC_X[XI_MDIM]);
     fwrite(cnt,1,(size_t)statusw,stdout);
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     /* bottom border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+6+rows,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x94",y0+6+rows,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x98\x1b[0m");
     printf("\x1b[%d;%dH\x1b[?25h",barrow,qx+(caretw-startw));
@@ -1103,7 +1103,7 @@ static int ed_fnd_put_hl(const char *s,const char *q,int maxw){
         if(w+cw>maxw) break;
         if(ql&&matched&&i>=hl&&i<hl+ql) printf("%s",EC_FINDALL);
         fputc(s[i],stdout); w+=cw;
-        if(ql&&matched&&i>=hl&&i<hl+ql) printf("\x1b[97m");
+        if(ql&&matched&&i>=hl&&i<hl+ql) fputs(EC_X[XI_MFG],stdout);
     }
     return w;
 }
@@ -1126,12 +1126,12 @@ static void ed_fnd_draw(Editor *e,int W,int H){
     if(e->fnd_sel<0) e->fnd_sel=0;
     ed_fnd_scroll(e,rows);
     /* top border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x8c",y0+1,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x90\x1b[0m");
     /* title and keyboard guidance */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+2,x0+1,TH_TDIM);
-    printf("\x1b[48;2;45;45;45m\x1b[97m");
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+2,x0+1,EC_X[XI_MODB],TH_TDIM);
+    printf("%s%s",EC_X[XI_PAN],EC_X[XI_MFG]);
     { char titlebuf[300];
       const char *title;
       const char *hint=e->fnd_mode==2?"Review preview; F4 twice applies  Esc close":"Up/Down select  Enter open  Esc close";
@@ -1145,28 +1145,28 @@ static void ed_fnd_draw(Editor *e,int W,int H){
       for(i=tl;i<inner;i++)
           fputc(inner>tl+hl+1&&i>=hintstart?hint[i-hintstart]:' ',stdout);
     }
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     /* column header */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+3,x0+1,TH_TDIM);
-    printf("\x1b[48;2;30;30;30m\x1b[90m");
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+3,x0+1,EC_X[XI_MODB],TH_TDIM);
+    printf("%s%s",EC_X[XI_MOD],EC_X[XI_MDIM]);
     printf(" FOLDER");
     for(i=7;i<folderw;i++) fputc(' ',stdout);
     printf(" \xe2\x94\x82 ");
     printf("FILE");
     for(i=4;i<filew;i++) fputc(' ',stdout);
     printf("\x1b[0m");
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",y0+3,x0+bw,EC_X[XI_MODB],TH_TDIM);
     /* separator */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82",y0+4,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+4,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     /* results */
     for(r=0;r<rows;r++){
         int idx=e->fnd_top+r;
         int yy=y0+5+r, used=0;
         printf("\x1b[%d;%dH",yy,x0+1);
-        if(idx==e->fnd_sel&&idx<e->fnd_n) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else printf("\x1b[48;2;30;30;30m\x1b[97m");
+        if(idx==e->fnd_sel&&idx<e->fnd_n) fputs(EC_X[XI_ACC],stdout);
+        else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
         printf("\xe2\x94\x82");
         if(idx<e->fnd_n){
             EdFnd *p=&e->fnd_res[idx];
@@ -1191,19 +1191,19 @@ static void ed_fnd_draw(Editor *e,int W,int H){
             used=inner;
         } else if(e->fnd_n==0&&r==0){
             if(e->fnd_mode==1&&e->fnd_nofolder){ printf(" (no folder)"); used=12; }
-            else if(e->fnd_len){ snprintf(cnt,sizeof cnt,"No matches for '%s'",e->fnd_q); printf("%s",TH_TDIM); used=ed_pfind_put(cnt,inner); printf("\x1b[97m"); }
+            else if(e->fnd_len){ snprintf(cnt,sizeof cnt,"No matches for '%s'",e->fnd_q); printf("%s",TH_TDIM); used=ed_pfind_put(cnt,inner); fputs(EC_X[XI_MFG],stdout); }
             else { used=ed_pfind_put(e->fnd_mode==1?"Type a name to search files":"Type text to search project files",inner); }
         }
         for(i=used;i<inner;i++) fputc(' ',stdout);
         printf("\x1b[0m");
-        printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",yy,x0+bw,EC_X[XI_MODB],TH_TDIM);
     }
     /* input bar at bottom */
     {
         int row=y0+5+rows, cl;
         size_t first=0;
-        printf("\x1b[%d;%dH%s\xe2\x94\x82",row,x0+1,TH_TDIM);
-        printf("\x1b[48;2;28;28;28m\x1b[97m");
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82",row,x0+1,EC_X[XI_MODB],TH_TDIM);
+        printf("%s%s",EC_X[XI_POP],EC_X[XI_MFG]);
         printf(" %s> ",label);
         qx=x0+5+(int)strlen(label); /* first query cell */
         caretw=0; drawn=0; startw=0;
@@ -1225,8 +1225,8 @@ static void ed_fnd_draw(Editor *e,int W,int H){
             fputc(e->fnd_q[f],stdout); drawn+=w0;
             while(f+1<e->fnd_len && ed_is_cont((unsigned char)e->fnd_q[f+1])){ f++; fputc(e->fnd_q[f],stdout); }
         }
-        if(e->fnd_len==0) printf("\x1b[90m%s",e->fnd_mode==1?"search file names":"search text in file + project");
-        printf("\x1b[48;2;30;30;30m");
+        if(e->fnd_len==0) printf("%s%s",EC_X[XI_MDIM],e->fnd_mode==1?"search file names":"search text in file + project");
+        fputs(EC_X[XI_MOD],stdout);
         for(;drawn<inner-20;drawn++) fputc(' ',stdout);
         e->fnd_cur_x=qx+(caretw-startw);
         e->fnd_cur_y=row;
@@ -1235,12 +1235,12 @@ static void ed_fnd_draw(Editor *e,int W,int H){
         else cnt[0]=0;
         if(cnt[0]){
             cl=(int)strlen(cnt);
-            printf("\x1b[%d;%dH\x1b[48;2;30;30;30m\x1b[90m%s",row,x0+1+inner-cl,cnt);
+            printf("\x1b[%d;%dH%s%s%s",row,x0+1+inner-cl,EC_X[XI_MOD],EC_X[XI_MDIM],cnt);
         }
-        printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+        printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     }
     /* bottom border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+6+rows,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x94",y0+6+rows,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<inner;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x98\x1b[0m");
     if(e->fnd_cur_x>0) printf("\x1b[%d;%dH\x1b[?25h",e->fnd_cur_y,e->fnd_cur_x);

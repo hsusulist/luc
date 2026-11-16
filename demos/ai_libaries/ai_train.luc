@@ -1,5 +1,5 @@
 -- demos/ai_libaries/ai_train.luc -- fit y = 2x + 1 with a tiny MLP
--- needs the ai library (luc install ai)
+-- needs the ai library (luc install -p ai)
 -- run: luc "demos/ai_libaries/ai_train.luc"
 
 import ai

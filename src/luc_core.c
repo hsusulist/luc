@@ -12,7 +12,10 @@ int  luc_aot_embedded(char **psrc,int *plen);
 #  include <windows.h>
 #  include <winhttp.h>
 #  include <process.h>
+#  include <conio.h>
 #else
+#  include <sys/wait.h>
+#  include <termios.h>
 #  include <dirent.h>
 #  include <sys/time.h>
 #  include <sys/stat.h>
@@ -74,8 +77,9 @@ void luc_throw(Value err){
 void luc_error(const char *fmt,...){
     char buf[1024]; char msg[1200]; va_list ap;
     va_start(ap,fmt); vsnprintf(buf,sizeof buf,fmt,ap); va_end(ap);
-    if(V.cur && V.cur->cursource)
-        snprintf(msg,sizeof msg,"%s:%d: %s",V.cur->cursource->s,V.cur->curline,buf);
+    Str *src=NULL; int line=V.cur? luc_curline(V.cur,&src) : 0;
+    if(src)
+        snprintf(msg,sizeof msg,"%s:%d: %s",src->s,line,buf);
     else
         snprintf(msg,sizeof msg,"%s",buf);
     luc_throw(mkobj(LT_STR,str_fromc(msg)));
@@ -89,6 +93,18 @@ static Obj *newobj(size_t sz,int type){
     V.nalloc++;
     return o;
 }
+
+/* Metamethod names used on hot paths: interned once, kept alive in V.loaded. */
+static Str *mm_cached(Str **slot,const char *name){
+    if(*slot) return *slot;
+    Str *s=str_fromc(name);
+    if(V.loaded){ tab_set(V.loaded,mkobj(LT_STR,s),mkobj(LT_STR,s)); *slot=s; }
+    return s;
+}
+static Str *g_mm_index, *g_mm_call, *g_mm_tostring;
+#define MM_INDEX    mkobj(LT_STR,mm_cached(&g_mm_index,"__index"))
+#define MM_CALL     mkobj(LT_STR,mm_cached(&g_mm_call,"__call"))
+#define MM_TOSTRING mkobj(LT_STR,mm_cached(&g_mm_tostring,"__tostring"))
 
 /* interned strings */
 static unsigned strhash(const char *s,int len){
@@ -121,7 +137,7 @@ Str *str_new(const char *s,int len){
     unsigned h=strhash(s,len);
     unsigned k=h&(unsigned)(V.strcap-1);
     for(Str *p=V.strtab[k];p;p=p->snext)
-        if(p->len==len && memcmp(p->s,s,(size_t)len)==0) return p;
+        if(p->hash==h && p->len==len && memcmp(p->s,s,(size_t)len)==0) return p;
     if(V.nstr>=V.strcap-V.strcap/4-1) strtab_grow();
     k=h&(unsigned)(V.strcap-1);
     Str *ns=(Str*)lmalloc(sizeof(Str)+(size_t)len);
@@ -132,6 +148,44 @@ Str *str_new(const char *s,int len){
     ns->snext=V.strtab[k]; V.strtab[k]=ns;
     V.nstr++; V.nalloc++;
     return ns;
+}
+/* a..b without a temp buffer: FNV-1a is sequential, so hash(a..b) continues from a->hash */
+Str *str_concat(Str *a,Str *b){
+    if(b->len==0) return a;
+    if(a->len==0) return b;
+    if((long long)a->len+b->len > INT_MAX-16) luc_error("string too long");
+    if(V.strcap <= 0 || !V.strtab) strtab_grow();
+    int len=a->len+b->len;
+    unsigned h=a->hash;
+    for(int i=0;i<b->len;i++){ h^=(unsigned char)b->s[i]; h*=16777619u; }
+    unsigned k=h&(unsigned)(V.strcap-1);
+    for(Str *p=V.strtab[k];p;p=p->snext)
+        if(p->hash==h && p->len==len && memcmp(p->s,a->s,(size_t)a->len)==0
+           && memcmp(p->s+a->len,b->s,(size_t)b->len)==0) return p;
+    if(V.nstr>=V.strcap-V.strcap/4-1) strtab_grow();
+    k=h&(unsigned)(V.strcap-1);
+    Str *ns=(Str*)lmalloc(sizeof(Str)+(size_t)len);
+    ns->o.type=LT_STR; ns->o.marked=0; ns->o.next=NULL;
+    ns->len=len; ns->hash=h;
+    memcpy(ns->s,a->s,(size_t)a->len);
+    memcpy(ns->s+a->len,b->s,(size_t)b->len);
+    ns->s[len]=0;
+    ns->snext=V.strtab[k]; V.strtab[k]=ns;
+    V.nstr++; V.nalloc++;
+    return ns;
+}
+/* Line of the instruction being run: frames keep savedpc = next instruction. */
+int luc_curline(LucState *L,Str **src){
+    if(L && L->nci>0){
+        CallInfo *ci=&L->ci[L->nci-1];
+        if(ci->cl && ci->cl->p && ci->savedpc){
+            Proto *p=ci->cl->p;
+            ptrdiff_t i=ci->savedpc-p->code-1;
+            if(i>=0 && i<p->ncode){ if(src) *src=p->source; return p->lines[i]; }
+        }
+    }
+    if(src) *src=L? L->cursource : NULL;
+    return L? L->curline : 0;
 }
 
 /* constructors */
@@ -237,12 +291,14 @@ static void hash_set(Table *t,Value k,Value v){
     while(t->ents[i].k.t!=LT_NIL) i=(i+1)&(unsigned)(t->ecap-1);
     t->ents[i].k=k; t->ents[i].v=v; t->ecount++;
 }
+/* Rehash when full. Keys set to nil stay behind as dead slots and are dropped here, so the
+   new size follows the LIVE count: a table with heavy add/remove churn must not keep doubling. */
 static void hash_grow(Table *t){
-    int nc;
-    if(t->ecap==0) nc=8;
-    else {
-        if(t->ecap > INT_MAX/2) luc_error("out of memory");
-        nc=t->ecap*2;
+    int nc=8, live=0;
+    for(int i=0;i<t->ecap;i++) if(t->ents[i].k.t!=LT_NIL && t->ents[i].v.t!=LT_NIL) live++;
+    while(nc < (live+1)*2){                     /* <= 50% full right after the rehash */
+        if(nc > INT_MAX/2) luc_error("out of memory");
+        nc*=2;
     }
     Entry *old=t->ents; int oc=t->ecap;
     if((size_t)nc > ((size_t)-1)/sizeof(Entry)) luc_error("out of memory");
@@ -481,8 +537,12 @@ void num2str(double n,char *buf,size_t sz){
     if(n!=n){ snprintf(buf,sz,"nan"); return; }
     if(n==HUGE_VAL){ snprintf(buf,sz,"inf"); return; }
     if(n==-HUGE_VAL){ snprintf(buf,sz,"-inf"); return; }
-    if(n==floor(n) && fabs(n)<1e15) snprintf(buf,sz,"%lld",(long long)n);
-    else snprintf(buf,sz,"%.17g",n);
+    if(n==floor(n) && fabs(n)<1e15){ snprintf(buf,sz,"%lld",(long long)n); return; }
+    /* shortest form that reads back as the same double: 0.1 -> "0.1", not 0.10000000000000001 */
+    for(int prec=15;prec<=17;prec++){
+        snprintf(buf,sz,"%.*g",prec,n);
+        if(prec==17 || strtod(buf,NULL)==n) return;
+    }
 }
 int str2num(const char *s,int len,double *out){
     char tmp[128]; char *end;
@@ -566,7 +626,7 @@ static Str *v2str(Value v,int depth){
             if(v.t==LT_TABLE){
                 Table *t=AS_TAB(v);
                 if(t->meta){
-                    Value h=tab_get(t->meta,mkobj(LT_STR,str_fromc("__tostring")));
+                    Value h=tab_get(t->meta,MM_TOSTRING);
                     if(h.t==LT_FUNC||h.t==LT_CFUNC){
                         Value r=meta_callv(V.cur,h,(Value[]){v},1);
                         if(r.t==LT_STR) return AS_STR(r);
@@ -1916,7 +1976,9 @@ static int comp_call(FuncState *fs,Expr *e,int nres){
         exprd(fs,e->a,func+1);                       /* self object */
         int t=reserve(fs,1);
         emit(fs,I_ABx(OP_LOADK,t,addkstr(fs,e->name)),e->line);
-        emit(fs,I_ABC(OP_GETTABLE,func,func+1,t),e->line);
+        /* SELF, not GETTABLE: self is passed explicitly, so built-in methods are fetched raw
+           instead of allocating a bound-method object on every obj:m() call */
+        emit(fs,I_ABC(OP_SELF,func,func+1,t),e->line);
         fs->freereg=func+2;
         nargs=1;
     } else {
@@ -2472,22 +2534,18 @@ static double arith_num(Value v){
     return 0;
 }
 static Value vm_concat(Value a,Value b){
-    if((a.t==LT_STR||a.t==LT_NUM)&&(b.t==LT_STR||b.t==LT_NUM)){
-        Str *x=tostr(a),*y=tostr(b);
-        int n=x->len+y->len;
-        char *buf=(char*)lmalloc((size_t)n+1);
-        memcpy(buf,x->s,(size_t)x->len);
-        memcpy(buf+x->len,y->s,(size_t)y->len);
-        Str *r=str_new(buf,n); free(buf);
-        return mkobj(LT_STR,r);
-    }
-    if(a.t==LT_LIST||b.t==LT_LIST||a.t==LT_TABLE||b.t==LT_TABLE){
-        Str *x=tostr(a),*y=tostr(b);
-        int n=x->len+y->len;
-        char *buf=(char*)lmalloc((size_t)n+1);
-        memcpy(buf,x->s,(size_t)x->len); memcpy(buf+x->len,y->s,(size_t)y->len);
-        Str *r=str_new(buf,n); free(buf);
-        return mkobj(LT_STR,r);
+    if(((a.t==LT_STR||a.t==LT_NUM)&&(b.t==LT_STR||b.t==LT_NUM))
+       || a.t==LT_LIST||b.t==LT_LIST||a.t==LT_TABLE||b.t==LT_TABLE){
+        Str *x=tostr(a), *y;
+        if(b.t==LT_TABLE && V.cur){
+            /* __tostring may run code (and the GC): keep x on the stack meanwhile */
+            LucState *L=V.cur;
+            ensure_stack(L,L->top+4);
+            L->stack[L->top++]=mkobj(LT_STR,x);
+            y=tostr(b);
+            L->top--;
+        } else y=tostr(b);
+        return mkobj(LT_STR,str_concat(x,y));
     }
     luc_error("attempt to concatenate a %s value",
               (a.t==LT_STR||a.t==LT_NUM)?type_name(b):type_name(a));
@@ -2547,20 +2605,22 @@ static int f_core_remove(LucState *L,int base,int nargs,CFunc *self){
     RET(0,mkbool(0)); return 1;
 }
 
-static Value vm_index(Value t,Value k){
+/* bind=0 is for SELF (obj:m()): the caller passes self itself, so built-in methods are
+   returned raw instead of wrapped in a per-call bound-method object. */
+static Value vm_index_ex(Value t,Value k,int bind){
     switch(t.t){
         case LT_TABLE: {
             Table *tb=AS_TAB(t);
             Value r=tab_get(tb,k);
             int d=0;
             while(r.t==LT_NIL && tb->meta && d<16){
-                Value h=tab_get(tb->meta,mkobj(LT_STR,str_fromc("__index")));
+                Value h=tab_get(tb->meta,MM_INDEX);
                 if(h.t==LT_TABLE||h.t==LT_LIST){ tb=AS_TAB(h); r=tab_get(tb,k); d++; }
                 else break;
             }
             if(r.t==LT_NIL && k.t==LT_STR && V.tabmeta){
                 Value m=tab_get(V.tabmeta,k);
-                if(m.t!=LT_NIL) return bind_method(t,m);
+                if(m.t!=LT_NIL) return bind? bind_method(t,m) : m;
             }
             return r;
         }
@@ -2578,7 +2638,7 @@ static Value vm_index(Value t,Value k){
                 Value m = V.listcore? tab_get(V.listcore,k) : NIL;
                 if(m.t==LT_NIL) m=tab_get(V.listmeta,k);
                 if(m.t==LT_NIL) return NIL;
-                return bind_method(t,m);
+                return bind? bind_method(t,m) : m;
             }
             return tab_get(AS_TAB(t),k);
         case LT_STR:
@@ -2594,29 +2654,30 @@ static Value vm_index(Value t,Value k){
             if(k.t==LT_STR){
                 Value m=tab_get(V.stringlib,k);
                 if(m.t==LT_NIL) return NIL;
-                return bind_method(t,m);
+                return bind? bind_method(t,m) : m;
             }
             return NIL;
         case LT_BUFFER: {
             if(k.t!=LT_STR) return NIL;
             Value m=tab_get(V.bufferlib,k);
-            return m.t==LT_NIL? NIL : bind_method(t,m);
+            return m.t==LT_NIL? NIL : (bind? bind_method(t,m) : m);
         }
         case LT_FILE: {
             if(k.t!=LT_STR) return NIL;
             Value m=tab_get(V.filelib,k);
-            return m.t==LT_NIL? NIL : bind_method(t,m);
+            return m.t==LT_NIL? NIL : (bind? bind_method(t,m) : m);
         }
         case LT_SOCKET: {
             if(k.t!=LT_STR) return NIL;
             Value m=V.socklib? tab_get(V.socklib,k) : NIL;
-            return m.t==LT_NIL? NIL : bind_method(t,m);
+            return m.t==LT_NIL? NIL : (bind? bind_method(t,m) : m);
         }
         default:
             luc_error("attempt to index a %s value",type_name(t));
     }
     return NIL;
 }
+static Value vm_index(Value t,Value k){ return vm_index_ex(t,k,1); }
 static void vm_setindex(Value t,Value k,Value v){
     if(t.t==LT_LIST && k.t==LT_NUM){
         double d=k.u.n;
@@ -2828,7 +2889,7 @@ static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Val
     CallInfo *ci=&L->ci[L->nci-1]; Value *base=L->stack+ci->base;
     Value oldv=vm_index(tv,kv);
     if(oldv.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
-        Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+        Value h=tab_get(AS_TAB(tv)->meta,MM_INDEX);
         if(h.t==LT_FUNC||h.t==LT_CFUNC){
             ci->savedpc=pc;
             oldv=meta_callv(L,h,(Value[]){tv,kv},2);
@@ -2875,7 +2936,8 @@ static void vm_execute(LucState *L,int baselevel){
 #if defined(__GNUC__) || defined(__clang__)
 #define VM_LABEL(name) vm_op_##name:
 #define VM_NEXT goto vm_dispatch
-    void *dispatch[OP_COUNT] = {
+    /* 256 entries: any byte value that is not an opcode lands on BADOP (no per-op range check) */
+    static void *dispatch[256] = {
         &&vm_op_MOVE, &&vm_op_LOADK, &&vm_op_LOADNIL, &&vm_op_LOADBOOL,
         &&vm_op_GETGLOBAL, &&vm_op_SETGLOBAL, &&vm_op_GETUPVAL, &&vm_op_SETUPVAL,
         &&vm_op_GETTABLE, &&vm_op_SETTABLE, &&vm_op_NEWTABLE, &&vm_op_SETLIST,
@@ -2886,12 +2948,21 @@ static void vm_execute(LucState *L,int baselevel){
         &&vm_op_JMPIFNOT, &&vm_op_CALL, &&vm_op_RETURN, &&vm_op_CLOSURE,
         &&vm_op_VARARG, &&vm_op_CLOSE, &&vm_op_FORPREP, &&vm_op_FORLOOP,
         &&vm_op_TFORLOOP, &&vm_op_SLICE, &&vm_op_NEXT, &&vm_op_APPEND,
-        &&vm_op_ADDEQ, &&vm_op_SUBEQ, &&vm_op_MULEQ, &&vm_op_DIVEQ
+        &&vm_op_ADDEQ, &&vm_op_SUBEQ, &&vm_op_MULEQ, &&vm_op_DIVEQ,
+        [OP_COUNT ... 255] = &&vm_op_BADOP
     };
+#define VM_OPS_LISTED 48
+    typedef char vm_dispatch_covers_all_ops[(OP_COUNT==VM_OPS_LISTED)?1:-1] __attribute__((unused));
 #else
 #define VM_LABEL(name) case OP_##name:
 #define VM_NEXT break
 #endif
+/* After anything that can run Luc code (metamethods, callbacks), the frame array and the
+   value stack may have been reallocated: re-derive the cached pointers. */
+#define VM_RELOAD() do{ ci=&L->ci[L->nci-1]; base=L->stack+ci->base; }while(0)
+/* GC safe point: every live value is in a register/stack slot at this moment. Used after ops
+   that allocate strings, so string-only loops are collected too (not just table allocs). */
+#define VM_GCCHECK() do{ if(V.nalloc>V.gcthresh){ ci->savedpc=pc; gc_collect(); } }while(0)
  reentry:
     ci=&L->ci[L->nci-1];
     cl=ci->cl; pr=cl->p; pc=ci->savedpc; base=L->stack+ci->base; K=pr->k;
@@ -2903,11 +2974,11 @@ static void vm_execute(LucState *L,int baselevel){
 #endif
         uint32_t ins=*pc++;
         int A=GET_A(ins);
-        L->curline=pr->lines[(int)(pc-1-pr->code)];
+        ci->savedpc=pc;   /* error lines are derived from this (luc_curline) */
 #if defined(__GNUC__) || defined(__clang__)
-        int op=GET_OP(ins);
-        if((unsigned)op>=OP_COUNT) luc_error("bad opcode %d",op);
-        goto *dispatch[op];
+        goto *dispatch[GET_OP(ins)];
+    vm_op_BADOP:
+        luc_error("bad opcode %d",GET_OP(ins));
 #else
         switch(GET_OP(ins)){
 #endif
@@ -2935,7 +3006,7 @@ static void vm_execute(LucState *L,int baselevel){
             }
             Value r=vm_index(tv,kv);
             if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
-                Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+                Value h=tab_get(AS_TAB(tv)->meta,MM_INDEX);
                 if(h.t==LT_FUNC||h.t==LT_CFUNC){
                     ci->savedpc=pc;
                     r=meta_callv(L,h,(Value[]){tv,kv},2);
@@ -2978,9 +3049,9 @@ static void vm_execute(LucState *L,int baselevel){
             int rb=GET_B(ins);
             base[A+1]=base[rb];
             Value tv=base[rb], kv=base[GET_C(ins)];
-            Value r=vm_index(tv,kv);
+            Value r=vm_index_ex(tv,kv,0);
             if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
-                Value h=tab_get(AS_TAB(tv)->meta,mkobj(LT_STR,str_fromc("__index")));
+                Value h=tab_get(AS_TAB(tv)->meta,MM_INDEX);
                 if(h.t==LT_FUNC||h.t==LT_CFUNC){
                     ci->savedpc=pc;
                     r=meta_callv(L,h,(Value[]){tv,kv},2);
@@ -2993,7 +3064,7 @@ static void vm_execute(LucState *L,int baselevel){
         VM_LABEL(ADD) {
             Value x=base[GET_B(ins)], y=base[GET_C(ins)];
             if(x.t==LT_NUM && y.t==LT_NUM){ base[A]=mknum(x.u.n+y.u.n); VM_NEXT; }
-            if((x.t==LT_STR||x.t==LT_NUM)&&(y.t==LT_STR||y.t==LT_NUM)){ base[A]=vm_concat(x,y); VM_NEXT; }
+            if((x.t==LT_STR||x.t==LT_NUM)&&(y.t==LT_STR||y.t==LT_NUM)){ base[A]=vm_concat(x,y); VM_GCCHECK(); VM_NEXT; }
             Value mr; ci->savedpc=pc;
             if(vm_metabin(L,x,y,"__add",&mr)){
                 ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
@@ -3073,13 +3144,25 @@ static void vm_execute(LucState *L,int baselevel){
         } VM_NEXT;
         VM_LABEL(NOT) { base[A]=mkbool(!truthy(base[GET_B(ins)])); } VM_NEXT;
         VM_LABEL(LEN) { base[A]=mknum((double)vm_len(base[GET_B(ins)])); } VM_NEXT;
-        VM_LABEL(CONCAT) { base[A]=vm_concat(base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
-        VM_LABEL(EQ) { base[A]=mkbool(val_rawequal(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
-        VM_LABEL(NE) { base[A]=mkbool(!val_rawequal(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
-        VM_LABEL(LT) { base[A]=mkbool(vm_lessthan(base[GET_B(ins)],base[GET_C(ins)],0)); } VM_NEXT;
-        VM_LABEL(LE) { base[A]=mkbool(vm_lessthan(base[GET_B(ins)],base[GET_C(ins)],1)); } VM_NEXT;
-        VM_LABEL(GT) { base[A]=mkbool(vm_lessthan(base[GET_C(ins)],base[GET_B(ins)],0)); } VM_NEXT;
-        VM_LABEL(GE) { base[A]=mkbool(vm_lessthan(base[GET_C(ins)],base[GET_B(ins)],1)); } VM_NEXT;
+        VM_LABEL(CONCAT) {
+            Value x=base[GET_B(ins)], y=base[GET_C(ins)];
+            if(x.t==LT_STR&&y.t==LT_STR){ base[A]=vm_concat(x,y); VM_GCCHECK(); VM_NEXT; }
+            ci->savedpc=pc;
+            Value r=vm_concat(x,y);          /* __tostring may run code: reload frame */
+            VM_RELOAD();
+            base[A]=r;
+            VM_GCCHECK();
+        } VM_NEXT;
+/* number/number compares inline; everything else through the generic helpers */
+#define VM_NUMCMP(expr,slow) do{ Value x=base[GET_B(ins)], y=base[GET_C(ins)]; \
+            base[A]=mkbool((x.t==LT_NUM&&y.t==LT_NUM)? (expr) : (slow)); }while(0)
+        VM_LABEL(EQ) { VM_NUMCMP(x.u.n==y.u.n, val_rawequal(x,y)); } VM_NEXT;
+        VM_LABEL(NE) { VM_NUMCMP(x.u.n!=y.u.n, !val_rawequal(x,y)); } VM_NEXT;
+        VM_LABEL(LT) { VM_NUMCMP(x.u.n<y.u.n,  vm_lessthan(x,y,0)); } VM_NEXT;
+        VM_LABEL(LE) { VM_NUMCMP(x.u.n<=y.u.n, vm_lessthan(x,y,1)); } VM_NEXT;
+        VM_LABEL(GT) { VM_NUMCMP(x.u.n>y.u.n,  vm_lessthan(y,x,0)); } VM_NEXT;
+        VM_LABEL(GE) { VM_NUMCMP(x.u.n>=y.u.n, vm_lessthan(y,x,1)); } VM_NEXT;
+#undef VM_NUMCMP
         VM_LABEL(IN) { base[A]=mkbool(vm_in(base[GET_B(ins)],base[GET_C(ins)])); } VM_NEXT;
         VM_LABEL(JMP) { pc+=GET_sBx(ins); } VM_NEXT;
         VM_LABEL(JMPIF) { if(truthy(base[A])) pc+=GET_sBx(ins); } VM_NEXT;
@@ -3116,7 +3199,7 @@ static void vm_execute(LucState *L,int baselevel){
             Value f=L->stack[func];
             if(f.t==LT_TABLE){
                 Table *mtb=AS_TAB(f)->meta;
-                Value hf = mtb? tab_get(mtb,mkobj(LT_STR,str_fromc("__call"))) : NIL;
+                Value hf = mtb? tab_get(mtb,MM_CALL) : NIL;
                 if(hf.t==LT_FUNC||hf.t==LT_CFUNC){
                     ci->savedpc=pc;
                     ensure_stack(L,func+na+64);
@@ -3154,15 +3237,18 @@ static void vm_execute(LucState *L,int baselevel){
                 ensure_stack(L,func+na+64);
                 L->top=func+1+na;
                 int n=cf->fn(L,func+1,na,cf);
+                ci=&L->ci[L->nci-1];          /* the C function may have grown the frame array */
                 for(int i=0;i<n;i++) L->stack[func+i]=L->stack[func+1+i];
                 if(nres>=0){ for(int i=n;i<nres;i++) L->stack[func+i]=NIL; }
                 base=L->stack+ci->base;
                 L->top = (nres<0)? func+n : ci->base+pr->maxstack;
+                VM_GCCHECK();                 /* C functions allocate (strings, lists...) */
             } else if(f.t==LT_FUNC){
                 ci->savedpc=pc;
                 int jn=luc_jit_call(L,func,na,nres);
                 if(jn!=LUC_JIT_FALLBACK){
-                    base=L->stack+ci->base;   /* Stack may have moved */
+                    ci=&L->ci[L->nci-1];      /* frames and stack may have moved */
+                    base=L->stack+ci->base;
                     L->top = (nres<0)? func+jn : ci->base+pr->maxstack;
                 } else {
                     pushframe(L,func,na,nres);
@@ -3193,7 +3279,7 @@ static void vm_execute(LucState *L,int baselevel){
             Value kv=mkobj(LT_STR,g_appendStr);
             Value m=vm_index(base[A],kv);
             if(m.t==LT_NIL && base[A].t==LT_TABLE && AS_TAB(base[A])->meta){
-                Value h=tab_get(AS_TAB(base[A])->meta,mkobj(LT_STR,str_fromc("__index")));
+                Value h=tab_get(AS_TAB(base[A])->meta,MM_INDEX);
                 if(h.t==LT_FUNC||h.t==LT_CFUNC){
                     m=meta_callv(L,h,(Value[]){base[A],kv},2);
                     ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
@@ -3203,7 +3289,7 @@ static void vm_execute(LucState *L,int baselevel){
             int got, nargs=n, plain=1;
             if(m.t==LT_TABLE){
                 Table *mtb=AS_TAB(m)->meta;
-                Value hf=mtb?tab_get(mtb,mkobj(LT_STR,str_fromc("__call"))):NIL;
+                Value hf=mtb?tab_get(mtb,MM_CALL):NIL;
                 if(hf.t==LT_FUNC||hf.t==LT_CFUNC){
                     /* Shift [A..A+n] right: [A]=hf [A+1]=m */
                     for(int i=n;i>=0;i--) base[A+i+1]=base[A+i];
@@ -3219,12 +3305,13 @@ static void vm_execute(LucState *L,int baselevel){
             }
             got=vm_call(L,ci->base+A,nargs,nres);
             ci=&L->ci[L->nci-1];   /* vm_call may grow frames */
+            base=L->stack+ci->base;   /* ...and move the stack */
             L->top=nres>=0?ci->base+pr->maxstack:ci->base+A+got;
         } VM_NEXT;
-        VM_LABEL(ADDEQ) { vm_compound(L,0,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
-        VM_LABEL(SUBEQ) { vm_compound(L,1,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
-        VM_LABEL(MULEQ) { vm_compound(L,2,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
-        VM_LABEL(DIVEQ) { vm_compound(L,3,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); } VM_NEXT;
+        VM_LABEL(ADDEQ) { vm_compound(L,0,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(SUBEQ) { vm_compound(L,1,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(MULEQ) { vm_compound(L,2,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(DIVEQ) { vm_compound(L,3,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
         VM_LABEL(RETURN) {
             int b=GET_B(ins);
             int n = b? b-1 : (int)(L->top-(ci->base+A));
@@ -3234,7 +3321,7 @@ static void vm_execute(LucState *L,int baselevel){
             L->nci--;
             if(want>=0){ for(int i=n;i<want;i++) L->stack[func+i]=NIL; L->top=func+want; }
             else L->top=func+n;
-            if(L->nci<=baselevel) return;
+            if(L->nci<=baselevel){ L->curline=pr->lines[(int)(pc-1-pr->code)]; L->cursource=pr->source; return; }
             ci=&L->ci[L->nci-1];
             cl=ci->cl; pr=cl->p; pc=ci->savedpc; base=L->stack+ci->base; K=pr->k;
             L->cursource=pr->source;
@@ -3266,6 +3353,7 @@ static void vm_execute(LucState *L,int baselevel){
             L->stack[cb]=base[A]; L->stack[cb+1]=base[A+1]; L->stack[cb+2]=base[A+2];
             ci->savedpc=pc;
             vm_call(L,cb,2,nvars);
+            ci=&L->ci[L->nci-1];
             base=L->stack+ci->base;
             L->top=ci->base+pr->maxstack;
             if(L->stack[cb].t!=LT_NIL) base[A+2]=L->stack[cb];
@@ -3324,6 +3412,8 @@ static void vm_execute(LucState *L,int baselevel){
     }
 #undef VM_LABEL
 #undef VM_NEXT
+#undef VM_RELOAD
+#undef VM_GCCHECK
 }
 
 /* Coroutines and scheduler */
@@ -3982,12 +4072,35 @@ static void pkg_fmt_size(long bytes,char *out,size_t cap){
     else snprintf(out,cap,"%ld B",bytes);
 }
 
+/* Download state for messages: g_pkg_neterr = could not reach the server at all (offline,
+   DNS, proxy), otherwise g_pkg_status = HTTP status when it was not 200.
+   g_pkg_label != NULL draws a one-line progress bar while downloading. */
+static int g_pkg_neterr, g_pkg_status;
+static const char *g_pkg_label;
+static int luc_stdout_console(void);
+
+static void pkg_progress(long got,long total,int done){
+    char hs[32];
+    if(!g_pkg_label || !luc_stdout_console()) return;
+    pkg_fmt_size(total>0? total : got,hs,sizeof hs);
+    if(total>0){
+        int pct=(int)((double)got*100.0/(double)total), fill=pct/5;
+        if(pct>100) pct=100;
+        if(fill>20) fill=20;
+        printf("\r  %-9s [%.*s%.*s] %3d%%  %-10s",g_pkg_label,
+               fill,"####################",20-fill,"....................",pct,hs);
+    } else printf("\r  %-9s %-10s",g_pkg_label,hs);
+    if(done) printf("\r%-60s\r","");
+    fflush(stdout);
+}
+
 #if defined(_WIN32)
 
 /* GET url via WinHTTP, follows redirects */
 static int pkg_http_get(const char *url,const char *outpath,long *outsize){
     const char *p=url;
     int secure=1;
+    g_pkg_neterr=0; g_pkg_status=0;
     if(!strncmp(p,"https://",8)){ secure=1; p+=8; }
     else if(!strncmp(p,"http://",7)){ secure=0; p+=7; }
     else return 0;
@@ -4002,9 +4115,10 @@ static int pkg_http_get(const char *url,const char *outpath,long *outsize){
     int ok=0;
     HINTERNET hs=WinHttpOpen(L"luc-install",WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                              WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
-    if(!hs) return 0;
+    if(!hs){ g_pkg_neterr=1; return 0; }
     WinHttpSetTimeouts(hs,10000,10000,10000,60000);
     HINTERNET hc=WinHttpConnect(hs,whost,secure?INTERNET_DEFAULT_HTTPS_PORT:INTERNET_DEFAULT_HTTP_PORT,0);
+    if(!hc) g_pkg_neterr=1;
     if(hc){
         HINTERNET hr=WinHttpOpenRequest(hc,L"GET",wpath,NULL,WINHTTP_NO_REFERER,
                                         WINHTTP_DEFAULT_ACCEPT_TYPES,
@@ -4015,31 +4129,40 @@ static int pkg_http_get(const char *url,const char *outpath,long *outsize){
             if(WinHttpSendRequest(hr,WINHTTP_NO_ADDITIONAL_HEADERS,0,
                                   WINHTTP_NO_REQUEST_DATA,0,0,0) &&
                WinHttpReceiveResponse(hr,NULL)){
-                DWORD status=0, dsz=sizeof status;
+                DWORD status=0, dsz=sizeof status, clen=0, csz=sizeof clen;
                 WinHttpQueryHeaders(hr,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,
                                     WINHTTP_HEADER_NAME_BY_INDEX,&status,&dsz,
                                     WINHTTP_NO_HEADER_INDEX);
+                if(!WinHttpQueryHeaders(hr,WINHTTP_QUERY_CONTENT_LENGTH|WINHTTP_QUERY_FLAG_NUMBER,
+                                        WINHTTP_HEADER_NAME_BY_INDEX,&clen,&csz,
+                                        WINHTTP_NO_HEADER_INDEX)) clen=0;
+                if(status!=200) g_pkg_status=(int)status;
                 if(status==200){
                     FILE *f=fopen(outpath,"wb");
+                    long got=0;
                     if(f){
                         ok=1;
                         for(;;){
                             DWORD avail=0, rd=0;
-                            if(!WinHttpQueryDataAvailable(hr,&avail)){ ok=0; break; }
+                            if(!WinHttpQueryDataAvailable(hr,&avail)){ ok=0; g_pkg_neterr=1; break; }
                             if(avail==0) break;
                             char *buf=(char*)malloc(avail);
                             if(!buf){ ok=0; break; }
-                            if(!WinHttpReadData(hr,buf,avail,&rd)){ ok=0; free(buf); break; }
-                            if(rd==0) break;
+                            if(!WinHttpReadData(hr,buf,avail,&rd)){ ok=0; g_pkg_neterr=1; free(buf); break; }
+                            if(rd==0){ free(buf); break; }
                             if(fwrite(buf,1,rd,f)!=rd){ ok=0; free(buf); break; }
-                            if(outsize) *outsize+=rd;
+                            got+=(long)rd;
+                            pkg_progress(got,(long)clen,0);
                             free(buf);
                         }
                         if(fclose(f)!=0) ok=0;
+                        if(ok && clen>0 && got!=(long)clen){ ok=0; g_pkg_neterr=1; }  /* cut off */
                         if(!ok) remove(outpath);
+                        else if(outsize) *outsize=got;
+                        pkg_progress(got,(long)clen,1);
                     }
                 }
-            }
+            } else g_pkg_neterr=1;
             WinHttpCloseHandle(hr);
         }
         WinHttpCloseHandle(hc);
@@ -4050,11 +4173,18 @@ static int pkg_http_get(const char *url,const char *outpath,long *outsize){
 
 #else
 
-/* POSIX: curl handles TLS and redirects */
+/* POSIX: curl handles TLS and redirects. Exit code 22 = HTTP error status. */
 static int pkg_http_get(const char *url,const char *outpath,long *outsize){
     char cmd[1600];
+    int rc;
+    g_pkg_neterr=0; g_pkg_status=0;
+    if(strchr(url,'\'')||strchr(outpath,'\'')) return 0;
     snprintf(cmd,sizeof cmd,"curl -fL --connect-timeout 10 -s -o '%s' '%s'",outpath,url);
-    if(system(cmd)!=0){ remove(outpath); return 0; }
+    rc=system(cmd);
+    if(rc!=0){
+        if(WIFEXITED(rc) && WEXITSTATUS(rc)==22) g_pkg_status=404; else g_pkg_neterr=1;
+        remove(outpath); return 0;
+    }
     if(outsize){
         FILE *f=fopen(outpath,"rb");
         if(f){ fseek(f,0,SEEK_END); *outsize=ftell(f); fclose(f); }
@@ -4088,264 +4218,309 @@ static int pkg_put_file(const char *tmp,const char *dest){
 #endif
 }
 
-static int pkg_install_window(int force){
-    char dll[1200],dlltmp[1250],newexe[1250],exetmp[1300],oldexe[1250],url[1200];
-    char pd[1200],pdll[1250],pexe[1250];
-    long sz=0;
-    int offline;
-    pkg_install_path(dll,sizeof dll,"SDL2.dll");
-    if(!force && pkg_file_exists(dll)){
-        printf("window support is already installed (%s).\n",dll);
-        printf("use 'luc install window --force' to download it again.\n");
-        return 0;
-    }
-    snprintf(dlltmp,sizeof dlltmp,"%s.tmp",dll);
-    pkg_install_path(newexe,sizeof newexe,"luc-new.exe");
-    snprintf(exetmp,sizeof exetmp,"%s.tmp",newexe);
-    pkg_install_path(oldexe,sizeof oldexe,"luc.exe.old");
-    remove(oldexe);                       /* Sweep stale backup */
-
-    /* Bundled packages/window next to exe: try first */
-    pkg_install_path(pd,sizeof pd,"packages/window");
-    snprintf(pdll,sizeof pdll,"%s/SDL2.dll",pd);
-    snprintf(pexe,sizeof pexe,"%s/luc-win.exe",pd);
-    offline=!force && pkg_file_exists(pdll) && pkg_file_exists(pexe);
-    if(offline){
-        printf("using bundled package: %s\n",pd);
-        snprintf(dlltmp,sizeof dlltmp,"%s",pdll);
-        snprintf(exetmp,sizeof exetmp,"%s",pexe);
-    } else {
-        pkg_join_url(url,sizeof url,"dist/app/SDL2.dll");
-        printf("downloading %s\n",url);
-        if(!pkg_http_get(url,dlltmp,&sz)||!pkg_has_pe_magic(dlltmp)){
-            fprintf(stderr,"luc install: download failed for SDL2.dll\n");
-            remove(dlltmp); return 1;
-        }
-        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
-        printf("  SDL2.dll  %s\n",hs);
-
-        pkg_join_url(url,sizeof url,"dist/app/luc-win.exe");
-        printf("downloading %s\n",url);
-        sz=0;
-        if(!pkg_http_get(url,exetmp,&sz)||!pkg_has_pe_magic(exetmp)){
-            fprintf(stderr,"luc install: download failed for luc-win.exe\n");
-            remove(exetmp); remove(dlltmp); return 1;
-        }
-        pkg_fmt_size(sz,hs,sizeof hs);
-        printf("  luc-win.exe  %s\n",hs);
-    }
-
-    if(!pkg_put_file(dlltmp,dll)){
-        fprintf(stderr,"luc install: cannot replace SDL2.dll (close other LUC programs)\n");
-        if(!offline){ remove(dlltmp); remove(exetmp); }
-        return 1;
-    }
-    char exe[1200]; pkg_install_path(exe,sizeof exe,"luc.exe");
-    int moved_old=0;
-    if(pkg_file_exists(exe)){
-#if defined(_WIN32)
-        moved_old=MoveFileExA(exe,oldexe,MOVEFILE_REPLACE_EXISTING)? 1:0;
-#else
-        remove(oldexe);
-        moved_old=(rename(exe,oldexe)==0);
-#endif
-    }
-    if(!pkg_put_file(exetmp,exe)){
-        fprintf(stderr,"luc install: cannot replace luc.exe (close other LUC programs)\n");
-        if(!offline) remove(exetmp);
-        return 1;
-    }
-    /* Media extras: missing files only degrade features, warn only */
-    { static const char *extra[]={
-        "SDL2_ttf.dll","SDL2_image.dll","SDL2_mixer.dll",
-        "libfreetype-6.dll","libharfbuzz-0.dll","libbz2-1.dll",
-        "libpng16-16.dll","zlib1.dll","libbrotlidec.dll","libbrotlicommon.dll",
-        "libgraphite2.dll","libglib-2.0-0.dll","libintl-8.dll","libpcre2-8-0.dll",
-        "libiconv-2.dll","libjpeg-8.dll","libmpg123-0.dll","libogg-0.dll",
-        "libopus-0.dll","libopusfile-0.dll","libvorbis-0.dll","libvorbisfile-3.dll",
-        "libFLAC.dll","libgcc_s_seh-1.dll","libstdc++-6.dll","libwinpthread-1.dll",
-        "DejaVuSans.ttf",NULL
-    };
-      char dest[1200],src[1300],u[1200]; long s2=0;
-      char exedir[1200];
-      if(!pkg_exe_dir(exedir,sizeof exedir)) snprintf(exedir,sizeof exedir,".");
-      for(int k=0;extra[k];k++){
-        int dn=snprintf(dest,sizeof dest,"%s/%s",exedir,extra[k]);
-        if(dn<0||(size_t)dn>=sizeof dest){
-            printf("luc install: warning: install path is too long for %s\n",extra[k]);
-            continue;
-        }
-        if(!force && pkg_file_exists(dest)) continue;
-        snprintf(src,sizeof src,"%s/%s",pd,extra[k]);
-        if(offline && pkg_file_exists(src)){
-            if(!pkg_put_file(src,dest))
-                printf("luc install: warning: cannot install %s (file in use?)\n",extra[k]);
-            else printf("  %s\n",extra[k]);
-        } else if(!offline){
-            pkg_join_url(u,sizeof u,"dist/app/");
-            strncat(u,extra[k],sizeof u-strlen(u)-1);
-            printf("downloading %s\n",u);
-            s2=0;
-            snprintf(src,sizeof src,"%s.tmp",dest);
-            if(!pkg_http_get(u,src,&s2)){ remove(src);
-                printf("luc install: warning: download failed for %s (skipped)\n",extra[k]);
-                continue; }
-            if(!pkg_put_file(src,dest)){
-                printf("luc install: warning: cannot install %s (file in use?)\n",extra[k]);
-                remove(src); continue;
-            }
-            { char hs[32]; pkg_fmt_size(s2,hs,sizeof hs); printf("  %s  %s\n",extra[k],hs); }
-        }
-      } }
-    printf("installed window support.\n");
-    if(moved_old) printf("note: the old interpreter is kept as luc.exe.old (safe to delete).\n");
-    printf("try: luc demos/window_libaries/pong.luc\n");
-    return 0;
+/* "why did the download fail" for messages */
+static void pkg_report_fail(const char *what){
+    if(g_pkg_neterr)
+        fprintf(stderr,"luc install: no internet connection - could not download %s\n"
+                       "  packages are always downloaded from %s\n"
+                       "  check your connection (or proxy) and try again\n",what,pkg_base_url());
+    else if(g_pkg_status)
+        fprintf(stderr,"luc install: the server answered HTTP %d for %s\n",g_pkg_status,what);
+    else
+        fprintf(stderr,"luc install: could not download %s\n",what);
 }
 
-/* Unpack bundle: '#=lucfile:' switches files, CRLF normalized */
+/* GET <base>/<rel> into <tmp>, with a progress bar labelled <label>. 1 = ok */
+static int pkg_fetch(const char *rel,const char *tmp,const char *label,long *size){
+    char url[1200];
+    long sz=0;
+    int ok;
+    pkg_join_url(url,sizeof url,rel);
+    g_pkg_label=label;
+    ok=pkg_http_get(url,tmp,&sz);
+    g_pkg_label=NULL;
+    if(size) *size=sz;
+    return ok;
+}
+
+/* Bundle format: "#=lucpkg: name" header, "#=lucfile: <name>" starts a file, "#=endpkg" ends.
+   All-or-nothing: the whole bundle is validated, written as <name>.part files, and only then
+   renamed over the old files - a broken download never leaves half-updated modules. */
 static int pkg_unpack_bundle(const char *path,const char *outdir){
     int len; char *src=read_file(path,&len);
+    char names[128][256];
+    int count=0, pass, ok=1;
     if(!src) return -1;
-    FILE *cur=NULL;
-    int count=0;
-    size_t i=0;
-    while(i<(size_t)len){
-        char *line=src+i;
-        char *nl=(char*)memchr(line,'\n',(size_t)len-i);
-        size_t ll=nl? (size_t)(nl-line) : (size_t)len-i;
-        size_t wl=ll;                          /* write length w/o CR */
-        if(wl>0 && line[wl-1]=='\r') wl--;
-        if(wl>=11 && !strncmp(line,"#=lucfile: ",11)){
-            if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
-            char name[256];
-            size_t n2=wl-11;
-            if(n2==0 || n2>=sizeof name){ free(src); if(cur) fclose(cur); return -1; }
-            memcpy(name,line+11,n2); name[n2]=0;
-            if(strchr(name,'/')||strchr(name,'\\')||strchr(name,':')||
-               !strcmp(name,".")||!strcmp(name,"..")){
-                free(src); if(cur) fclose(cur); return -1; }
-            char out[1400];
-            snprintf(out,sizeof out,"%s/%s",outdir,name);
-            cur=fopen(out,"wb");
-            if(!cur){ free(src); return -1; }
-            count++;
-        } else if(wl>=8 && !strncmp(line,"#=endpkg",8)){
-            if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
-        } else if(wl>=9 && !strncmp(line,"#=lucpkg:",9)){
-/* header, ignore */
-        } else if(cur){
-            if(fwrite(line,1,wl,cur)!=wl || fputc('\n',cur)==EOF){ /* track error */
-                /* close and mark failure */
-                fclose(cur); cur=NULL;
-                free(src); return -1;
+    if(len<9 || strncmp(src,"#=lucpkg:",9)!=0){ free(src); return -1; }   /* e.g. an HTML error page */
+    for(pass=0;pass<2 && ok;pass++){
+        FILE *cur=NULL;
+        size_t i=0;
+        count=0;
+        while(i<(size_t)len){
+            char *line=src+i;
+            char *nl=(char*)memchr(line,'\n',(size_t)len-i);
+            size_t ll=nl? (size_t)(nl-line) : (size_t)len-i;
+            size_t wl=ll;
+            if(wl>0 && line[wl-1]=='\r') wl--;
+            if(wl>=11 && !strncmp(line,"#=lucfile: ",11)){
+                size_t n2=wl-11;
+                if(cur){ if(fclose(cur)!=0) ok=0; cur=NULL; }
+                if(n2==0 || n2>=sizeof names[0] || count>=128){ ok=0; break; }
+                memcpy(names[count],line+11,n2); names[count][n2]=0;
+                if(strchr(names[count],'/')||strchr(names[count],'\\')||strchr(names[count],':')||
+                   names[count][0]=='.'){ ok=0; break; }
+                if(pass==1){
+                    char out[1400];
+                    snprintf(out,sizeof out,"%s/%s.part",outdir,names[count]);
+                    cur=fopen(out,"wb");
+                    if(!cur){ ok=0; break; }
+                }
+                count++;
+            } else if(wl>=8 && !strncmp(line,"#=endpkg",8)){
+                if(cur){ if(fclose(cur)!=0) ok=0; cur=NULL; }
+            } else if(wl>=9 && !strncmp(line,"#=lucpkg:",9)){
+                /* header */
+            } else if(cur){
+                if(fwrite(line,1,wl,cur)!=wl || fputc('\n',cur)==EOF){ ok=0; break; }
             }
+            i+=ll+(nl?1:0);
         }
-        i+=ll+(nl?1:0);
+        if(cur){ if(fclose(cur)!=0) ok=0; }
+        if(count==0) ok=0;
     }
-    if(cur){ if(fclose(cur)!=0){ free(src); return -1; } cur=NULL; }
     free(src);
-    return count;
+    for(int k=0;k<count;k++){
+        char part[1400],dest[1400];
+        snprintf(part,sizeof part,"%s/%s.part",outdir,names[k]);
+        snprintf(dest,sizeof dest,"%s/%s",outdir,names[k]);
+        if(!ok){ remove(part); continue; }
+#if defined(_WIN32)
+        if(!MoveFileExA(part,dest,MOVEFILE_REPLACE_EXISTING)){ remove(part); ok=0; }
+#else
+        if(rename(part,dest)!=0){ remove(part); ok=0; }
+#endif
+    }
+    return ok? count : -1;
 }
 
-static int pkg_install_ai(void){
-    char mods[1200],tmp[1300],url[1200],pkg[1300];
+/* ai / discord: one .lucpkg bundle unpacked into luc_modules next to luc.exe */
+static int pkg_install_bundle(const char *name){
+    char mods[1200],tmp[1300],rel[256],label[64];
     long sz=0;
-    int offline;
+    int n;
     pkg_install_path(mods,sizeof mods,"luc_modules");
     pkg_mkdir(mods);
-    /* Bundled packages/ai.lucpkg next to exe: try first */
-    pkg_install_path(pkg,sizeof pkg,"packages/ai.lucpkg");
-    offline=pkg_file_exists(pkg);
-    if(offline){
-        printf("using bundled package: %s\n",pkg);
-        snprintf(tmp,sizeof tmp,"%s",pkg);
-    } else {
-        snprintf(tmp,sizeof tmp,"%s/ai.lucpkg.tmp",mods);
-        pkg_join_url(url,sizeof url,"packages/ai.lucpkg");
-        printf("downloading %s\n",url);
-        if(!pkg_http_get(url,tmp,&sz)){
-            fprintf(stderr,"luc install: download failed (no internet, and no\n");
-            fprintf(stderr,"  packages/ai.lucpkg folder next to luc.exe)\n");
-            remove(tmp); return 1;
-        }
-        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
-        printf("  ai.lucpkg  %s\n",hs);
-    }
-    int n=pkg_unpack_bundle(tmp,mods);
-    if(!offline) remove(tmp);
+    snprintf(tmp,sizeof tmp,"%s/%s.lucpkg.tmp",mods,name);
+    snprintf(rel,sizeof rel,"packages/%s.lucpkg",name);
+    snprintf(label,sizeof label,"%s",name);
+    if(!pkg_fetch(rel,tmp,label,&sz)){ remove(tmp); pkg_report_fail(rel); return 1; }
+    n=pkg_unpack_bundle(tmp,mods);
+    remove(tmp);
     if(n<=0){
-        fprintf(stderr,"luc install: package file is empty or invalid\n");
+        fprintf(stderr,"luc install: the downloaded %s package is damaged; nothing was changed\n",name);
         return 1;
     }
-    printf("installed %d modules -> %s\n",n,mods);
-    printf("try: luc -e \"import ai print(ai.Tensor)\"\n");
+    { char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
+      printf("  %-9s installed  %d files, %s\n",name,n,hs); }
     return 0;
 }
 
-static int pkg_install_discord(void){
-    char mods[1200],tmp[1300],url[1200],pkg[1300];
-    long sz=0;
-    int offline;
-    pkg_install_path(mods,sizeof mods,"luc_modules");
-    pkg_mkdir(mods);
-    /* Bundled packages/discord.lucpkg next to exe: try first */
-    pkg_install_path(pkg,sizeof pkg,"packages/discord.lucpkg");
-    offline=pkg_file_exists(pkg);
-    if(offline){
-        printf("using bundled package: %s\n",pkg);
-        snprintf(tmp,sizeof tmp,"%s",pkg);
-    } else {
-        snprintf(tmp,sizeof tmp,"%s/discord.lucpkg.tmp",mods);
-        pkg_join_url(url,sizeof url,"packages/discord.lucpkg");
-        printf("downloading %s\n",url);
-        if(!pkg_http_get(url,tmp,&sz)){
-            fprintf(stderr,"luc install: download failed (no internet, and no\n");
-            fprintf(stderr,"  packages/discord.lucpkg folder next to luc.exe)\n");
-            remove(tmp); return 1;
-        }
-        char hs[32]; pkg_fmt_size(sz,hs,sizeof hs);
-        printf("  discord.lucpkg  %s\n",hs);
-    }
-    int n=pkg_unpack_bundle(tmp,mods);
-    if(!offline) remove(tmp);
-    if(n<=0){
-        fprintf(stderr,"luc install: package file is empty or invalid\n");
+static const char *WINDOW_EXTRA[]={
+    "SDL2_ttf.dll","SDL2_image.dll","SDL2_mixer.dll",
+    "libfreetype-6.dll","libharfbuzz-0.dll","libbz2-1.dll",
+    "libpng16-16.dll","zlib1.dll","libbrotlidec.dll","libbrotlicommon.dll",
+    "libgraphite2.dll","libglib-2.0-0.dll","libintl-8.dll","libpcre2-8-0.dll",
+    "libiconv-2.dll","libjpeg-8.dll","libmpg123-0.dll","libogg-0.dll",
+    "libopus-0.dll","libopusfile-0.dll","libvorbis-0.dll","libvorbisfile-3.dll",
+    "libFLAC.dll","libgcc_s_seh-1.dll","libstdc++-6.dll","libwinpthread-1.dll",
+    "DejaVuSans.ttf",NULL
+};
+
+/* window: SDL2 + media DLLs and the window build of luc.exe. Everything is downloaded to
+   .tmp files first; nothing is replaced unless SDL2.dll and luc-win.exe both arrived. */
+static int pkg_install_window(int force){
+    char dll[1200],dlltmp[1250],exe[1200],exetmp[1300],oldexe[1250];
+    char dir[1024],dest[1300],tmp[1400],rel[256];
+    long total=0, sz=0;
+    int nextra=0, nmissing=0, k;
+#if !defined(_WIN32)
+    if(!getenv("LUC_PKG_SELFTEST")){
+        fprintf(stderr,"luc install: the window package is for Windows only\n");
         return 1;
     }
-    printf("installed %d modules -> %s\n",n,mods);
-    printf("get a bot token at https://discord.com/developers/applications\n");
-    return 0;
-}
-
-static int cmd_install(int argc,char **argv){
-    if(argc<3){
-        char dir[1024];
-        int have=pkg_exe_dir(dir,sizeof dir);
-        printf("LUC package installer  (source: %s)\n",pkg_base_url());
-        printf("  the bundled packages folder (from the installer) is used first\n");
-        for(size_t k=0;k<sizeof PKGS/sizeof PKGS[0];k++){
-            char p[1200];
-            int inst=0;
-            if(have){
-                if(!strcmp(PKGS[k].name,"window")) snprintf(p,sizeof p,"%s/SDL2.dll",dir);
-                else if(!strcmp(PKGS[k].name,"ai")) snprintf(p,sizeof p,"%s/luc_modules/ai.luc",dir);
-                else snprintf(p,sizeof p,"%s/luc_modules/discord.luc",dir);
-                inst=pkg_file_exists(p);
-            }
-            printf("  %-8s %-58s [%s]\n",PKGS[k].name,PKGS[k].desc,inst?"installed":"not installed");
-        }
-        printf("\nusage: luc install <name>            install a package (window, ai, discord)\n");
-        printf("       luc install window --force    redownload window support\n");
+#endif
+    pkg_install_path(dll,sizeof dll,"SDL2.dll");
+    if(!force && pkg_file_exists(dll)){
+        printf("  window    already installed (luc install -p window --force downloads it again)\n");
         return 0;
     }
-    const char *name=argv[2];
-    int force=(argc>3 && (!strcmp(argv[3],"--force")||!strcmp(argv[3],"-f")));
+    if(!pkg_exe_dir(dir,sizeof dir)) snprintf(dir,sizeof dir,".");
+    snprintf(dlltmp,sizeof dlltmp,"%s.tmp",dll);
+    pkg_install_path(exe,sizeof exe,"luc.exe");
+    pkg_install_path(exetmp,sizeof exetmp,"luc-new.exe.tmp");
+    pkg_install_path(oldexe,sizeof oldexe,"luc.exe.old");
+    remove(oldexe);                                   /* stale backup from a previous swap */
+
+    if(!pkg_fetch("dist/app/SDL2.dll",dlltmp,"SDL2.dll",&sz)||!pkg_has_pe_magic(dlltmp)){
+        remove(dlltmp); pkg_report_fail("SDL2.dll"); return 1; }
+    total+=sz;
+    if(!pkg_fetch("dist/app/luc-win.exe",exetmp,"luc.exe",&sz)||!pkg_has_pe_magic(exetmp)){
+        remove(dlltmp); remove(exetmp); pkg_report_fail("luc-win.exe"); return 1; }
+    total+=sz;
+    for(k=0;WINDOW_EXTRA[k];k++){                     /* extras: a missing one only disables a feature */
+        snprintf(dest,sizeof dest,"%s/%s",dir,WINDOW_EXTRA[k]);
+        if(!force && pkg_file_exists(dest)) continue;
+        snprintf(tmp,sizeof tmp,"%s.tmp",dest);
+        snprintf(rel,sizeof rel,"dist/app/%s",WINDOW_EXTRA[k]);
+        sz=0;
+        if(!pkg_fetch(rel,tmp,WINDOW_EXTRA[k],&sz)){
+            remove(tmp);
+            if(g_pkg_neterr){ /* connection dropped: undo everything */
+                for(int j=0;j<k;j++){ char t2[1400]; snprintf(t2,sizeof t2,"%s/%s.tmp",dir,WINDOW_EXTRA[j]); remove(t2); }
+                remove(dlltmp); remove(exetmp); pkg_report_fail(WINDOW_EXTRA[k]); return 1;
+            }
+            nmissing++;
+            continue;
+        }
+        total+=sz;
+    }
+    /* swap in */
+    if(!pkg_put_file(dlltmp,dll)){
+        fprintf(stderr,"luc install: cannot replace SDL2.dll (close other LUC programs and retry)\n");
+        remove(dlltmp); remove(exetmp); return 1;
+    }
+    {
+        int moved_old=0;
+        if(pkg_file_exists(exe)){
+#if defined(_WIN32)
+            moved_old=MoveFileExA(exe,oldexe,MOVEFILE_REPLACE_EXISTING)? 1:0;
+#else
+            moved_old=(rename(exe,oldexe)==0);
+#endif
+        }
+        if(!pkg_put_file(exetmp,exe)){
+            if(moved_old) pkg_put_file(oldexe,exe);    /* put the old interpreter back */
+            fprintf(stderr,"luc install: cannot replace luc.exe (close other LUC programs and retry)\n");
+            remove(exetmp); return 1;
+        }
+    }
+    for(k=0;WINDOW_EXTRA[k];k++){
+        snprintf(dest,sizeof dest,"%s/%s",dir,WINDOW_EXTRA[k]);
+        snprintf(tmp,sizeof tmp,"%s.tmp",dest);
+        if(!pkg_file_exists(tmp)) continue;
+        if(!pkg_put_file(tmp,dest)){ remove(tmp); printf("  warning: cannot replace %s (file in use?)\n",WINDOW_EXTRA[k]); }
+        else nextra++;
+    }
+    { char hs[32]; pkg_fmt_size(total,hs,sizeof hs);
+      printf("  %-9s installed  luc.exe + SDL2 + %d media files, %s\n","window",nextra,hs); }
+    if(nmissing) printf("  note: %d optional media file%s not on the server (some image/sound formats may be missing)\n",
+                        nmissing,nmissing==1?" was":"s were");
+    return 0;
+}
+
+static int pkg_is_installed(const char *name){
+    char p[1300];
+    if(!strcmp(name,"window")) pkg_install_path(p,sizeof p,"SDL2.dll");
+    else if(!strcmp(name,"ai")) pkg_install_path(p,sizeof p,"luc_modules/ai.luc");
+    else if(!strcmp(name,"discord")) pkg_install_path(p,sizeof p,"luc_modules/discord.luc");
+    else return 0;
+    return pkg_file_exists(p);
+}
+
+static int pkg_install_one(const char *name,int force){
     if(!strcmp(name,"window")) return pkg_install_window(force);
-    if(!strcmp(name,"ai"))     return pkg_install_ai();
-    if(!strcmp(name,"discord")) return pkg_install_discord();
+    if(!strcmp(name,"ai")||!strcmp(name,"discord")) return pkg_install_bundle(name);
     fprintf(stderr,"luc install: unknown package '%s' (available: window, ai, discord)\n",name);
     return 1;
+}
+
+static int luc_stdin_console(void);
+
+/* Read one key for the package menu: 'u'/'d' arrows, '\n' enter, 27 esc, or the char */
+static int pkg_menu_key(void){
+#if defined(_WIN32)
+    int c=_getch();
+    if(c==0||c==0xE0){ c=_getch(); return c==72?'u' : c==80?'d' : 0; }
+    if(c=='\r') return '\n';
+    return c;
+#else
+    unsigned char c;
+    if(read(STDIN_FILENO,&c,1)!=1) return 27;
+    if(c==27){
+        unsigned char s2[2];
+        struct termios t; tcgetattr(STDIN_FILENO,&t);
+        /* lone Esc vs. an arrow sequence: peek with a short timeout */
+        struct termios t2=t; t2.c_cc[VMIN]=0; t2.c_cc[VTIME]=1; tcsetattr(STDIN_FILENO,TCSANOW,&t2);
+        int n=(int)read(STDIN_FILENO,s2,2);
+        tcsetattr(STDIN_FILENO,TCSANOW,&t);
+        if(n==2 && s2[0]=='[') return s2[1]=='A'?'u' : s2[1]=='B'?'d' : 0;
+        return 27;
+    }
+    if(c=='\r') return '\n';
+    return c;
+#endif
+}
+
+/* "luc install -p" with no name: pick a package, Enter installs it right away */
+static int pkg_menu(void){
+    int n=(int)(sizeof PKGS/sizeof PKGS[0]), sel=0, key, i, rc;
+    if(!luc_stdin_console() || !luc_stdout_console()){
+        printf("LUC packages (downloaded from %s):\n",pkg_base_url());
+        for(i=0;i<n;i++)
+            printf("  %-8s %-52s %s\n",PKGS[i].name,PKGS[i].desc,pkg_is_installed(PKGS[i].name)?"installed":"");
+        printf("install with: luc install -p <name>    (-f / --force downloads again)\n");
+        return 0;
+    }
+    for(i=0;i<n;i++) if(!pkg_is_installed(PKGS[i].name)){ sel=i; break; }
+#if !defined(_WIN32)
+    struct termios old,raw;
+    tcgetattr(STDIN_FILENO,&old); raw=old;
+    raw.c_lflag&=~(ICANON|ECHO); raw.c_cc[VMIN]=1; raw.c_cc[VTIME]=0;
+    tcsetattr(STDIN_FILENO,TCSANOW,&raw);
+#endif
+    printf("LUC packages  -  Up/Down + Enter installs, Esc cancels\n\x1b[?25l");
+    for(;;){
+        for(i=0;i<n;i++){
+            int on=pkg_is_installed(PKGS[i].name);
+            const char *d=PKGS[i].desc, *cut=strstr(d," (");
+            int dl=cut? (int)(cut-d) : (int)strlen(d);
+            if(dl>40) dl=40;                           /* one row per package, or the redraw breaks */
+            printf("\r\x1b[K%s %d. %-8s %-40.*s %s\x1b[0m\n",
+                   i==sel?"\x1b[7m>":" ",i+1,PKGS[i].name,dl,d,on?"installed":"");
+        }
+        fflush(stdout);
+        key=pkg_menu_key();
+        if(key=='u') sel=(sel+n-1)%n;
+        else if(key=='d') sel=(sel+1)%n;
+        else if(key>='1' && key<'1'+n){ sel=key-'1'; key='\n'; }
+        if(key=='\n'||key==27||key=='q') break;
+        printf("\x1b[%dA",n);                          /* redraw the list in place */
+    }
+    printf("\x1b[?25h");
+#if !defined(_WIN32)
+    tcsetattr(STDIN_FILENO,TCSANOW,&old);
+#endif
+    if(key!='\n'){ printf("cancelled\n"); return 0; }
+    rc=pkg_install_one(PKGS[sel].name,pkg_is_installed(PKGS[sel].name)); /* installed: download again */
+    return rc;
+}
+
+/* luc install -p [name...] [-f|--force] */
+static int cmd_install(int argc,char **argv){
+    int force=0, rc=0, any=0;
+    for(int i=3;i<argc;i++)
+        if(!strcmp(argv[i],"-f")||!strcmp(argv[i],"--force")) force=1;
+        else if(argv[i][0]=='-'){
+            fprintf(stderr,"luc install -p: unknown option '%s' (only -f / --force)\n",argv[i]);
+            return 1;
+        }
+    for(int i=3;i<argc;i++){
+        if(argv[i][0]=='-') continue;
+        any=1;
+        if(pkg_install_one(argv[i],force)!=0) rc=1;
+    }
+    if(!any) return pkg_menu();
+    return rc;
 }
 
 static int luc_remove_user_library(const char *name){
@@ -4517,7 +4692,7 @@ static void print_help(void){
     "install and editor\n"
     "  luc install                 open the installer/maintenance UI\n"
     "  luc install -c window,ai -d FOLDER -y   unattended install\n"
-    "  luc install <pkg>           install an optional package: window, ai, discord\n"
+    "  luc install -p [pkg]        add a package from GitHub: window, ai, discord (menu if no name)\n"
     "  luc remove <name>           remove an optional system or user library\n"
     "  luc uninstall [-y|-n]       uninstall LUC; -y confirms, -n cancels\n"
     "  luc lcode [path]            open the LCode editor (also --lcode / --edit)\n"
@@ -4836,8 +5011,18 @@ static int luc_stdin_console(void){
     DWORD m=0;
     return h && h!=INVALID_HANDLE_VALUE && GetConsoleMode(h,&m);
 }
+/* stdout is a console that understands ANSI escapes (enabled here if needed) */
+static int luc_stdout_console(void){
+    HANDLE h=GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD m=0;
+    if(!h || h==INVALID_HANDLE_VALUE || !GetConsoleMode(h,&m)) return 0;
+    if(!(m&ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+        if(!SetConsoleMode(h,m|ENABLE_VIRTUAL_TERMINAL_PROCESSING)) return 0;
+    return 1;
+}
 #else
 static int luc_stdin_console(void){ return isatty(STDIN_FILENO); }
+static int luc_stdout_console(void){ return isatty(STDOUT_FILENO); }
 #endif
 /* LUC_REPL=1 forces shell, even piped */
 static int repl_wanted(void){ return luc_stdin_console() || getenv("LUC_REPL") != NULL; }
@@ -4869,7 +5054,7 @@ static const HelpTopic HELP_TOPICS[] = {
  "  luc --version               Show the LUC version.\n"
  "  luc --help                  Show command-line help.\n"
  "  luc --libs                  List core, installed system, and user libraries.\n"
- "  luc install [name]          Open installer or install window, ai, discord.\n"
+ "  luc install -p [name]       Download a package: window, ai, discord (menu if no name).\n"
  "  luc remove <name>           Remove an installed system or user library.\n"
  "  luc install -c window,ai -d FOLDER -y   Unattended install.\n"
  "  luc install                 Open the installer/maintenance UI.\n"
@@ -5022,7 +5207,7 @@ static const HelpTopic HELP_TOPICS[] = {
  "!karatsuba on the first line: every integer-string * here is exact."},
 {"ai",
  "import ai: lanternl mini-PyTorch. ai.Train for numbers, ai.LMTrain for text.\n"
- "Needs: luc install ai. See demos/ai_libaries/."},
+ "Needs: luc install -p ai. See demos/ai_libaries/."},
 {"net",
  "import net(\"n\"): TCP + HTTP. n.get(url), n.post(url, body), n.request(method, url, body), n.serve(port).\n"
  "See demos/net_libaries/."},
@@ -5033,10 +5218,10 @@ static const HelpTopic HELP_TOPICS[] = {
  "Touch: touches/touch_pressed/released. Gamepad: pad_count/button/axis/name.\n"
  "System: clipboard, message, open_url, os_name. Window: fullscreen, minimize,\n"
  "maximize/restore, move_window, display_size. Sound: play/stop/pause_sound.\n"
- "Needs: luc install window. See demos/window_libaries/."},
+ "Needs: luc install -p window. See demos/window_libaries/."},
 {"discord",
  "import discord: chat bots with prefix/slash commands and buttons.\n"
- "Needs a token + luc install discord. See demos/discord_libaries/."},
+ "Needs a token + luc install -p discord. See demos/discord_libaries/."},
 {NULL,NULL}
 };
 
@@ -5513,9 +5698,19 @@ int main(int argc,char **argv){
     }
 
     if(strcmp(argv[1],"install")==0){
-        if(argc==2 || (argc>2 && argv[2][0]=='-'))
+        /* luc install            -> installs/maintains LUC itself (install.ps1)
+           luc install -p [pkg]   -> optional packages, always downloaded from GitHub */
+        if(argc>2 && (!strcmp(argv[2],"-p")||!strcmp(argv[2],"--package")))
+            return cmd_install(argc,argv);
+        if(argc==2 || argv[2][0]=='-')
             return cmd_installer(argc,argv);
-        return cmd_install(argc,argv);
+        if(!strcmp(argv[2],"window")||!strcmp(argv[2],"ai")||!strcmp(argv[2],"discord"))
+            fprintf(stderr,"luc install: packages are installed with -p:  luc install -p %s\n",argv[2]);
+        else
+            fprintf(stderr,"luc install: unknown argument '%s'\n"
+                           "  luc install            install or repair LUC itself\n"
+                           "  luc install -p <pkg>   add a package (window, ai, discord)\n",argv[2]);
+        return 1;
     }
 
     {

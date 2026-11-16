@@ -33,8 +33,8 @@ static void ed_cmd_hint_draw(Editor *e,int W,int H){
         int idx=first+i;
         if(row<1) continue;
         printf("\x1b[%d;1H",row);
-        if(idx==e->cmdh_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else printf("\x1b[48;2;28;28;28m\x1b[97m");
+        if(idx==e->cmdh_sel) printf("%s",EC_X[XI_ACC]);
+        else printf("%s%s",EC_X[XI_POP],TH_TCUR);
         printf(" \xe2\x97\x8f :%s",items[idx]);
         { int used=(int)strlen(items[idx])+5,k;
           for(k=used;k<26;k++) fputc(' ',stdout); }
@@ -226,19 +226,22 @@ static int ed_ex_item_draw(Editor *e,size_t ei,int cwmax){
         if(!ndi) ndi=&DEVICON_DEF;
     }
     sel=(e->focus==1&&e->exsel_ok&&ei==e->exsel)||namrow;
-    if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
+    if(sel) printf("%s",EC_X[XI_ACC]);
     else {
         col=isd||e->icons_nerd
                     ? ((ed_dir_dirty(e,e->ex[ei].full)||
                         (!isd&&ed_path_dirty(e,e->ex[ei].full)))?33:0)
                     : (ed_path_dirty(e,e->ex[ei].full)?33:ed_ex_color(nm,isd));
-        if(col) printf("\x1b[%dm",col);
+        printf("%s",ed_ex_col_seq(col));
     }
     if(e->opt_guides){
-        for(i=1;i<dep&&cw<cwmax-6;i++){ fputs("\x1b[90m\xe2\x94\x82\x1b[0m ",stdout); cw+=2; }
+        for(i=1;i<dep&&cw<cwmax-6;i++){
+            /* guide line; restore the row background (a bare reset would drop to the terminal's) */
+            printf("%s\xe2\x94\x82%s ",TH_TDIM,sel?EC_X[XI_ACC]:EC_EXBG);
+            cw+=2; }
         if(cw<cwmax-6){ fputc(' ',stdout); fputc(' ',stdout); cw+=2; }
-        if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else if(col) printf("\x1b[%dm",col);
+        if(sel) printf("%s",EC_X[XI_ACC]);
+        else printf("%s",ed_ex_col_seq(col));
     } else {
         for(i=0;i<dep*2&&cw<cwmax-6;i++){ fputc(' ',stdout); cw++; }
     }
@@ -250,9 +253,9 @@ static int ed_ex_item_draw(Editor *e,size_t ei,int cwmax){
         if(!sel) printf("\x1b[38;2;%u;%u;%um",
             (ndi->rgb>>16)&255,(ndi->rgb>>8)&255,ndi->rgb&255);
         fwrite(ib,1,(size_t)m,stdout);
-        printf("\x1b[0m");
-        if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else if(col) printf("\x1b[%dm",col);
+        printf("%s",sel?EC_X[XI_ACC]:EC_EXBG);
+        if(sel) printf("%s",EC_X[XI_ACC]);
+        else printf("%s",ed_ex_col_seq(col));
         cw+=1; }
     else { fputc(' ',stdout); fputc(' ',stdout); cw+=2; }
     fputc(' ',stdout); cw++;
@@ -306,7 +309,8 @@ static void ed_draw(Editor *e){
         H=bi.srWindow.Bottom-bi.srWindow.Top+1;
         sync=1;   /* real console: wrap the frame so it paints atomically */
     }
-    if(H<6) H=6; if(W<40) W=40;
+    if(H<6) H=6;
+    if(W<40) W=40;
     /* Keep both panes usable at any console size */
     if(e->exw<ED_EXW_MIN) e->exw=ED_EXW_MIN;
     { int maxex=W-24; if(maxex<ED_EXW_MIN) maxex=ED_EXW_MIN;
@@ -373,17 +377,17 @@ static void ed_draw(Editor *e){
             if(tx+width>W-2) break;
             start=tx;
             e->tab_x0[ti]=start; e->tab_x1[ti]=start+width;
-            if(!strcmp(e->tab_path[ti],e->path)) printf("\x1b[48;2;45;45;45m\x1b[97m");
-            else printf("\x1b[48;2;22;22;22m%s",TH_TDIM);
+            if(!strcmp(e->tab_path[ti],e->path)) printf("%s%s",EC_X[XI_PAN],TH_TCUR);
+            else printf("%s%s",EC_TOPBG,TH_TDIM);
             printf(" %s ",label);
             tx+=width;
         }
         e->tab_n=ti;
         if(e->tab_n<64&&e->tab_n==0){
             e->tab_x0[0]=0; e->tab_x1[0]=8; e->tab_n=1;
-            printf("\x1b[48;2;45;45;45m\x1b[97m lcode ");
+            printf("%s%s lcode ",EC_X[XI_PAN],TH_TCUR);
         }
-        printf("\x1b[K\x1b[0m\n");
+        printf("%s\x1b[K\x1b[0m\n",EC_TOPBG);
       }
       /* Syntax colors are part of the luc plugin. */
       { int lang=L_NONE;
@@ -399,7 +403,7 @@ static void ed_draw(Editor *e){
             ed_scan_state(e->ln[pre].b,e->ln[pre].len,&pcm,&pst,lang); }
         for(r=0;r<CROWS;r++){
           size_t li=e->top+r;
-          printf("\x1b[%d;1H\x1b[K",r+2);
+          printf("\x1b[%d;1H%s\x1b[K",r+2,EC_CODEBG);
           /* Code pane (anchored independently so the sidebar can sit on either side) */
           printf("\x1b[%d;%dH",r+2,codex+1);
           ed_find_hl_begin(e,li);
@@ -409,11 +413,12 @@ static void ed_draw(Editor *e){
               size_t dd=0;
               int iscur=(li==e->cy && e->focus==0);
               int dmark=ed_diag_has(e,li);
-              printf(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG));
+              fputs(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG),stdout);
               if(dmark) printf("\x1b[91m%*d  ! \x1b[0m",digits,(int)li+1);
               else if(iscur||ed_hl_findbg) printf("%s%*d    ",TH_TCUR,digits,(int)li+1);
               else printf("%s%*d    ",TH_TDIM,digits,(int)li+1);
-              printf(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG));
+              fputs(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG),stdout);
+              printf("%s",EC_X[XI_TXT]);   /* plain code text: theme color, not the terminal's */
               while(kk<LL&&dd<e->dleft){ int w0=ed_chw((unsigned char)lb[kk],col); dd+=(size_t)w0; col+=w0; kk++; }
               while(kk<LL&&ed_is_cont((unsigned char)lb[kk])) kk++;
               ed_hl_bg=iscur?2:1;
@@ -431,7 +436,7 @@ static void ed_draw(Editor *e){
                            has_sel,sel_s,sel_e); }
               ed_hl_bg=0;
               ed_scan_state(lb,LL,&pcm,&pst,lang);
-              printf(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG));
+              fputs(ed_hl_findbg?EC_SELBG:(iscur?EC_LINEBG:EC_CODEBG),stdout);
               printf("\x1b[K\x1b[0m");
           } else { printf("%s\x1b[K\x1b[0m",EC_CODEBG); }
           { int thumb_start=0,thumb_len=0;
@@ -445,7 +450,8 @@ static void ed_draw(Editor *e){
               printf("\x1b[%d;%dH%s",r+2,exx+1,EC_EXBG);
               if(r==0){
                   int tw=(int)strlen(e->ex_title), kk;
-                  if(tw>exvw-4) tw=exvw-4; if(tw<0) tw=0;
+                  if(tw>exvw-4) tw=exvw-4;
+                  if(tw<0) tw=0;
                   printf("%s%.*s",TH_TDIM,tw,e->ex_title);
                   for(kk=tw;kk<exvw-4;kk++) fputc(' ',stdout);
                   if(exvw>=4) printf("... ");
@@ -453,6 +459,7 @@ static void ed_draw(Editor *e){
                   printf("\x1b[0m");
               } else if(r==1){
                   const char *dd=e->exdir, *bb=dd;
+                  printf("%s",EC_X[XI_TXT]);
                   { const char *p=dd; while(*p){ if(*p=='\\'||*p=='/') bb=p+1; p++; } }
                   if(!*bb) bb=dd;
                   printf(e->root_shut?"\xe2\x96\xb8":"\xe2\x96\xbe");
@@ -485,7 +492,7 @@ static void ed_draw(Editor *e){
       /* Terminal panel: title, tail of the log, command input */
       if(ph>0){
         ptop=H-ph;
-        printf("\x1b[%d;1H\x1b[K%s",ptop+1,EC_TOPBG);
+        printf("\x1b[%d;1H%s\x1b[K",ptop+1,EC_TOPBG);
         { int ptw=(int)strlen(e->panel_title); if(ptw>W-2) ptw=W-2;
           printf("%s %.*s",TH_TCUR,ptw,e->panel_title); }
         { int used=1+(int)strlen(e->panel_title); if(used>W-2) used=W-2;
@@ -502,7 +509,7 @@ static void ed_draw(Editor *e){
           if(e->log_scroll<0) e->log_scroll=0; }
         for(r=0;r<outn;r++){
             int idx=e->logn-outn-e->log_scroll+r;
-            printf("\x1b[%d;1H\x1b[K%s",ptop+2+r,EC_LOGBG);
+            printf("\x1b[%d;1H%s\x1b[K",ptop+2+r,EC_LOGBG);
             if(idx<0){
                 if(r==0) printf("%s%s output, shell messages, and status appear here",TH_TDIM,e->panel_title);
             } else if(idx==e->logn-1) printf("%s%.*s",TH_TCUR,W-2,e->logs[idx]);
@@ -515,7 +522,7 @@ static void ed_draw(Editor *e){
           while(*bb){ if(*bb=='\\'||*bb=='/') dd=bb+1; bb++; }
           if(!*dd) dd=e->exdir;
           snprintf(pr,sizeof pr,"%.*s>",(int)sizeof pr-2,dd);
-          printf("\x1b[%d;1H\x1b[K",H);
+          printf("\x1b[%d;1H%s\x1b[K",H,EC_TOPBG);
           printf("%s%s%s ",EC_TOPBG,TH_TCUR,pr);
           pc=(int)strlen(pr)+1;
           if(e->shlen) fwrite(e->shbuf,1,e->shlen,stdout);
@@ -676,6 +683,7 @@ static void ex_expand(Editor *e,size_t idx){
         tn++;
     }while(FindNextFileA(fh,&fd));
     FindClose(fh);
+    if(tn==0){ free(tmp); e->ex[idx].expanded=1; e->root_shut=0; return; }   /* empty folder */
     qsort(tmp,tn,sizeof(ExItem),ex_cmp);
     if(e->exn+tn>ED_EX_MAX){
         for(i=0;i<tn;i++){ free(tmp[i].name); free(tmp[i].full); }

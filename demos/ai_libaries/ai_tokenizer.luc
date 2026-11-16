@@ -1,5 +1,5 @@
 -- demos/ai_libaries/ai_tokenizer.luc -- tiny BPE tokenizer: train, encode, decode
--- needs the ai library (luc install ai)
+-- needs the ai library (luc install -p ai)
 -- run: luc "demos/ai_libaries/ai_tokenizer.luc"
 
 import ai

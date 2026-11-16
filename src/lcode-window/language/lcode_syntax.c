@@ -259,6 +259,44 @@ static char EC_LOGBG[32]="\x1b[48;2;37;37;37m";    /* Log panel bg */
 static char EC_SELBG[32]="\x1b[48;2;38;79;120m";   /* Text selection bg */
 static char TH_TCUR[32]="\x1b[97m";                /* Bright text (gutter current, title) */
 static char TH_TDIM[32]="\x1b[90m";                /* Dim text (gutter, hints) */
+/* Extra theme slots (all optional in a .theme file) */
+#define ED_XFIELDS 21
+enum { XI_TXT=0, XI_ACC, XI_ACCFG, XI_PAN, XI_POP, XI_DIR, XI_LUC, XI_LUA, XI_WARN, XI_BIN,
+       /* dialogs (:setting, :git, :plugin, find panels, suggestions) */
+       XI_MOD, XI_MODL, XI_MODF, XI_ROW, XI_ACCDIM, XI_MFG, XI_MDIM, XI_VAL, XI_ON, XI_ACT,
+       XI_MODB };
+static const char *ED_XNAME[ED_XFIELDS]={
+    "txt","acc","accfg","pan","pop","exdir","exluc","exlua","exwarn","exbin",
+    "modal","modalside","modalfoot","modalrow","accdim","modaltext","modaldim",
+    "value","on","action","modalborder"};
+/* 1 = background slot (48;2;...), 0 = text color (38;2;...) */
+static const char ED_XBG[ED_XFIELDS]={0,1,0,1,1,0,0,0,0,0, 1,1,1,1,1,0,0,0,0,0, 1};
+/* defaults = what lcode always drew (dark/light themes use these as-is) */
+static const char *ED_XDEF[ED_XFIELDS]={
+    "39","48;2;0;120;215","97","48;2;45;45;45","48;2;28;28;28","36","32","34","33","31",
+    "48;2;30;30;30","48;2;17;17;17","48;2;22;22;22","48;2;36;36;36","48;2;0;70;120",
+    "97","90","38;2;120;200;255","92","96",
+    "49"};   /* dialog frame: terminal background unless a theme sets one */
+/* ready-to-print sequences. ACC and ACCDIM carry their text color too (accfg);
+   ACCBG is the accent background alone. Filled by ed_theme_apply_def (called at startup). */
+#define XI_ACCBG ED_XFIELDS
+static char EC_X[ED_XFIELDS+1][48]={
+    "\x1b[39m","\x1b[48;2;0;120;215m\x1b[97m","","\x1b[48;2;45;45;45m","\x1b[48;2;28;28;28m",
+    "\x1b[36m","\x1b[32m","\x1b[34m","\x1b[33m","\x1b[31m",
+    "\x1b[48;2;30;30;30m","\x1b[48;2;17;17;17m","\x1b[48;2;22;22;22m","\x1b[48;2;36;36;36m",
+    "\x1b[48;2;0;70;120m\x1b[97m","\x1b[97m","\x1b[90m","\x1b[38;2;120;200;255m","\x1b[92m","\x1b[96m",
+    "\x1b[49m","\x1b[48;2;0;120;215m"};
+/* Explorer text color for an ANSI code lcode used to emit (0 = plain text) */
+static const char *ed_ex_col_seq(int col){
+    switch(col){
+        case 36: return EC_X[XI_DIR];
+        case 32: return EC_X[XI_LUC];
+        case 34: return EC_X[XI_LUA];
+        case 33: return EC_X[XI_WARN];
+        case 31: return EC_X[XI_BIN];
+        default: return EC_X[XI_TXT];
+    }
+}
 
 typedef struct { const char *name;
     const char *code,*line,*ex,*top,*log,*sel;
@@ -276,30 +314,142 @@ static const ThemeDef THEMES[]={
     {NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL}
 };
 #define ED_NTHEMES 2
-static char ed_theme_cur[16]="dark";
+#define ED_UTHEMES 16        /* extra themes loaded from plugin folders (*.theme) */
+#define ED_THEMEFIELDS 14
+typedef struct { char name[32]; char v[ED_THEMEFIELDS][24]; char x[ED_XFIELDS][24]; } UTheme;
+static UTheme ED_UT[ED_UTHEMES];
+static int ed_nut=0;
+static char ed_theme_cur[32]="dark";
+static int ed_theme_apply_def(const ThemeDef *t,const char *const *x){
+    snprintf(EC_CODEBG,sizeof EC_CODEBG,"\x1b[%sm",t->code);
+    snprintf(EC_LINEBG,sizeof EC_LINEBG,"\x1b[%sm",t->line);
+    snprintf(EC_EXBG,sizeof EC_EXBG,"\x1b[%sm",t->ex);
+    snprintf(EC_TOPBG,sizeof EC_TOPBG,"\x1b[%sm",t->top);
+    snprintf(EC_LOGBG,sizeof EC_LOGBG,"\x1b[%sm",t->log);
+    snprintf(EC_SELBG,sizeof EC_SELBG,"\x1b[%sm",t->sel);
+    snprintf(EC_SEQ[1],sizeof EC_SEQ[1],"%s",t->key);
+    snprintf(EC_SEQ[2],sizeof EC_SEQ[2],"%s",t->str);
+    snprintf(EC_SEQ[3],sizeof EC_SEQ[3],"%s",t->num);
+    snprintf(EC_SEQ[4],sizeof EC_SEQ[4],"%s",t->com);
+    snprintf(EC_SEQ[5],sizeof EC_SEQ[5],"%s",t->fn);
+    snprintf(EC_SEQ[6],sizeof EC_SEQ[6],"%s",t->dir);
+    snprintf(TH_TCUR,sizeof TH_TCUR,"\x1b[%sm",t->tcur);
+    snprintf(TH_TDIM,sizeof TH_TDIM,"\x1b[%sm",t->tdim);
+    { int k;
+      for(k=0;k<ED_XFIELDS;k++) snprintf(EC_X[k],sizeof EC_X[0],"\x1b[%sm",x[k]);
+      /* accent rows also switch the text color; the bare accent bg is kept separately */
+      snprintf(EC_X[XI_ACC],sizeof EC_X[0],"\x1b[%sm\x1b[%sm",x[XI_ACC],x[XI_ACCFG]);
+      snprintf(EC_X[XI_ACCDIM],sizeof EC_X[0],"\x1b[%sm\x1b[%sm",x[XI_ACCDIM],x[XI_ACCFG]);
+      snprintf(EC_X[XI_ACCBG],sizeof EC_X[0],"\x1b[%sm",x[XI_ACC]); }
+    snprintf(ed_theme_cur,sizeof ed_theme_cur,"%s",t->name);
+    return 1;
+}
 static int ed_theme_apply(const char *name){
     int i;
-    for(i=0;i<ED_NTHEMES;i++){
-        const ThemeDef *t=&THEMES[i];
-        if(strcmp(t->name,name)) continue;
-        snprintf(EC_CODEBG,sizeof EC_CODEBG,"\x1b[%sm",t->code);
-        snprintf(EC_LINEBG,sizeof EC_LINEBG,"\x1b[%sm",t->line);
-        snprintf(EC_EXBG,sizeof EC_EXBG,"\x1b[%sm",t->ex);
-        snprintf(EC_TOPBG,sizeof EC_TOPBG,"\x1b[%sm",t->top);
-        snprintf(EC_LOGBG,sizeof EC_LOGBG,"\x1b[%sm",t->log);
-        snprintf(EC_SELBG,sizeof EC_SELBG,"\x1b[%sm",t->sel);
-        snprintf(EC_SEQ[1],sizeof EC_SEQ[1],"%s",t->key);
-        snprintf(EC_SEQ[2],sizeof EC_SEQ[2],"%s",t->str);
-        snprintf(EC_SEQ[3],sizeof EC_SEQ[3],"%s",t->num);
-        snprintf(EC_SEQ[4],sizeof EC_SEQ[4],"%s",t->com);
-        snprintf(EC_SEQ[5],sizeof EC_SEQ[5],"%s",t->fn);
-        snprintf(EC_SEQ[6],sizeof EC_SEQ[6],"%s",t->dir);
-        snprintf(TH_TCUR,sizeof TH_TCUR,"\x1b[%sm",t->tcur);
-        snprintf(TH_TDIM,sizeof TH_TDIM,"\x1b[%sm",t->tdim);
-        snprintf(ed_theme_cur,sizeof ed_theme_cur,"%s",t->name);
-        return 1;
+    for(i=0;i<ED_NTHEMES;i++)
+        if(!strcmp(THEMES[i].name,name)) return ed_theme_apply_def(&THEMES[i],ED_XDEF);
+    for(i=0;i<ed_nut;i++){
+        const UTheme *u=&ED_UT[i];
+        ThemeDef t;
+        if(strcmp(u->name,name)) continue;
+        t.name=u->name;
+        t.code=u->v[0]; t.line=u->v[1]; t.ex=u->v[2]; t.top=u->v[3]; t.log=u->v[4]; t.sel=u->v[5];
+        t.key=u->v[6]; t.str=u->v[7]; t.num=u->v[8]; t.com=u->v[9]; t.fn=u->v[10]; t.dir=u->v[11];
+        t.tcur=u->v[12]; t.tdim=u->v[13];
+        { const char *x[ED_XFIELDS]; int k;
+          for(k=0;k<ED_XFIELDS;k++) x[k]=u->x[k];
+          return ed_theme_apply_def(&t,x); }
     }
     return 0;
+}
+/* All themes: built-in dark/light, then the ones plugins provide */
+static int ed_theme_total(void){ return ED_NTHEMES+ed_nut; }
+static const char *ed_theme_nth(int i){ return i<ED_NTHEMES?THEMES[i].name:ED_UT[i-ED_NTHEMES].name; }
+static void ed_theme_next(void){
+    int i,n=ed_theme_total(),cur=0;
+    for(i=0;i<n;i++) if(!strcmp(ed_theme_nth(i),ed_theme_cur)){ cur=i; break; }
+    ed_theme_apply(ed_theme_nth((cur+1)%n));
+}
+static void ed_theme_names(char *out,size_t cap){
+    int i,n=ed_theme_total(); size_t k=0;
+    if(!cap) return;
+    out[0]=0;
+    for(i=0;i<n;i++){
+        int w=snprintf(out+k,cap-k,"%s%s",i?"|":"",ed_theme_nth(i));
+        if(w<0||(size_t)w>=cap-k) break;
+        k+=(size_t)w;
+    }
+}
+
+/* *.theme files: one theme per file, "field=#rrggbb" (or r,g,b) lines.
+   Fields: code line ex top log sel (backgrounds), key str num com fn dir tcur tdim (text). */
+static const char *ED_TFIELD[ED_THEMEFIELDS]={
+    "code","line","ex","top","log","sel","key","str","num","com","fn","dir","tcur","tdim"};
+static const char *ed_themedef_field(const ThemeDef *t,int i){
+    switch(i){
+        case 0: return t->code; case 1: return t->line; case 2: return t->ex;
+        case 3: return t->top;  case 4: return t->log;  case 5: return t->sel;
+        case 6: return t->key;  case 7: return t->str;  case 8: return t->num;
+        case 9: return t->com;  case 10: return t->fn;  case 11: return t->dir;
+        case 12: return t->tcur; default: return t->tdim;
+    }
+}
+static int ed_hexval(int c){
+    if(c>='0'&&c<='9') return c-'0';
+    if(c>='a'&&c<='f') return c-'a'+10;
+    if(c>='A'&&c<='F') return c-'A'+10;
+    return -1;
+}
+/* "#rrggbb" or "r,g,b" -> 1 and the channels; 0 when malformed */
+static int ed_color_parse(const char *s,int *r,int *g,int *b){
+    while(*s==' '||*s=='\t') s++;
+    if(*s=='#'){
+        int v[6],i;
+        s++;
+        for(i=0;i<6;i++){ v[i]=ed_hexval((unsigned char)s[i]); if(v[i]<0) return 0; }
+        if(s[6]&&s[6]!=' '&&s[6]!='\t'&&s[6]!='\r'&&s[6]!='\n') return 0;
+        *r=v[0]*16+v[1]; *g=v[2]*16+v[3]; *b=v[4]*16+v[5];
+        return 1;
+    }
+    { int x,y,z;
+      if(sscanf(s,"%d , %d , %d",&x,&y,&z)!=3) return 0;
+      if(x<0||x>255||y<0||y>255||z<0||z>255) return 0;
+      *r=x; *g=y; *b=z; return 1; }
+}
+/* Read one .theme file; unset fields start from the dark theme. 0 if unreadable. */
+static int ed_theme_load_file(const char *path,const char *id,UTheme *out){
+    FILE *f=fopen(path,"r"); char line[160]; int i;
+    if(!f) return 0;
+    memset(out,0,sizeof *out);
+    snprintf(out->name,sizeof out->name,"%s",id);
+    for(i=0;i<ED_THEMEFIELDS;i++) snprintf(out->v[i],sizeof out->v[i],"%s",ed_themedef_field(&THEMES[0],i));
+    for(i=0;i<ED_XFIELDS;i++) snprintf(out->x[i],sizeof out->x[i],"%s",ED_XDEF[i]);
+    while(fgets(line,sizeof line,f)){
+        char *eq,*k=line; size_t kn;
+        int r,g,b;
+        while(*k==' '||*k=='\t') k++;
+        if(!*k||*k=='#'||*k==';'||*k=='\r'||*k=='\n') continue;
+        eq=strchr(k,'=');
+        if(!eq) continue;
+        kn=(size_t)(eq-k);
+        while(kn>0&&(k[kn-1]==' '||k[kn-1]=='\t')) kn--;
+        for(i=0;i<ED_THEMEFIELDS;i++)
+            if(strlen(ED_TFIELD[i])==kn&&!strncmp(ED_TFIELD[i],k,kn)) break;
+        if(i>=ED_THEMEFIELDS){
+            int xi;   /* not a main field: try the optional slots */
+            for(xi=0;xi<ED_XFIELDS;xi++)
+                if(strlen(ED_XNAME[xi])==kn&&!strncmp(ED_XNAME[xi],k,kn)) break;
+            if(xi>=ED_XFIELDS) continue;
+            if(!ed_color_parse(eq+1,&r,&g,&b)) continue;
+            snprintf(out->x[xi],sizeof out->x[xi],"%d;2;%d;%d;%d",
+                ED_XBG[xi]?48:38,r,g,b);
+            continue;
+        }
+        if(!ed_color_parse(eq+1,&r,&g,&b)) continue;
+        snprintf(out->v[i],sizeof out->v[i],"%d;2;%d;%d;%d",i<6?48:38,r,g,b);
+    }
+    fclose(f);
+    return 1;
 }
 static int ed_hl_bg = 0;   /* 0 plain, 1 code bg, 2 line bg */
 static int ed_hl_wantsel = 0; /* current byte is inside the text selection */
@@ -325,18 +475,18 @@ static void ed_hl_emit(int code,int *cur){
         if(st==2) printf("%s",EC_FINDCUR);
         else if(st==1) printf("%s",EC_FINDALL);
         else if(code) printf("\x1b[%sm",EC_SEQ[code]);
-        else printf("\x1b[0m");
-        if(ed_hl_findbg) printf(EC_SELBG);
-        else if(ed_hl_bg==2) printf(EC_LINEBG);
-        else if(ed_hl_bg==1) printf(EC_CODEBG);
+        else printf("\x1b[0m%s",EC_X[XI_TXT]);
+        if(ed_hl_findbg) fputs(EC_SELBG,stdout);
+        else if(ed_hl_bg==2) fputs(EC_LINEBG,stdout);
+        else if(ed_hl_bg==1) fputs(EC_CODEBG,stdout);
         *cur=code; ed_hl_selon=0; ed_hl_find_on=st;
     }
     /* selection sits on top of syntax colors (bg swap keeps fg readable) */
-    if(ed_hl_wantsel&&!ed_hl_selon){ printf(EC_SELBG); ed_hl_selon=1; }
+    if(ed_hl_wantsel&&!ed_hl_selon){ fputs(EC_SELBG,stdout); ed_hl_selon=1; }
     else if(!ed_hl_wantsel&&ed_hl_selon){
-        if(ed_hl_findbg) printf(EC_SELBG);
-        else if(ed_hl_bg==2) printf(EC_LINEBG);
-        else if(ed_hl_bg==1) printf(EC_CODEBG);
+        if(ed_hl_findbg) fputs(EC_SELBG,stdout);
+        else if(ed_hl_bg==2) fputs(EC_LINEBG,stdout);
+        else if(ed_hl_bg==1) fputs(EC_CODEBG,stdout);
         else printf("\x1b[49m");
         ed_hl_selon=0;
     }

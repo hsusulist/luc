@@ -1,5 +1,5 @@
 -- demos/libs_libaries/mlp.luc -- wrap lanternl so training is one word: train()
--- needs the ai library (luc install ai)
+-- needs the ai library (luc install -p ai)
 -- run: luc "demos/libs_libaries/mlp.luc"
 --
 -- NOTE: do NOT name this file train.luc -- ai's own submodule is called

@@ -312,7 +312,6 @@ static void ed_plug_scan_dir(Editor *e,const char *plugdir){
     if(fh==INVALID_HANDLE_VALUE) return;
     do{
         char sub[1120], cfg[1200];
-        size_t j;
         if(!strcmp(fd.cFileName,".")||!strcmp(fd.cFileName,"..")) continue;
         if(!(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) continue;
         snprintf(sub,sizeof sub,"%s\\%s",plugdir,fd.cFileName);
@@ -336,6 +335,42 @@ static void ed_plug_scan_dir(Editor *e,const char *plugdir){
         }
     }while(FindNextFileA(fh,&fd));
     FindClose(fh);
+}
+/* Plugin themes: every enabled plugin folder may hold *.theme files (id = file name) */
+static void ed_themes_scan_plugin(const char *cfg){
+    char dir[1100],pat[1200]; WIN32_FIND_DATAA fd; HANDLE fh; size_t n;
+    snprintf(dir,sizeof dir,"%s",cfg);
+    n=strlen(dir);
+    while(n>0&&dir[n-1]!='\\'&&dir[n-1]!='/') n--;
+    if(n==0) return;
+    dir[n-1]=0;
+    snprintf(pat,sizeof pat,"%s\\*.theme",dir);
+    fh=FindFirstFileA(pat,&fd);
+    if(fh==INVALID_HANDLE_VALUE) return;
+    do{
+        char path[1300],id[32]; size_t L=strlen(fd.cFileName),j; int ok=1,dup=0;
+        if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+        if(L<7||L-6>=sizeof id||_stricmp(fd.cFileName+L-6,".theme")) continue;
+        memcpy(id,fd.cFileName,L-6); id[L-6]=0;
+        for(j=0;id[j];j++)
+            if(!(isalnum((unsigned char)id[j])||id[j]=='-'||id[j]=='_')) ok=0;
+        if(!ok) continue;
+        for(j=0;j<ED_NTHEMES;j++) if(!strcmp(THEMES[j].name,id)) dup=1;
+        for(j=0;j<(size_t)ed_nut;j++) if(!strcmp(ED_UT[j].name,id)) dup=1;
+        if(dup) continue;
+        if(ed_nut>=ED_UTHEMES) break;
+        snprintf(path,sizeof path,"%s\\%s",dir,fd.cFileName);
+        if(ed_theme_load_file(path,id,&ED_UT[ed_nut])) ed_nut++;
+    }while(FindNextFileA(fh,&fd));
+    FindClose(fh);
+}
+/* Rebuild the plugin theme list; keep the current theme if it still exists */
+static void ed_themes_reload(Editor *e){
+    int i;
+    ed_nut=0;
+    for(i=0;i<e->nplugs;i++)
+        if(e->plugs[i].enabled&&e->plugs[i].cfg[0]) ed_themes_scan_plugin(e->plugs[i].cfg);
+    if(!ed_theme_apply(ed_theme_cur)) ed_theme_apply("dark");
 }
 static void ed_plug_scan(Editor *e){
     char user[1024],root[1024]; const char *app=getenv("APPDATA");
@@ -361,6 +396,7 @@ static void ed_plug_scan(Editor *e){
                 ed_plug_scan_dir(e,root);
         }
     }
+    ed_themes_reload(e);
 }
 static int lc_copy_plugin_tree(const char *src,const char *dst,int depth){
     char pat[1200]; WIN32_FIND_DATAA fd; HANDLE fh;
@@ -435,6 +471,7 @@ static int ed_plug_luc_on(Editor *e){
     return 1;
 }
 static void ed_plug_write(Editor *e,int i){
+    ed_themes_reload(e);   /* enabling/disabling a plugin adds/removes its themes */
     /* Rewrite cfg but keep unknown lines (incl. setting.* we don't own here) */
     char lines[32][256]; int nl=0, k;
     FILE *f;
@@ -498,13 +535,13 @@ static void ed_sug_add(Editor *e,const char *w,const char *tag){
 }
 /* Rebuild the list from the identifier before the cursor */
 static void ed_sug_update(Editor *e){
-    char *b; size_t L, k, s, i, j;
+    char *b; size_t k, s, i, j;
     e->sug_on=0; e->sug_n=0; e->sug_sel=0;
     if(!e->path[0]||e->focus!=0) return;
     if(!ed_plug_luc_on(e)) return;
     if(!ed_plug_setting(e,"luc","suggestions",1)) return;
     ed_clamp(e);
-    b=e->ln[e->cy].b; L=e->ln[e->cy].len; k=e->cx; s=k;
+    b=e->ln[e->cy].b; k=e->cx; s=k;
     while(s>0&&ed_is_ident((unsigned char)b[s-1])) s--;
     if(k-s<1||k-s>=sizeof e->sug_px) return;
     memcpy(e->sug_px,b+s,k-s); e->sug_px[k-s]=0;
@@ -575,15 +612,16 @@ static void ed_sug_draw(Editor *e,int W,int H){
     for(i=0;i<e->sug_n&&i<bh;i++){
         int yy=y0+i;
         printf("\x1b[%d;%dH",yy+1,x0+1);
-        if(i==e->sug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else printf("\x1b[48;2;28;28;28m\x1b[97m");
+        if(i==e->sug_sel) fputs(EC_X[XI_ACC],stdout);
+        else printf("%s%s",EC_X[XI_POP],EC_X[XI_MFG]);
         fputc(' ',stdout);
-        if(!strcmp(e->sug_tag[i],"Keyword")) printf("\x1b[38;2;197;134;192m");
-        else if(!strcmp(e->sug_tag[i],"Function")) printf("\x1b[38;2;220;220;170m");
-        else printf("\x1b[38;2;150;150;150m");
+        /* tag colors follow the theme's syntax colors (keyword / function) */
+        if(!strcmp(e->sug_tag[i],"Keyword")) printf("\x1b[%sm",EC_SEQ[1]);
+        else if(!strcmp(e->sug_tag[i],"Function")) printf("\x1b[%sm",EC_SEQ[5]);
+        else fputs(EC_X[XI_MDIM],stdout);
         fputs("\xe2\x97\x8f ",stdout);
-        if(i==e->sug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else printf("\x1b[48;2;28;28;28m\x1b[97m");
+        if(i==e->sug_sel) fputs(EC_X[XI_ACC],stdout);
+        else printf("%s%s",EC_X[XI_POP],EC_X[XI_MFG]);
         { int k2, L=(int)strlen(e->sug_items[i]), maxl=bw-3;
           if(maxl<1) maxl=1;
           for(k2=0;k2<L&&k2<maxl;k2++) fputc(e->sug_items[i][k2],stdout);

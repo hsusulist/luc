@@ -1,5 +1,6 @@
 # LUC - pack luc_modules\*.luc into packages\ai.lucpkg + packages\discord.lucpkg
 # update 2026-09-01: commit packages\ai.lucpkg so "luc install ai" works
+# update 2026-11-16: "luc install -p ai|discord" downloads these from GitHub
 # The bundle is plain text so the built-in "luc install ai" command can
 # download ONE file and split it locally (no zip support needed in C).
 # Bundle format:
@@ -46,7 +47,8 @@ if (-not $all -or $all.Count -eq 0) {
     throw "no .luc files found in $SrcDir"
 }
 
-$aiFiles = @($all | Where-Object { $_.Name -notlike 'discord*' })
+# http.luc ships with the interpreter (installer main component), not with ai
+$aiFiles = @($all | Where-Object { $_.Name -notlike 'discord*' -and $_.Name -ne 'http.luc' })
 Pack-Bundle (Join-Path $ProjectDir 'packages\ai.lucpkg') 'ai' $aiFiles
 
 $dcFiles = @($all | Where-Object { $_.Name -like 'discord*' })

@@ -966,11 +966,11 @@ static void lc_code(const char *start){
                       }
                   }
                   else if(ch==0){
-                      int n=e.nplugs<ED_PLUGSHOW?e.nplugs:ED_PLUGSHOW;
+                      int nshow=e.nplugs<ED_PLUGSHOW?e.nplugs:ED_PLUGSHOW;
                       if(vk==VK_UP&&e.plug_sel>0) e.plug_sel--;
                       else if(vk==VK_DOWN&&e.plug_sel+1<e.nplugs) e.plug_sel++;
                       if(e.plug_sel<e.plug_top) e.plug_top=e.plug_sel;
-                      if(e.plug_sel>=e.plug_top+n) e.plug_top=e.plug_sel-n+1;
+                      if(e.plug_sel>=e.plug_top+nshow) e.plug_top=e.plug_sel-nshow+1;
                   } }
                 if(e.show_plugins){ ed_draw_modal(&e); continue; }
                 break;

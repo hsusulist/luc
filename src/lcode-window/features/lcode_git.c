@@ -216,30 +216,30 @@ static void ed_git_draw(Editor *e,int W,int H){
     cx0=x0+3+ED_GITW;
     e->git_cur_x=0; e->git_cur_y=0;
     /* top border + header */
-    printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x8c",y0+1,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<bw-2;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x90\x1b[0m");
-    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m\xe2\x94\x82",y0+2,x0+1);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+2,x0+1,EC_X[XI_PAN],EC_X[XI_MFG]);
     { char hb[160]; int L;
       if(e->git_branch[0]) snprintf(hb,sizeof hb," git  %s",e->git_branch);
       else snprintf(hb,sizeof hb," git");
       L=(int)strlen(hb); if(L>bw-2) L=bw-2;
       fwrite(hb,1,(size_t)L,stdout);
       for(k=L;k<bw-2;k++) fputc(' ',stdout); }
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     for(i=0;i<rows;i++){
         int yy=y0+3+i;
-        printf("\x1b[%d;%dH%s\xe2\x94\x82",yy,x0+1,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82",yy,x0+1,EC_X[XI_MODB],TH_TDIM);
         if(i<ED_GIT_NTABS){
             int cur=(i==e->git_tab);
-            if(cur) printf(e->git_left?"\x1b[48;2;0;120;215m\x1b[97m":"\x1b[48;2;0;70;120m\x1b[97m");
-            else printf("\x1b[48;2;17;17;17m\x1b[97m");
+            if(cur) fputs(e->git_left?EC_X[XI_ACC]:EC_X[XI_ACCDIM],stdout);
+            else printf("%s%s",EC_X[XI_MODL],EC_X[XI_MFG]);
             printf(" %-*.*s",ED_GITW-1,ED_GITW-1,ED_GIT_TABS[i]);
         } else {
-            printf("\x1b[48;2;17;17;17m");
+            fputs(EC_X[XI_MODL],stdout);
             for(k=0;k<ED_GITW;k++) fputc(' ',stdout);
         }
-        printf("\x1b[48;2;30;30;30m%s\xe2\x94\x82",TH_TDIM);
+        printf("%s%s\xe2\x94\x82",EC_X[XI_MOD],TH_TDIM);
         printf("\x1b[%d;%dH",yy,cx0);
         if(i<nrows){
             int ri=e->git_row_top+i, kind, sel;
@@ -247,11 +247,11 @@ static void ed_git_draw(Editor *e,int W,int H){
             if(ri>=nrows) ri=nrows-1;
             sel=(!e->git_left&&ri==e->git_row);
             ed_git_row_text(e,e->git_tab,ri,label,sizeof label,val,sizeof val,&kind);
-            if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-            else printf("\x1b[48;2;30;30;30m\x1b[97m");
+            if(sel) fputs(EC_X[XI_ACC],stdout);
+            else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
             if(kind==SET_INFO){
                 int L=(int)strlen(label); if(L>cw-1) L=cw-1;
-                if(!sel) printf("\x1b[90m");
+                if(!sel) fputs(EC_X[XI_MDIM],stdout);
                 fputc(' ',stdout);
                 fwrite(label,1,(size_t)L,stdout);
                 for(k=1+L;k<cw;k++) fputc(' ',stdout);
@@ -270,9 +270,9 @@ static void ed_git_draw(Editor *e,int W,int H){
                 fputc(' ',stdout); fwrite(label,1,(size_t)Ll,stdout);
                 fputc(' ',stdout);
                 printf("[ ");
-                if(!e->git_len&&!e->git_edit){ printf("\x1b[90m"); fwrite("(Enter to type)",1,15>(size_t)inner?(size_t)inner:15,stdout); vis=15>inner?inner:15; }
+                if(!e->git_len&&!e->git_edit){ fputs(EC_X[XI_MDIM],stdout); fwrite("(Enter to type)",1,15>(size_t)inner?(size_t)inner:15,stdout); vis=15>inner?inner:15; }
                 else {
-                    printf("\x1b[38;2;120;200;255m");
+                    fputs(EC_X[XI_VAL],stdout);
                     for(q=e->git_off;q<e->git_len;q++){
                         int w=ed_chw((unsigned char)e->git_msg[q],vis);
                         if(vis+w>inner) break;
@@ -280,8 +280,8 @@ static void ed_git_draw(Editor *e,int W,int H){
                         vis+=w;
                     }
                 }
-                if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-                else printf("\x1b[48;2;30;30;30m\x1b[97m");
+                if(sel) fputs(EC_X[XI_ACC],stdout);
+                else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
                 for(k=vis;k<inner;k++) fputc(' ',stdout);
                 printf(" ]");
                 { int used=1+Ll+pad+fieldw; for(k=used;k<cw;k++) fputc(' ',stdout); }
@@ -299,21 +299,21 @@ static void ed_git_draw(Editor *e,int W,int H){
                 fputc(' ',stdout);
                 fwrite(label,1,(size_t)Ll,stdout);
                 for(k=0;k<pad;k++) fputc(' ',stdout);
-                printf("[ \x1b[96m");
+                printf("[ %s",EC_X[XI_ACT]);
                 fwrite(val,1,(size_t)vlen,stdout);
-                if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-                else printf("\x1b[48;2;30;30;30m\x1b[97m");
+                if(sel) fputs(EC_X[XI_ACC],stdout);
+                else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
                 printf(" ]");
                 { int used=1+Ll+pad+fieldw; for(k=used;k<cw;k++) fputc(' ',stdout); }
             }
         } else {
-            printf("\x1b[48;2;30;30;30m");
+            fputs(EC_X[XI_MOD],stdout);
             for(k=0;k<cw;k++) fputc(' ',stdout);
         }
-        printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",yy,x0+bw,EC_X[XI_MODB],TH_TDIM);
     }
     /* footer (result of the last action, else a key hint) + bottom border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[48;2;22;22;22m%s",y0+3+rows,x0+1,TH_TDIM,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82%s%s",y0+3+rows,x0+1,EC_X[XI_MODB],TH_TDIM,EC_X[XI_MODF],TH_TDIM);
     { const char *hint; char buf[200]; int used, kk;
       if(e->git_note[0]){ snprintf(buf,sizeof buf," %s",e->git_note); hint=buf; }
       else if(e->git_edit) hint=" Enter done  Esc stop typing";
@@ -321,8 +321,8 @@ static void ed_git_draw(Editor *e,int W,int H){
       used=(int)strlen(hint); if(used>bw-2) used=bw-2;
       fwrite(hint,1,(size_t)used,stdout);
       for(kk=used;kk<bw-2;kk++) fputc(' ',stdout); }
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3+rows,x0+bw,TH_TDIM);
-    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+4+rows,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",y0+3+rows,x0+bw,EC_X[XI_MODB],TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x94",y0+4+rows,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<bw-2;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x98\x1b[0m");
     if(e->git_edit&&e->git_cur_x>0)

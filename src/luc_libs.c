@@ -46,9 +46,8 @@ LFN(f_rawlen){ UNUSED_SELF; RET(0,mknum((double)vm_len(AR(0)))); return 1; }
 LFN(f_error){ UNUSED_SELF;
     Value v=AR(0);
     if(v.t==LT_STR && (nargs<2 || checknum(L,base,nargs,1,"error")!=0)){
-        char b[1200];
-        snprintf(b,sizeof b,"%s:%d: %s",
-                 L->cursource?L->cursource->s:"?",L->curline,AS_STR(v)->s);
+        char b[1200]; Str *src=NULL; int line=luc_curline(L,&src);
+        snprintf(b,sizeof b,"%s:%d: %s",src?src->s:"?",line,AS_STR(v)->s);
         luc_throw(cstrv(b));
     }
     luc_throw(v);
@@ -135,14 +134,15 @@ LFN(f_rawset){ UNUSED_SELF; tab_set(checktab(L,base,nargs,0,"rawset"),AR(1),AR(2
 LFN(f_rawequal){ UNUSED_SELF; RET(0,mkbool(val_rawequal(AR(0),AR(1)))); return 1; }
 LFN(f_collectgarbage){ UNUSED_SELF; gc_collect(); RET(0,mknum((double)V.nalloc)); return 1; }
 
+static Value lucL_aikern_module(void);   /* lanternl kernels, below */
 /* require loads third-party modules; system libs use import. */
 LFN(f_require){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"require");
     Value key=mkobj(LT_STR,name);
     Value cached=tab_get(V.loaded,key);
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
-    if(strcmp(name->s,"json")==0){
-        Value m=lucL_json_module();
+    if(strcmp(name->s,"json")==0||strcmp(name->s,"aikern")==0){
+        Value m= name->s[0]=='j'? lucL_json_module() : lucL_aikern_module();
         tab_set(V.loaded,key,m);
         RET(0,m); return 1;
     }
@@ -160,8 +160,9 @@ LFN(f_require){ UNUSED_SELF;
     tab_set(V.loaded,key,res);
     RET(0,res); return 1;
 }
-/* import system libs; third-party use require. */
+/* import system libs; anything else falls back to saved/user libs (.luic pack or .luc). */
 static Value libs_module(void);   /* libs helper below */
+static Value import_saved(LucState *L,int base,int nargs,const char *name);
 LFN(f_import){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"import");
     char keybuf[512]; snprintf(keybuf,sizeof keybuf,"system:%s",name->s);
@@ -184,7 +185,7 @@ LFN(f_import){ UNUSED_SELF;
     }else if(strcmp(name->s,"discord")==0){
         int len=0; char found[1024];
         char *src=find_system_module(name->s,&len,found,sizeof found);
-        if(!src) luc_error("module 'discord' not found\ninstall it with: luc install discord");
+        if(!src) luc_error("module 'discord' not found\ninstall it with: luc install -p discord");
         int scratch=base+nargs+2;
         ensure_stack(L,scratch+16);
         Closure *cl=luc_compile(src,len,found);
@@ -196,7 +197,7 @@ LFN(f_import){ UNUSED_SELF;
     }else if(strcmp(name->s,"ai")==0){
         int len=0; char found[1024];
         char *src=find_system_module(name->s,&len,found,sizeof found);
-        if(!src) luc_error("module 'ai' not found\ninstall it with: luc install ai");
+        if(!src) luc_error("module 'ai' not found\ninstall it with: luc install -p ai");
         int scratch=base+nargs+2;
         ensure_stack(L,scratch+16);
         Closure *cl=luc_compile(src,len,found);
@@ -208,9 +209,13 @@ LFN(f_import){ UNUSED_SELF;
     }else if(strcmp(name->s,"libs")==0){
         m=libs_module();
     }else{
-        luc_error("module '%s' is not a LUC system library (system: nums, window, ai, json, net, discord, libs)\n"
-                  "third-party modules use: create %s = require(\"%s\")",
-                  name->s,name->s,name->s);
+        char nm[256]; snprintf(nm,sizeof nm,"%s",name->s);
+        m=import_saved(L,base,nargs,nm);
+        if(m.t==LT_NIL)
+            luc_error("module '%s' not found: it is not a system library (nums, window, ai, json, net, discord, libs)\n"
+                      "and there is no %s.luic / %s.luc next to the script, in the current folder, luc_modules/, LUC_PATH\n"
+                      "or the saved-libs folder (install one with: luc %s.luic)",
+                      nm,nm,nm,nm);
     }
     tab_set(V.loaded,key,m);
     RET(0,m); return 1;
@@ -355,6 +360,54 @@ static void pack_abort(PackPart *pp,int n,const char *fmt,const char *a){
     luc_error(fmt,a);
 }
 
+/* import <lib> for non-system libs: <lib>.luic -> table of its parts, <lib>.luc -> its return value.
+   Searches script dir, cwd, luc_modules/, LUC_PATH and the saved-libs folder (see find_pack/find_module).
+   Returns NIL when nothing is found. */
+static Value import_saved(LucState *L,int base,int nargs,const char *name){
+    int plen=0; char pfound[1024];
+    char *psrc=find_pack(name,&plen,pfound,sizeof pfound);
+    if(psrc){
+        PackPart *pp=NULL; int np=0;
+        pack_parse(name,psrc,plen,&pp,&np);
+        Table *t=tab_new(0);
+        Value tv=mkobj(LT_TABLE,t);
+        char tk[1152]; snprintf(tk,sizeof tk,"savedpack:%s",pfound);
+        tab_set(V.loaded,cstrv(tk),tv);          /* root it while parts run */
+        for(int i=0;i<np;i++){
+            char keybuf[1408]; snprintf(keybuf,sizeof keybuf,"packpart:%s#%s",pfound,pp[i].name);
+            Value key=cstrv(keybuf);
+            Value part=tab_get(V.loaded,key);
+            if(part.t==LT_NIL){
+                part=libs_run1(L,base,nargs,pp[i].src,pp[i].len,pfound);
+                if(part.t!=LT_TABLE && part.t!=LT_LIST){
+                    char pn[256]; snprintf(pn,sizeof pn,"%s",pp[i].name);
+                    pack_parts_free(pp,np); free(psrc);
+                    luc_error("lib '%s': part '%s' did not return a table",name,pn);
+                }
+                tab_set(V.loaded,key,part);
+            }
+            tab_set(t,cstrv(pp[i].name),part);
+        }
+        pack_parts_free(pp,np); free(psrc);
+        return tv;
+    }
+    {
+        int len=0; char found[1024];
+        char *src=find_module(name,&len,found,sizeof found);
+        if(!src) return NIL;
+        char keybuf[1152]; snprintf(keybuf,sizeof keybuf,"filemod:%s",found);
+        Value key=cstrv(keybuf);
+        Value rv=tab_get(V.loaded,key);
+        if(rv.t==LT_NIL){
+            rv=libs_run1(L,base,nargs,src,len,found);
+            if(rv.t==LT_NIL) rv=mkbool(1);
+            tab_set(V.loaded,key,rv);
+        }
+        free(src);
+        return rv;
+    }
+}
+
 /* __import_from: part table or symbol. */
 LFN(f_import_from){ UNUSED_SELF;
     Str *lib=checkstr(L,base,nargs,0,"import-from");
@@ -371,7 +424,10 @@ LFN(f_import_from){ UNUSED_SELF;
             Value cached=tab_get(V.loaded,key);
             if(cached.t==LT_NIL){
                 Value res=libs_run1(L,base,nargs,pp[i].src,pp[i].len,pfound);
-                if(res.t!=LT_TABLE && res.t!=LT_LIST){ pack_parts_free(pp,np); free(psrc); luc_error("lib '%s': part '%s' did not return a table",lib->s,pp[i].name); }
+                if(res.t!=LT_TABLE && res.t!=LT_LIST){
+                    char pn[256]; snprintf(pn,sizeof pn,"%s",pp[i].name);   /* copy before freeing pp */
+                    pack_parts_free(pp,np); free(psrc);
+                    luc_error("lib '%s': part '%s' did not return a table",lib->s,pn); }
                 tab_set(V.loaded,key,res);
                 cached=res;
             }
@@ -386,7 +442,10 @@ LFN(f_import_from){ UNUSED_SELF;
             Value t=tab_get(V.loaded,key);
             if(t.t==LT_NIL){
                 t=libs_run1(L,base,nargs,pp[i].src,pp[i].len,pfound);
-                if(t.t!=LT_TABLE && t.t!=LT_LIST){ pack_parts_free(pp,np); free(psrc); luc_error("lib '%s': part '%s' did not return a table",lib->s,pp[i].name); }
+                if(t.t!=LT_TABLE && t.t!=LT_LIST){
+                    char pn[256]; snprintf(pn,sizeof pn,"%s",pp[i].name);   /* copy before freeing pp */
+                    pack_parts_free(pp,np); free(psrc);
+                    luc_error("lib '%s': part '%s' did not return a table",lib->s,pn); }
                 tab_set(V.loaded,key,t);
             }
             if(t.t==LT_TABLE || t.t==LT_LIST){
@@ -1097,6 +1156,100 @@ void lucL_open_io(void){
 
 
 /* luc_lib_json.c */
+/* aikern: native kernels for lanternl (luc_modules/matrix.luc). Matrices there are tables with
+   the row-major data in keys 1..rows*cols (the table's array part). Each kernel copies its
+   inputs to plain doubles, computes, and writes back, keeping the exact accumulation order of
+   the Lua loops it replaces so results are bit-for-bit identical. */
+static double *aik_read(Table *t,int n,const char *fn,const char *what){
+    double *v;
+    if(n<0) luc_error("aikern.%s: bad size",fn);
+    v=(double*)malloc(sizeof(double)*(size_t)(n?n:1));
+    if(!v) luc_error("aikern.%s: out of memory",fn);
+    for(int i=0;i<n;i++){
+        Value x= i<t->alen? t->arr[i] : tab_get(t,mknum((double)(i+1)));
+        if(x.t!=LT_NUM){ free(v); luc_error("aikern.%s: %s[%d] is not a number (got %s)",fn,what,i+1,type_name(x)); }
+        v[i]=x.u.n;
+    }
+    return v;
+}
+static void aik_write(Table *t,const double *v,int n){
+    if(t->alen>=n){ for(int i=0;i<n;i++) t->arr[i]=mknum(v[i]); return; }
+    for(int i=0;i<n;i++) tab_set(t,mknum((double)(i+1)),mknum(v[i]));
+}
+static int aik_dims(LucState *L,int base,int nargs,const char *fn,Table **a,Table **b,Table **r,int *m,int *k,int *n){
+    *a=checktab(L,base,nargs,0,fn); *b=checktab(L,base,nargs,1,fn); *r=checktab(L,base,nargs,2,fn);
+    *m=checkint(L,base,nargs,3,fn); *k=checkint(L,base,nargs,4,fn); *n=checkint(L,base,nargs,5,fn);
+    if(*m<0||*k<0||*n<0) luc_error("aikern.%s: negative size",fn);
+    if((double)*m*(double)*k>2e9||(double)*k*(double)*n>2e9||(double)*m*(double)*n>2e9) luc_error("aikern.%s: matrix too large",fn);
+    return truthy(AR(6));
+}
+/* r(m x n) = a(m x k) * b(k x n)   [r += ... when acc] */
+LFN(f_aik_mm){ UNUSED_SELF;
+    Table *ta,*tb,*tr; int m,k,n, acc=aik_dims(L,base,nargs,"mm",&ta,&tb,&tr,&m,&k,&n);
+    double *a=aik_read(ta,m*k,"mm","a"), *b=aik_read(tb,k*n,"mm","b"), *r;
+    r= acc? aik_read(tr,m*n,"mm","out") : (double*)calloc((size_t)(m*n?m*n:1),sizeof(double));
+    if(!r){ free(a); free(b); luc_error("aikern.mm: out of memory"); }
+    for(int i=0;i<m;i++){
+        const double *ar=a+(size_t)i*k; double *rr=r+(size_t)i*n; int p0=0;
+        if(!acc && k>0){
+            double av=ar[0];
+            if(av!=0) for(int j=0;j<n;j++) rr[j]=av*b[j];
+            else for(int j=0;j<n;j++) rr[j]=0;
+            p0=1;
+        }
+        for(int p=p0;p<k;p++){
+            double av=ar[p];
+            if(av!=0){ const double *br=b+(size_t)p*n; for(int j=0;j<n;j++) rr[j]=rr[j]+av*br[j]; }
+        }
+    }
+    aik_write(tr,r,m*n);
+    free(a); free(b); free(r);
+    return 0;
+}
+/* r(m x n) = a(m x k) * b(n x k)^T */
+LFN(f_aik_mm_nt){ UNUSED_SELF;
+    Table *ta,*tb,*tr; int m,k,n, acc=aik_dims(L,base,nargs,"mm_nt",&ta,&tb,&tr,&m,&k,&n);
+    double *a=aik_read(ta,m*k,"mm_nt","a"), *b=aik_read(tb,n*k,"mm_nt","b"), *r;
+    r= acc? aik_read(tr,m*n,"mm_nt","out") : (double*)calloc((size_t)(m*n?m*n:1),sizeof(double));
+    if(!r){ free(a); free(b); luc_error("aikern.mm_nt: out of memory"); }
+    for(int i=0;i<m;i++){
+        const double *ar=a+(size_t)i*k;
+        for(int j=0;j<n;j++){
+            const double *br=b+(size_t)j*k; double s=0;
+            for(int p=0;p<k;p++) s=s+ar[p]*br[p];
+            if(acc) r[(size_t)i*n+j]=r[(size_t)i*n+j]+s; else r[(size_t)i*n+j]=s;
+        }
+    }
+    aik_write(tr,r,m*n);
+    free(a); free(b); free(r);
+    return 0;
+}
+/* r(k x n) = a(m x k)^T * b(m x n) */
+LFN(f_aik_mm_tn){ UNUSED_SELF;
+    Table *ta,*tb,*tr; int m,k,n, acc=aik_dims(L,base,nargs,"mm_tn",&ta,&tb,&tr,&m,&k,&n);
+    double *a=aik_read(ta,m*k,"mm_tn","a"), *b=aik_read(tb,m*n,"mm_tn","b"), *r;
+    r= acc? aik_read(tr,k*n,"mm_tn","out") : (double*)calloc((size_t)(k*n?k*n:1),sizeof(double));
+    if(!r){ free(a); free(b); luc_error("aikern.mm_tn: out of memory"); }
+    for(int i=0;i<m;i++){
+        const double *ar=a+(size_t)i*k, *br=b+(size_t)i*n;
+        for(int p=0;p<k;p++){
+            double av=ar[p];
+            if(av!=0){ double *rr=r+(size_t)p*n; for(int j=0;j<n;j++) rr[j]=rr[j]+av*br[j]; }
+        }
+    }
+    aik_write(tr,r,k*n);
+    free(a); free(b); free(r);
+    return 0;
+}
+static Value lucL_aikern_module(void){
+    Table *t=tab_new(0);
+    reg(t,"mm",f_aik_mm);
+    reg(t,"mm_nt",f_aik_mm_nt);
+    reg(t,"mm_tn",f_aik_mm_tn);
+    tab_set(t,cstrv("version"),mknum(1));
+    return mkobj(LT_TABLE,t);
+}
+
 /* JSON module (require "json") */
 /* JSON */
 typedef struct { char *b; size_t len,cap; } SBuf;
@@ -1114,7 +1267,7 @@ static void json_str(SBuf *o,Str *s){
     for(int i=0;i<s->len;i++){
         unsigned char c=(unsigned char)s->s[i];
         switch(c){
-            case '"':  sb_puts(o,"\""); break;
+            case '"':  sb_puts(o,"\\\""); break;
             case '\\': sb_puts(o,"\\\\"); break;
             case '\n': sb_puts(o,"\\n"); break;
             case '\r': sb_puts(o,"\\r"); break;
@@ -1199,6 +1352,24 @@ LFN(f_json_encode){ UNUSED_SELF;
 typedef struct { const char *p,*end; int depth; } JParse;
 static Value json_parse(JParse *j);
 
+/* exactly four hex digits -> *out; 0 when missing/bad */
+static int json_hex4(JParse *j,unsigned *out){
+    unsigned cp=0;
+    if(j->end-j->p<4) return 0;
+    for(int i=0;i<4;i++){
+        int h=hexval((unsigned char)*j->p++);
+        if(h<0) return 0;
+        cp=cp*16+(unsigned)h;
+    }
+    *out=cp; return 1;
+}
+static void json_put_utf8(SBuf *o,unsigned cp){
+    if(cp<0x80) sb_putc(o,(char)cp);
+    else if(cp<0x800){ sb_putc(o,(char)(0xC0|(cp>>6))); sb_putc(o,(char)(0x80|(cp&0x3F))); }
+    else if(cp<0x10000){ sb_putc(o,(char)(0xE0|(cp>>12))); sb_putc(o,(char)(0x80|((cp>>6)&0x3F))); sb_putc(o,(char)(0x80|(cp&0x3F))); }
+    else { sb_putc(o,(char)(0xF0|(cp>>18))); sb_putc(o,(char)(0x80|((cp>>12)&0x3F)));
+           sb_putc(o,(char)(0x80|((cp>>6)&0x3F))); sb_putc(o,(char)(0x80|(cp&0x3F))); }
+}
 static Value json_parse_string(JParse *j){
     j->p++;
     SBuf o; sb_init(&o);
@@ -1213,15 +1384,20 @@ static Value json_parse_string(JParse *j){
                 case 'f': sb_putc(&o,'\f'); break; case '/': sb_putc(&o,'/');   break;
                 case '"': sb_putc(&o,'"');   break; case '\\':sb_putc(&o,'\\'); break;
                 case 'u': {
-                    unsigned cp=0;
-                    for(int i=0;i<4 && j->p<j->end;i++){
-                        int h=hexval((unsigned char)*j->p++);
-                        if(h<0){ free(o.b); luc_error("json.decode: bad \\u escape"); }
-                        cp=cp*16+(unsigned)h;
-                    }
-                    if(cp<0x80) sb_putc(&o,(char)cp);
-                    else if(cp<0x800){ sb_putc(&o,(char)(0xC0|(cp>>6))); sb_putc(&o,(char)(0x80|(cp&0x3F))); }
-                    else { sb_putc(&o,(char)(0xE0|(cp>>12))); sb_putc(&o,(char)(0x80|((cp>>6)&0x3F))); sb_putc(&o,(char)(0x80|(cp&0x3F))); }
+                    unsigned cp;
+                    if(!json_hex4(j,&cp)){ free(o.b); luc_error("json.decode: bad \\u escape"); }
+                    if(cp>=0xD800 && cp<=0xDBFF){
+                        /* UTF-16 surrogate pair: \uD83D\uDE00 -> one 4-byte UTF-8 char */
+                        unsigned lo;
+                        if(j->end-j->p>=6 && j->p[0]=='\\' && j->p[1]=='u'){
+                            const char *save=j->p;
+                            j->p+=2;
+                            if(json_hex4(j,&lo) && lo>=0xDC00 && lo<=0xDFFF)
+                                cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00);
+                            else { j->p=save; cp=0xFFFD; }
+                        } else cp=0xFFFD;
+                    } else if(cp>=0xDC00 && cp<=0xDFFF) cp=0xFFFD;   /* lone low surrogate */
+                    json_put_utf8(&o,cp);
                     break; }
                 default: free(o.b); luc_error("json.decode: bad escape");
             }
@@ -1365,16 +1541,55 @@ static int sort_less(LucState *L,int scratch,Value cmp,Value a,Value b){
     vm_call(L,scratch,2,1);
     return truthy(L->stack[scratch]);
 }
+/* Stable merge sort, O(n log n) compares. Works on a private copy that is kept reachable
+   (as a list on the stack), so a comparator that resizes the list or allocates is harmless. */
 LFN(f_list_sort){ UNUSED_SELF;
     Table *t=checktab(L,base,nargs,0,"sort");
     Value cmp=AR(1);
     int n=t->o.type==LT_LIST? t->alen : tab_len(t);
-    int scratch=base+nargs+2;
-    for(int i=1;i<n;i++){                       /* stable insertion sort */
-        Value key=t->arr[i]; int j=i-1;
-        while(j>=0 && sort_less(L,scratch,cmp,key,t->arr[j])){ t->arr[j+1]=t->arr[j]; j--; }
-        t->arr[j+1]=key;
+    if(n>t->alen) n=t->alen;
+    if(n<2) return 0;
+    if(cmp.t==LT_NIL){                           /* no comparator: check types up front */
+        int nums=1, strs=1;
+        for(int i=0;i<n;i++){ if(t->arr[i].t!=LT_NUM) nums=0; if(t->arr[i].t!=LT_STR) strs=0; }
+        if(!nums && !strs) for(int i=1;i<n;i++) (void)vm_lessthan(t->arr[i],t->arr[0],0);
     }
+    int keep=base+nargs+1, scratch=base+nargs+4;
+    ensure_stack(L,scratch+16);
+    Table *a=tab_new(1), *b=tab_new(1);
+    L->stack[keep]=mkobj(LT_LIST,a); L->stack[keep+1]=mkobj(LT_LIST,b);
+    if(L->top<keep+2) L->top=keep+2;
+    for(int i=0;i<n;i++) list_push(a,t->arr[i]);
+    for(int i=0;i<n;i++) list_push(b,NIL);
+    Value *src=a->arr, *dst=b->arr;
+    /* bottom-up: runs of 1, insertion-sorted to width 8 first (fewer passes) */
+    for(int lo=0;lo<n;lo+=8){
+        int hi=lo+8<n?lo+8:n;
+        for(int i=lo+1;i<hi;i++){
+            Value key=src[i]; int j=i-1;
+            L->stack[scratch+8]=key;              /* key stays reachable during callbacks */
+            while(j>=lo && sort_less(L,scratch,cmp,key,src[j])){ src[j+1]=src[j]; j--; }
+            src[j+1]=key;
+        }
+    }
+    for(int w=8;w<n;w*=2){
+        for(int lo=0;lo<n;lo+=2*w){
+            int mid=lo+w<n?lo+w:n, hi=lo+2*w<n?lo+2*w:n, i=lo, j=mid, k=lo;
+            while(i<mid && j<hi){
+                if(sort_less(L,scratch,cmp,src[j],src[i])) dst[k++]=src[j++];
+                else dst[k++]=src[i++];
+            }
+            while(i<mid) dst[k++]=src[i++];
+            while(j<hi) dst[k++]=src[j++];
+        }
+        Value *tmp=src; src=dst; dst=tmp;
+    }
+    /* write back (the comparator may have changed the list's length) */
+    {
+        int m=n<t->alen?n:t->alen;
+        for(int i=0;i<m;i++) t->arr[i]=src[i];
+    }
+    L->stack[keep]=NIL; L->stack[keep+1]=NIL;
     return 0;
 }
 LFN(f_list_tostring){ UNUSED_SELF;
@@ -2428,7 +2643,7 @@ void lucL_open_os(void){
 /* string */
 static int posrelat(int pos,int len){
     if(pos>=0) return pos;
-    if(-pos>len) return 0;
+    if(pos<-len) return 0;          /* (no -pos: overflows for INT_MIN) */
     return len+pos+1;
 }
 LFN(f_str_len){ UNUSED_SELF; RET(0,mknum((double)checkstr(L,base,nargs,0,"len")->len)); return 1; }
@@ -2715,6 +2930,18 @@ static const char *match_capture(MatchState *ms,const char *s,int ll){
     if((ms->src_end-s)>=len && memcmp(ms->capture[ll].init,s,(size_t)len)==0) return s+len;
     return NULL;
 }
+static const char *match_balance(MatchState *ms,const char *s,const char *p){
+    if(p+1>=ms->p_end) luc_error("malformed pattern (missing arguments to '%%b')");
+    if(s>=ms->src_end || *s!=*p) return NULL;
+    {
+        int b=*p, e=*(p+1), cont=1;
+        while(++s<ms->src_end){
+            if(*s==e){ if(--cont==0) return s+1; }
+            else if(*s==b) cont++;
+        }
+    }
+    return NULL;
+}
 static const char *do_match(MatchState *ms,const char *s,const char *p){
     if(ms->depth++ > 200){ ms->depth--; luc_error("pattern too complex"); }
     while(p!=ms->p_end){
@@ -2732,6 +2959,21 @@ static const char *do_match(MatchState *ms,const char *s,const char *p){
                     s=match_capture(ms,s,(unsigned char)*(p+1));
                     if(!s){ ms->depth--; return NULL; }
                     p+=2; continue;
+                }
+                if(*(p+1)=='b'){            /* %bxy: balanced pair, e.g. %b() */
+                    s=match_balance(ms,s,p+2);
+                    if(!s){ ms->depth--; return NULL; }
+                    p+=4; continue;
+                }
+                if(*(p+1)=='f'){            /* %f[set]: frontier */
+                    const char *ep; int prev,cur;
+                    p+=2;
+                    if(p>=ms->p_end || *p!='[') luc_error("missing '[' after '%%f' in pattern");
+                    ep=classend(ms,p);
+                    prev=(s==ms->src_init)?0:(unsigned char)*(s-1);
+                    cur=(s<ms->src_end)?(unsigned char)*s:0;
+                    if(!matchbracket(prev,p,ep-1) && matchbracket(cur,p,ep-1)){ p=ep; continue; }
+                    ms->depth--; return NULL;
                 }
                 goto dflt;
             default: dflt: {
@@ -2757,8 +2999,14 @@ static const char *do_match(MatchState *ms,const char *s,const char *p){
     ms->depth--;
     return s;
 }
+/* a match that ends inside "(..." leaves a capture open: Lua reports it, we must not copy it */
+static void captures_closed(MatchState *ms){
+    for(int i=0;i<ms->level;i++)
+        if(ms->capture[i].len==CAP_UNF) luc_error("malformed pattern (unfinished capture)");
+}
 static int push_captures(LucState *L,int base,MatchState *ms,const char *s,const char *e,int slot){
     int n = (ms->level==0 && s)? 1 : ms->level;
+    captures_closed(ms);
     for(int i=0;i<n;i++){
         if(ms->level==0) RET(slot+i,strv(s,(int)(e-s)));
         else if(ms->capture[i].len==CAP_POS)
@@ -2844,6 +3092,7 @@ LFN(f_str_gsub){ UNUSED_SELF;
         ms.level=0; ms.depth=0;
         const char *e=do_match(&ms,s1,pp);
         if(e){
+            captures_closed(&ms);
             count++;
 /* build replacement */
             if(repl.t==LT_STR||repl.t==LT_NUM){

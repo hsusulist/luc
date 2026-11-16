@@ -1,0 +1,41 @@
+-- Mini web server demo: run it, then open http://localhost:8080 in a browser.
+-- (needs luc_modules/http.luc; the module is loaded with require, not import)
+create http = require("http")
+
+create notes = []
+
+http.cors("*")
+
+http.get("/", function(req, res)
+    res:html("<h1>luc server</h1><p>Try <a href='/hello/world?shout=1'>/hello/world</a>, "
+        .. "<a href='/api/notes'>/api/notes</a></p>")
+end)
+
+http.get("/hello/:name", function(req, res)
+    create msg = "hello " .. req.params.name
+    if req.query.shout != nil then msg = msg:upper() end
+    res:send(msg)
+end)
+
+-- curl -X POST localhost:8080/api/notes -H "Content-Type: application/json" -d "{\"text\":\"hi\"}"
+http.post("/api/notes", function(req, res)
+    if req.json == nil or req.json.text == nil then
+        return res:status(400):json({ "error": "send JSON like {\"text\": \"...\"}" })
+    end
+    notes:append(req.json.text)
+    res:status(201):json({ "count": notes:len() })
+end)
+
+http.get("/api/notes", function(req, res)
+    return { "notes": notes }          -- returning a table sends it as JSON
+end)
+
+http.get("/slow", function(req, res)
+    task.wait(2)                       -- other requests keep being served meanwhile
+    res:send("done waiting")
+end)
+
+-- files from ./public (index.html, css, images...), checked after the routes above
+http.static("./public")
+
+http.listen(8080)

@@ -211,7 +211,7 @@ static void ed_cmd_run(Editor *e,const char *cmd){
         ed_log(e,":plugin - plugin list (Enter toggles)");
         ed_log(e,":setting - settings (Appearance, Keybinds, plugins)");
         ed_log(e,":keybind - keybind settings");
-        ed_log(e,":theme [dark|light] - editor colors");
+        ed_log(e,":theme [name] - editor colors (dark, light, plus plugin themes)");
         ed_log(e,":find [text] - find in the open file (Ctrl+F)");
         ed_log(e,":ff [text] - find files by name");
         ed_log(e,":pf / :pfind - search all project files (Ctrl+Shift+F)");
@@ -229,10 +229,12 @@ static void ed_cmd_run(Editor *e,const char *cmd){
     }
     if(!strncmp(cmd,"theme",5)&&(cmd[5]==0||cmd[5]==' '||cmd[5]=='\t')){
         const char *a=cmd+5;
+        char names[256];
         while(*a==' '||*a=='\t') a++;
-        if(!*a){ ed_log(e,"theme: %s (dark|light)",ed_theme_cur); return; }
+        ed_theme_names(names,sizeof names);
+        if(!*a){ ed_log(e,"theme: %s (%s)",ed_theme_cur,names); return; }
         if(ed_theme_apply(a)){ ed_cfg_save(e); ed_log(e,"theme: %s",ed_theme_cur); }
-        else ed_log(e,"theme: unknown '%s' (dark|light)",a);
+        else ed_log(e,"theme: unknown '%s' (%s)",a,names);
         return;
     }
     ed_log(e,"unknown command ':%s' (try :help)",cmd);

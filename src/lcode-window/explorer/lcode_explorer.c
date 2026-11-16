@@ -24,7 +24,8 @@ static void ex_target_dir(Editor *e,char *out,size_t cap){
         const char *f=e->ex[e->exsel].full, *b=NULL, *p;
         for(p=f;*p;p++) if(*p=='\\'||*p=='/') b=p;
         if(b){ size_t n=(size_t)(b-f);
-            if(n>=cap) n=cap-1; memcpy(out,f,n); out[n]=0;
+            if(n>=cap) n=cap-1;
+            memcpy(out,f,n); out[n]=0;
             if(!out[0]) snprintf(out,cap,".");
             return; }
     }
@@ -383,7 +384,8 @@ static void ed_popup_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
     bh=(e->menutitle[0]?1:0)+e->nitems; if(bh>H-1) bh=H-1; if(bh<1) bh=1;
     if(e->menu_anch){
         int ax=e->menu_ax, ay=e->menu_ay;
-        if(ax<0) ax=0; if(ay<1) ay=1;
+        if(ax<0) ax=0;
+        if(ay<1) ay=1;
         *x0=ax; *y0=ay;
         if(*x0+bw>W) *x0=W-bw;
         if(*x0<0) *x0=0;
@@ -402,10 +404,10 @@ static void ed_popup_draw(Editor *e,int W,int H){
     /* Borderless context menu: plain block, blue selection, title only for confirm */
     { int inner=bw, k, base=e->menutitle[0]?1:0, n;
       if(e->menutitle[0]){
-          printf("\x1b[%d;%dH\x1b[48;2;28;28;28m",y0+1,x0+1);
+          printf("\x1b[%d;%dH%s",y0+1,x0+1,EC_X[XI_POP]);
           { int tl=(int)strlen(e->menutitle);
             if(tl>inner) tl=inner;
-            printf("\x1b[90m%.*s",tl,e->menutitle);
+            printf("%s%.*s",TH_TDIM,tl,e->menutitle);
             for(k=tl;k<inner;k++) fputc(' ',stdout); }
           printf("\x1b[0m");
       }
@@ -413,9 +415,9 @@ static void ed_popup_draw(Editor *e,int W,int H){
       for(i=0;i<n;i++){
           int yy=y0+base+i;
           printf("\x1b[%d;%dH",yy+1,x0+1);
-          if(e->mitems[i].disabled) printf("\x1b[48;2;28;28;28m\x1b[90m");
-          else if(i==e->msel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-          else printf("\x1b[48;2;28;28;28m\x1b[37m");
+          if(e->mitems[i].disabled) printf("%s%s",EC_X[XI_POP],TH_TDIM);
+          else if(i==e->msel) printf("%s",EC_X[XI_ACC]);
+          else printf("%s%s",EC_X[XI_POP],TH_TCUR);
           fputs(i==e->msel?"\xe2\x96\xb8 ":"  ",stdout);
           { int k2, L=(int)strlen(e->mitems[i].label);
             int maxl=inner-2;

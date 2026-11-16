@@ -23,23 +23,26 @@ static void ed_scrollbar_geom(Editor *e,int rows,int *start,int *length){
     if(len<1) len=1;
     if(len>rows) len=rows;
     max_top=(size_t)rows<len?0:(size_t)(rows-len);
-    slot=(int)((long long)e->top*(long long)max_top/(long long)(total-(size_t)rows));
+    /* rounded, so slot -> top -> slot round-trips and the thumb doesn't jitter while dragged */
+    slot=(int)(((long long)e->top*(long long)max_top+(long long)(total-(size_t)rows)/2)
+               /(long long)(total-(size_t)rows));
     if(slot<0) slot=0;
     if(slot>(int)max_top) slot=(int)max_top;
     *start=slot; *length=len;
 }
+/* Scroll-bar drag/click: moves the VIEW only. Cursor and selection stay where they are,
+   exactly like the mouse wheel (the view snaps back to the cursor on the next edit/move). */
 static void ed_scrollbar_set(Editor *e,int rows,int slot,int length){
-    size_t oldtop=e->top, maxline, maxslot;
-    size_t rel=e->cy>=oldtop?e->cy-oldtop:0;
+    size_t maxline, maxslot;
     if(e->n<=(size_t)rows){ e->top=0; return; }
     maxline=e->n-(size_t)rows;
     maxslot=(size_t)(rows-length);
     if(slot<0) slot=0;
     if((size_t)slot>maxslot) slot=(int)maxslot;
-    e->top=maxslot?(size_t)((long long)slot*(long long)maxline/(long long)maxslot):0;
-    e->cy=e->top+rel;
-    if(e->cy>=e->n) e->cy=e->n-1;
-    if(e->cy>=e->top+(size_t)rows) e->cy=e->top+(size_t)rows-1;
+    e->top=maxslot?(size_t)(((long long)slot*(long long)maxline+(long long)maxslot/2)
+                           /(long long)maxslot):0;
+    if(e->top>maxline) e->top=maxline;
+    e->sug_on=0;
     e->status[0]=0;
 }
 
@@ -64,7 +67,7 @@ static int ed_chw(unsigned char c,int col){
 
 /* Printable form; binaries stay viewable */
 static unsigned char ed_chshow(unsigned char c){
-    if(c=='\t'||c>=32&&c!=127) return c;
+    if(c=='\t'||(c>=32&&c!=127)) return c;
     return '.';
 }
 
@@ -129,17 +132,21 @@ static void ed_copy_line(Editor *e){
 }
 
 /* Text selection: ordered (sy,sx)-(ey,ex) between anchor and cursor */
+/* A position past the end of the buffer (stale anchor after the file shrank) snaps to the
+   end of the last line; a column past its line's end snaps to that line's end. */
+static void ed_pos_clamp(Editor *e,size_t *y,size_t *x){
+    if(*y>=e->n){ *y=e->n-1; *x=e->ln[*y].len; }
+    if(*x>e->ln[*y].len) *x=e->ln[*y].len;
+}
 static void ed_sel_norm(Editor *e,size_t *sy,size_t *sx,size_t *ey,size_t *ex){
     *sy=e->sel_ay; *sx=e->sel_ax; *ey=e->cy; *ex=e->cx;
+    if(e->n==0){ *sy=*ey=0; *sx=*ex=0; return; }
+    /* clamp BEFORE ordering: clamping after could leave start > end (negative length) */
+    ed_pos_clamp(e,sy,sx);
+    ed_pos_clamp(e,ey,ex);
     if(*ey<*sy||(*ey==*sy&&*ex<*sx)){
         size_t t=*sy;*sy=*ey;*ey=t; t=*sx;*sx=*ex;*ex=t;
     }
-    /* stale anchor (file shrank underneath): clamp into range */
-    if(e->n==0){ *sy=*ey=0; *sx=*ex=0; return; }
-    if(*sy>=e->n) *sy=e->n-1;
-    if(*ey>=e->n) *ey=e->n-1;
-    if(*sx>e->ln[*sy].len) *sx=e->ln[*sy].len;
-    if(*ex>e->ln[*ey].len) *ex=e->ln[*ey].len;
 }
 static int ed_sel_empty(Editor *e){
     size_t sy,sx,ey,ex;
@@ -277,7 +284,7 @@ static void ed_undo_push(Editor *e,int op){
     e->un_last_op=op; e->un_last_time=now;
 }
 static void ed_undo_apply(Editor *e,EdUndo *u){
-    size_t k, s=0, n=1, at=0;
+    size_t k, n=1, at=0;
     for(k=0;k<e->n;k++) free(e->ln[k].b);
     free(e->ln); e->ln=NULL; e->n=0; e->cap=0;
     for(k=0;k<u->len;k++) if(u->data[k]=='\n') n++;
@@ -334,12 +341,31 @@ static void ed_redo(Editor *e){
 }
 
 static void ed_load(Editor *e);
+/* Line-ending style of the file as it is on disk, so saving keeps it: CRLF files stay CRLF
+   (no whole-file git diff on Windows) and a file without a final newline doesn't gain one.
+   Missing/new files: LF with a final newline. */
+static void ed_eol_probe(const char *path,int *crlf,int *final_nl){
+    int len=0, i, nl=0, cr=0;
+    char *src=read_file(path,&len);
+    *crlf=0; *final_nl=1;
+    if(!src) return;
+    for(i=0;i<len;i++) if(src[i]=='\n'){ nl++; if(i>0&&src[i-1]=='\r') cr++; }
+    *crlf = nl>0 && cr*2>=nl;          /* majority wins for mixed files */
+    *final_nl = len==0 || src[len-1]=='\n';
+    free(src);
+}
 static int ed_save_to(EdLine *ln,size_t n,const char *path){
-    FILE *f=fopen(path,"wb");
+    FILE *f;
     size_t i;
+    int crlf, final_nl;
+    ed_eol_probe(path,&crlf,&final_nl);
+    f=fopen(path,"wb");
     if(!f) return 0;
-    for(i=0;i<n;i++){ if(ln[i].len) fwrite(ln[i].b,1,ln[i].len,f); fputc('\n',f); }
-    fclose(f);
+    for(i=0;i<n;i++){
+        if(ln[i].len) fwrite(ln[i].b,1,ln[i].len,f);
+        if(i+1<n || final_nl) fputs(crlf?"\r\n":"\n",f);
+    }
+    if(fclose(f)!=0) return 0;          /* e.g. disk full: report the save as failed */
     return 1;
 }
 

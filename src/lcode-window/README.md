@@ -29,3 +29,20 @@ source-only editor.
 
 For an installable editor-only build, install `@hsusulist/lcode`; it downloads
 the standalone LCode release without installing the LUC command.
+
+## Themes from plugins
+
+`dark` and `light` are built in. A plugin folder (`plugin/<name>/`, next to `lcode.exe`,
+in the current folder, or in `%APPDATA%\LUC\plugin`) can add more: put one `<id>.theme`
+file per theme next to its `plugin.cfg`. The id is the file name without `.theme`
+(letters, digits, `-`, `_`). Each line is `field=#rrggbb` (or `field=r,g,b`):
+
+| Fields | Meaning |
+| --- | --- |
+| `code` `line` `ex` `top` `log` `sel` | backgrounds: code pane, cursor line, explorer, top strip, log panel, selection |
+| `key` `str` `num` `com` `fn` `dir` | syntax colors |
+| `tcur` `tdim` | bright and dim text (current line number, titles, hints) |
+
+Missing fields fall back to the `dark` theme. Plugin themes appear while the plugin is
+enabled; `:theme <id>` or the Theme row in `:setting` selects one. `plugin/catppuccin`
+is a complete example (Mocha, Macchiato, Frappe, Latte).

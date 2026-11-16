@@ -4,9 +4,9 @@
 
 import discord("bot")
 
-create p1 = bot.embed:create({"title": "Shop 1/2", "description": "Trang 1", "color": "0x00ff00"})
+create p1 = bot.embed:create({"title": "Shop 1/2", "description": "Page 1", "color": "0x00ff00"})
 p1:add_field({"name": "!ping", "value": "pong command", "inline": false})
-create p2 = bot.embed:create({"title": "Shop 2/2", "description": "Trang 2", "color": "0x0099ff"})
+create p2 = bot.embed:create({"title": "Shop 2/2", "description": "Page 2", "color": "0x0099ff"})
 p2:add_field({"name": "!help", "value": "shows this", "inline": false})
 
 create buttons = bot.buttons
@@ -58,7 +58,7 @@ task.spawn(function()
         create choice = sel:choose("food")
         if choice != nil then
             create msg = bot.msg
-            msg:send("Ban chon " + choice)
+            msg:send("You choose " + choice)
         end
     end
 end)

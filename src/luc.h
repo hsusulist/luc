@@ -202,6 +202,8 @@ void luc_throw(Value err);
 
 /* strings */
 Str *str_new(const char *s,int len);
+Str *str_concat(Str *a,Str *b);          /* interned a..b, one copy */
+int  luc_curline(LucState *L,Str **src);  /* line + source of the running instruction */
 void num2str(double n,char *buf,size_t sz);
 int  str2num(const char *s,int len,double *out);
 Str *tostr(Value v);

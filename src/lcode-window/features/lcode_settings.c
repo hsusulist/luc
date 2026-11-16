@@ -5,8 +5,10 @@ static void ed_plug_geom(Editor *e,int W,int H,int *x0,int *y0,int *w,int *h){
     int n=e->nplugs<ED_PLUGSHOW?e->nplugs:ED_PLUGSHOW;
     if(n<1) n=1;
     bh=1+n;
-    if(bw>W-4) bw=W-4; if(bw<24) bw=24;
-    if(bh>H-2) bh=H-2; if(bh<2) bh=2;
+    if(bw>W-4) bw=W-4;
+    if(bw<24) bw=24;
+    if(bh>H-2) bh=H-2;
+    if(bh<2) bh=2;
     *x0=(W-bw)/2; *y0=(H-bh)/2; if(*y0<1) *y0=1;
     *w=bw; *h=bh;
 }
@@ -19,7 +21,7 @@ static void ed_plug_draw(Editor *e,int W,int H){
     if(e->plug_sel>=e->plug_top+n) e->plug_top=e->plug_sel-n+1;
     if(e->plug_sel<e->plug_top) e->plug_top=e->plug_sel;
     /* header: light black */
-    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m",y0+1,x0+1);
+    printf("\x1b[%d;%dH%s%s",y0+1,x0+1,EC_X[XI_PAN],EC_X[XI_MFG]);
     { char hb[128];
       snprintf(hb,sizeof hb," plugins (%d)",e->nplugs);
       printf("%-*.*s",inner,inner,hb); }
@@ -28,9 +30,9 @@ static void ed_plug_draw(Editor *e,int W,int H){
         int yy=y0+1+i, pi=e->plug_top+i;
         Plug *p=&e->plugs[pi];
         printf("\x1b[%d;%dH",yy+1,x0+1);
-        if(pi==e->plug_sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-        else if(!p->enabled) printf("\x1b[48;2;36;36;36m\x1b[90m");
-        else printf("\x1b[48;2;36;36;36m\x1b[97m");
+        if(pi==e->plug_sel) fputs(EC_X[XI_ACC],stdout);
+        else if(!p->enabled) printf("%s%s",EC_X[XI_ROW],EC_X[XI_MDIM]);
+        else printf("%s%s",EC_X[XI_ROW],EC_X[XI_MFG]);
         { char row[128];
           snprintf(row,sizeof row,"  %-.12s  %-.12s",p->name,p->author);
           printf("%-*.*s",inner,inner,row); }
@@ -247,7 +249,7 @@ static void ed_set_activate(Editor *e){
     if(tab==0){
         if(row==0){ e->opt_guides=!e->opt_guides; ed_cfg_save(e); e->set_full=1; }
         else if(row==1){ e->icons_nerd=!e->icons_nerd; ed_cfg_save(e); e->set_full=1; }
-        else if(row==2){ ed_theme_apply(strcmp(ed_theme_cur,"dark")?"dark":"light"); ed_cfg_save(e); e->set_full=1; }
+        else if(row==2){ ed_theme_next(); ed_cfg_save(e); e->set_full=1; }
         else if(row==3){ e->show_ex=!e->show_ex; if(!e->show_ex) e->focus=0; ed_cfg_save(e); e->set_full=1; }
         else if(row==4){ ed_set_edit_start(e); }
         else if(row==5){ e->ex_side=!e->ex_side; ed_cfg_save(e); e->set_full=1; }
@@ -304,32 +306,31 @@ static void ed_set_draw(Editor *e,int W,int H){
     cw=bw-ED_SETW-3;
     cx0=x0+3+ED_SETW;   /* first content cell, 1-based */
     /* top border + header */
-    printf("\x1b[%d;%dH%s\xe2\x94\x8c",y0+1,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x8c",y0+1,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<bw-2;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x90\x1b[0m");
-    printf("\x1b[%d;%dH\x1b[48;2;45;45;45m\x1b[97m\xe2\x94\x82",y0+2,x0+1);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82",y0+2,x0+1,EC_X[XI_PAN],EC_X[XI_MFG]);
     printf(" settings");
     for(k=9;k<bw-2;k++) fputc(' ',stdout);
-    printf("\x1b[0m%s\xe2\x94\x82\x1b[0m",TH_TDIM);
+    printf("%s%s\xe2\x94\x82\x1b[0m",EC_X[XI_MODB],TH_TDIM);
     for(i=0;i<rows;i++){
         int yy=y0+3+i;
         int ti=e->set_tab_top+i;
-        printf("\x1b[%d;%dH%s\xe2\x94\x82",yy,x0+1,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82",yy,x0+1,EC_X[XI_MODB],TH_TDIM);
         if(ti<ntabs){
             const char *t="?";
             if(ti==0) t="Appearance";
             else if(ti==1) t="Keybinds";
             else { int pi=ed_set_plug_tab(e,ti); if(pi>=0) t=e->plugs[pi].name; }
             int cur=ti==e->set_tab;
-            if(cur) printf(e->set_left?"\x1b[48;2;0;120;215m\x1b[97m"
-                                      :"\x1b[48;2;0;70;120m\x1b[97m");
-            else printf("\x1b[48;2;17;17;17m\x1b[97m");
+            if(cur) fputs(e->set_left?EC_X[XI_ACC]:EC_X[XI_ACCDIM],stdout);
+            else printf("%s%s",EC_X[XI_MODL],EC_X[XI_MFG]);
             printf(" %-*.*s",ED_SETW-1,ED_SETW-1,t);
         } else {
-            printf("\x1b[48;2;17;17;17m");
+            fputs(EC_X[XI_MODL],stdout);
             for(k=0;k<ED_SETW;k++) fputc(' ',stdout);
         }
-        printf("\x1b[48;2;30;30;30m%s\xe2\x94\x82",TH_TDIM);
+        printf("%s%s\xe2\x94\x82",EC_X[XI_MOD],TH_TDIM);
         printf("\x1b[%d;%dH",yy,cx0);
         if(i<nrows){
             int ri=e->set_row_top+i;
@@ -337,8 +338,8 @@ static void ed_set_draw(Editor *e,int W,int H){
             if(ri>=nrows) ri=nrows-1;
             sel=(!e->set_left&&ri==e->set_row);
             ed_set_row_text(e,e->set_tab,ri,label,sizeof label,val,sizeof val,&kind);
-            if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-            else printf("\x1b[48;2;30;30;30m\x1b[97m");
+            if(sel) fputs(EC_X[XI_ACC],stdout);
+            else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
             if(kind==SET_INFO){
                 char line[208]; int L;
                 snprintf(line,sizeof line,"%s",label);
@@ -365,13 +366,13 @@ static void ed_set_draw(Editor *e,int W,int H){
                 fwrite(label,1,(size_t)Ll,stdout);
                 for(k=0;k<pad;k++) fputc(' ',stdout);
                 printf("[ ");
-                if(kind==SET_TOGGLE&&!strcmp(val,"on")) printf("\x1b[92m");
-                else if(kind==SET_VALUE) printf("\x1b[38;2;120;200;255m");
-                else if(kind==SET_ACTION) printf("\x1b[96m");
-                else if(!sel) printf("\x1b[90m");
+                if(kind==SET_TOGGLE&&!strcmp(val,"on")) fputs(EC_X[XI_ON],stdout);
+                else if(kind==SET_VALUE) fputs(EC_X[XI_VAL],stdout);
+                else if(kind==SET_ACTION) fputs(EC_X[XI_ACT],stdout);
+                else if(!sel) fputs(EC_X[XI_MDIM],stdout);
                 fwrite(val,1,strlen(val),stdout);
-                if(sel) printf("\x1b[48;2;0;120;215m\x1b[97m");
-                else printf("\x1b[48;2;30;30;30m\x1b[97m");
+                if(sel) fputs(EC_X[XI_ACC],stdout);
+                else printf("%s%s",EC_X[XI_MOD],EC_X[XI_MFG]);
                 printf(" ]");
                 { int used=1+Ll+pad+fieldw; for(k=used;k<cw;k++) fputc(' ',stdout); }
                 if(kind==SET_TEXT&&e->set_edit&&
@@ -389,13 +390,13 @@ static void ed_set_draw(Editor *e,int W,int H){
                 }
             }
         } else {
-            printf("\x1b[48;2;30;30;30m");
+            fputs(EC_X[XI_MOD],stdout);
             for(k=0;k<cw;k++) fputc(' ',stdout);
         }
-        printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",yy,x0+bw,TH_TDIM);
+        printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",yy,x0+bw,EC_X[XI_MODB],TH_TDIM);
     }
     /* footer + bottom border */
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[48;2;22;22;22m%s",y0+3+rows,x0+1,TH_TDIM,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82%s%s",y0+3+rows,x0+1,EC_X[XI_MODB],TH_TDIM,EC_X[XI_MODF],TH_TDIM);
     { const char *hint;
       if(e->set_tab==1&&e->set_key_cap==1) hint=" Press keys  Esc cancel";
       else if(e->set_tab==1&&e->set_key_cap==2) hint=" Enter confirm  Esc cancel";
@@ -405,8 +406,8 @@ static void ed_set_draw(Editor *e,int W,int H){
       if(used>bw-2) used=bw-2;
       fwrite(hint,1,(size_t)used,stdout);
       for(kk=used;kk<bw-2;kk++) fputc(' ',stdout); }
-    printf("\x1b[%d;%dH%s\xe2\x94\x82\x1b[0m",y0+3+rows,x0+bw,TH_TDIM);
-    printf("\x1b[%d;%dH%s\xe2\x94\x94",y0+4+rows,x0+1,TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x82\x1b[0m",y0+3+rows,x0+bw,EC_X[XI_MODB],TH_TDIM);
+    printf("\x1b[%d;%dH%s%s\xe2\x94\x94",y0+4+rows,x0+1,EC_X[XI_MODB],TH_TDIM);
     for(k=0;k<bw-2;k++) fputs("\xe2\x94\x80",stdout);
     printf("\xe2\x94\x98\x1b[0m");
     if(e->set_edit&&e->set_cur_x>0)
@@ -493,7 +494,6 @@ static void ed_menu_pick(Editor *e,int id){
 
 /* Popup input: 1 when consumed */
 static int ed_popup_key(Editor *e,WORD vk,WCHAR ch){
-    int i;
     if(e->naming){
         if(ch==27){ ed_naming_cancel(e); return 1; }
         if(ch==13){ ed_naming_confirm(e); return 1; }

@@ -169,9 +169,10 @@ gcc: MSYS2 MinGW64 shell -> pacman -S mingw-w64-x86_64-gcc
     }
 }
 
-# pack packages\ai.lucpkg so "luc install ai" also works offline
+# pack packages\ai.lucpkg + discord.lucpkg: commit them - "luc install -p" and the
+# installer's Modify/Repair download them from GitHub (nothing is shipped offline)
 if (Test-Path (Join-Path $ProjectDir 'luc_modules')) {
-    Write-Host 'Packing packages\ai.lucpkg (offline source for luc install ai)...'
+    Write-Host 'Packing packages\*.lucpkg (served from GitHub for luc install -p)...'
     & (Join-Path $ProjectDir 'tools\make_pkg.ps1')
 }
 

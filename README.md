@@ -81,10 +81,13 @@ On Windows the package is a small launcher that installs the runtime into `%LOCA
 The core interpreter is always installed. Optional components: `window`, `ai`, `discord`, `lcode`, `vscode`, `source`.
 
 ```powershell
-luc install                              # interactive installer
-luc install window                       # add one component later
+luc install                              # install or repair LUC itself
 luc install -c window,ai -d "D:\Tools\LUC" -y
+luc install -p                           # pick a package from a menu, Enter installs it
+luc install -p ai discord                # install packages directly
 ```
+
+Packages added with `luc install -p` are always downloaded from GitHub (no offline copy); without internet the command says so and changes nothing. Reopening `luc-installer.exe` offers Modify, Repair, Reinstall and Uninstall.
 
 Flags: `-y`, `-c <list>`, `-d <dir>`, `--no-path`, `--no-env`, `--force`, `--quiet`, `--archive <zip>`, `--source github|local`.
 
@@ -96,7 +99,7 @@ Flags: `-y`, `-c <list>`, `-d <dir>`, `--no-path`, `--no-env`, `--force`, `--qui
 | `luc -e "print(1 + 2)"` | run a snippet |
 | `luc` | open the interactive help desk (type a keyword such as `repeat` or `net`) |
 | `luc --libs` | list core, installed and user libraries |
-| `luc install <name>` / `luc remove <name>` | add or remove an optional library |
+| `luc install -p [name]` / `luc remove <name>` | add (from GitHub) or remove an optional library |
 | `luc lcode [path]` | open the LCode editor |
 | `luc build in.luc -o out.exe` | compile to a standalone executable (Windows x64 only) |
 | `luc uninstall` | uninstall LUC |
