@@ -1,0 +1,8 @@
+create t = os.now()
+create d = {}
+repeat 1, 200000 as i do d["k" .. i] = i end
+create s = 0
+repeat 1, 10 as r do
+    repeat 1, 200000 as i do s = s + d["k" .. i] end
+end
+print("dict", s, os.now() - t)

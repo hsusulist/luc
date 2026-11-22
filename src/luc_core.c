@@ -283,8 +283,19 @@ static Entry *hash_find(Table *t,Value k){
         i=(i+1)&(unsigned)(t->ecap-1);
     }
 }
+/* String keys are interned and cache their hash: a pointer compare finds them. */
+static inline Entry *hash_find_str(const Table *t,const Str *s){
+    if(t->ecap==0) return NULL;
+    unsigned m=(unsigned)(t->ecap-1), i=s->hash&m;
+    for(;;){
+        Entry *e=&t->ents[i];
+        if(e->k.t==LT_STR){ if(e->k.u.o==(const Obj*)s) return e; }
+        else if(e->k.t==LT_NIL) return NULL;
+        i=(i+1)&m;
+    }
+}
 static void hash_set(Table *t,Value k,Value v){
-    Entry *e=hash_find(t,k);
+    Entry *e= k.t==LT_STR? hash_find_str(t,AS_STR(k)) : hash_find(t,k);
     if(e){ e->v=v; return; }
     if(v.t==LT_NIL) return;
     if(t->ecap==0 || (t->ecount+1)*4 >= t->ecap*3) hash_grow(t);
@@ -337,6 +348,7 @@ static void arr_reserve(Table *t,int n){
 
 Value tab_get(Table *t,Value k){
     int i;
+    if(k.t==LT_STR){ Entry *e=hash_find_str(t,AS_STR(k)); return e? e->v : NIL; }
     if(arr_index(k,&i)){
         if(i>=1 && i<=t->alen) return t->arr[i-1];
     }
@@ -538,7 +550,16 @@ void num2str(double n,char *buf,size_t sz){
     if(n!=n){ snprintf(buf,sz,"nan"); return; }
     if(n==HUGE_VAL){ snprintf(buf,sz,"inf"); return; }
     if(n==-HUGE_VAL){ snprintf(buf,sz,"-inf"); return; }
-    if(n==floor(n) && fabs(n)<1e15){ snprintf(buf,sz,"%lld",(long long)n); return; }
+    if(n==floor(n) && fabs(n)<1e15){
+        /* integers: hand-rolled itoa (snprintf dominated "k" .. i style code) */
+        long long v=(long long)n; char tmp[24]; int k=0;
+        unsigned long long u = v<0? (unsigned long long)(-v) : (unsigned long long)v;
+        do { tmp[k++]=(char)('0'+u%10); u/=10; } while(u);
+        if(v<0) tmp[k++]='-';
+        if((size_t)k+1>sz){ snprintf(buf,sz,"%lld",v); return; }
+        for(int i=0;i<k;i++) buf[i]=tmp[k-1-i];
+        buf[k]=0; return;
+    }
     /* shortest form that reads back as the same double: 0.1 -> "0.1", not 0.10000000000000001 */
     for(int prec=15;prec<=17;prec++){
         snprintf(buf,sz,"%.*g",prec,n);
@@ -1809,7 +1830,7 @@ static Block *parse_block(Parser *ps){
 
 /* 10. COMPILER (AST -> bytecode) */
 
-typedef struct { Str *name; } LocalVar;
+typedef struct { Str *name; int captured; } LocalVar;  /* captured: some closure holds it as an upvalue */
 typedef struct BlockCnt {
     struct BlockCnt *prev;
     int firstlocal, isloop;
@@ -1878,6 +1899,7 @@ static int reserve(FuncState *fs,int n){
 static int newlocal(FuncState *fs,Str *name){
     if(fs->nlocals>=LUC_MAXREG-4) cerror(fs,fs->line,"too many local variables");
     fs->locals[fs->nlocals].name=name;
+    fs->locals[fs->nlocals].captured=0;
     checkreg(fs,fs->nlocals+1);
     return fs->nlocals++;
 }
@@ -1892,6 +1914,7 @@ static int findupval(FuncState *fs,Str *n){
     int r=findlocal(fs->prev,n);
     if(r>=0){
         if(p->nup>=LUC_MAXUPVAL) cerror(fs,fs->line,"too many upvalues");
+        fs->prev->locals[r].captured=1;
         p->upvals[p->nup].instack=1; p->upvals[p->nup].idx=(unsigned char)r;
         fs->upnames[p->nup]=n; return p->nup++;
     }
@@ -1908,7 +1931,10 @@ static void enterblock(FuncState *fs,BlockCnt *bl,int isloop){
 }
 static void leaveblock(FuncState *fs,int line){
     BlockCnt *bl=fs->bl;
-    if(bl->firstlocal<fs->nlocals) emit(fs,I_ABC(OP_CLOSE,bl->firstlocal,0,0),line);
+    /* CLOSE only when a closure captured one of this block's locals (else it is a no-op) */
+    int cap=0;
+    for(int i=bl->firstlocal;i<fs->nlocals;i++) if(fs->locals[i].captured){ cap=1; break; }
+    if(cap) emit(fs,I_ABC(OP_CLOSE,bl->firstlocal,0,0),line);
     fs->nlocals=bl->firstlocal; fs->freereg=fs->nlocals; fs->bl=bl->prev;
 }
 static void patch_breaks(FuncState *fs,BlockCnt *bl,int target){
@@ -2185,6 +2211,16 @@ static int try_compound(FuncState *fs,Stat *s){
     return 1;
 }
 
+/* Expression kinds whose code writes the destination register only as its last step. */
+static int direct_safe(Expr *e){
+    switch(e->k){
+        case E_BIN: case E_INDEX: case E_NUM: case E_STR: case E_NIL: case E_TRUE: case E_FALSE:
+        case E_TABLE: case E_LIST: case E_SLICE: case E_FUNC: case E_NAME:
+            return 1;
+        case E_UN: return e->op=='('? direct_safe(e->a) : 1;
+        default: return 0;   /* and/or write the target early; calls use their own slot */
+    }
+}
 static void store_to(FuncState *fs,Expr *lhs,int valreg,int line){
     if(lhs->k==E_NAME){
         int r=findlocal(fs,lhs->name);
@@ -2238,6 +2274,12 @@ static void comp_stat(FuncState *fs,Stat *s){
                 }
             }
             if(try_compound(fs,s)){ fs->freereg=fs->nlocals; break; }
+            if(s->lhs.n==1 && s->rhs.n==1 && s->lhs.e[0]->k==E_NAME && direct_safe(s->rhs.e[0])){
+                /* x = expr for a local x: compute straight into x's register (no temp + MOVE).
+                   Only for expression kinds that read every operand before writing the target. */
+                int r=findlocal(fs,s->lhs.e[0]->name);
+                if(r>=0){ exprd(fs,s->rhs.e[0],r); fs->freereg=fs->nlocals; break; }
+            }
             int base=fs->freereg;
             adjust_assign(fs,s->lhs.n,&s->rhs,base);
             for(int i=s->lhs.n-1;i>=0;i--) store_to(fs,s->lhs.e[i],base+i,s->line);
@@ -2455,6 +2497,14 @@ static Proto *compile_proto(FuncState *parent,FuncBody *fb,Str *source,int karat
         emit(&fs,I_ABC(OP_RETURN,base,2,0),fb->line);
     } else emit(&fs,I_ABC(OP_RETURN,0,1,0),fb->line);
     if(fs.p->maxstack<2) fs.p->maxstack=2;
+#ifdef LUC_DISASM
+    if(getenv("LUC_DIS")){
+        static const char *nm[]={"MOVE","LOADK","LOADNIL","LOADBOOL","GETGLOBAL","SETGLOBAL","GETUPVAL","SETUPVAL","GETTABLE","SETTABLE","NEWTABLE","SETLIST","SELF","ADD","SUB","MUL","DIV","MOD","POW","UNM","NOT","LEN","CONCAT","EQ","NE","LT","LE","GT","GE","IN","JMP","JMPIF","JMPIFNOT","CALL","RETURN","CLOSURE","VARARG","CLOSE","FORPREP","FORLOOP","TFORLOOP","SLICE","NEXT","APPEND","ADDEQ","SUBEQ","MULEQ","DIVEQ","LOADKA","LOADKC","EQJ","NEJ","LTJ","LEJ","GTJ","GEJ","LOADKG","LOADKS","?","?","?","?","?","?","?","?","?","?","?","?","?","?","?","?","?","?"};
+        fprintf(stderr,"-- proto %s line %d (%d ins)\n",fb->name?fb->name->s:"?",fb->line,fs.p->ncode);
+        for(int i=0;i<fs.p->ncode;i++){ uint32_t c=fs.p->code[i];
+            fprintf(stderr,"%4d [%3d] %-9s A=%d B=%d C=%d Bx=%d sBx=%d\n",i,fs.p->lines[i],nm[GET_OP(c)],GET_A(c),GET_B(c),GET_C(c),GET_Bx(c),GET_sBx(c)); }
+    }
+#endif
     return fs.p;
 }
 
@@ -2770,9 +2820,49 @@ static int f_lua_trap(LucState *L,int base,int nargs,CFunc *self){
     return 0;
 }
 
+/* Superinstructions.  Rewrites the FIRST instruction of a hot sequence in place and
+   leaves the rest untouched: the fused op does the whole sequence on its number fast
+   path and skips ahead, otherwise it does only the first instruction's work and the
+   original next instructions run as before.  Same length, same jump targets, same
+   line table.  Runs once per proto, before any frame of it exists (pushframe); a proto
+   the JIT compiled keeps its native code (the JIT read the original bytecode first). */
+static int op_is_cmp(int op){ return op>=OP_EQ && op<=OP_GE; }
+static int op_is_arith4(int op){ return op==OP_ADD||op==OP_SUB||op==OP_MUL||op==OP_DIV; }
+static void proto_fuse(Proto *p){
+    p->vmopt=1;
+    uint32_t *c=p->code; int n=p->ncode;
+    for(int i=0;i+1<n;i++){
+        uint32_t a=c[i], b=c[i+1];
+        int oa=GET_OP(a), ob=GET_OP(b);
+        if(oa==OP_LOADK && p->k[GET_Bx(a)].t==LT_NUM){
+            int t=GET_A(a);
+            int uses = GET_B(b)==t || GET_C(b)==t;
+            if(op_is_arith4(ob) && uses){
+                c[i]=(a&0x00FFFFFFu)|((uint32_t)OP_LOADKA<<24); i++; continue;
+            }
+            if(op_is_cmp(ob) && uses && i+2<n && GET_OP(c[i+2])==OP_JMPIFNOT
+               && GET_A(c[i+2])==GET_A(b)){
+                c[i]=(a&0x00FFFFFFu)|((uint32_t)OP_LOADKC<<24); i++; continue;
+            }
+        }
+        if(oa==OP_LOADK && p->k[GET_Bx(a)].t==LT_STR){
+            int t=GET_A(a);
+            if(ob==OP_GETTABLE && GET_C(b)==t && GET_B(b)!=t){
+                c[i]=(a&0x00FFFFFFu)|((uint32_t)OP_LOADKG<<24); i++; continue;
+            }
+            if(ob==OP_SETTABLE && GET_B(b)==t && GET_A(b)!=t){
+                c[i]=(a&0x00FFFFFFu)|((uint32_t)OP_LOADKS<<24); i++; continue;
+            }
+        }
+        if(op_is_cmp(oa) && ob==OP_JMPIFNOT && GET_A(b)==GET_A(a)){
+            c[i]=(a&0x00FFFFFFu)|((uint32_t)(OP_EQJ+(oa-OP_EQ))<<24);
+        }
+    }
+}
 static void pushframe(LucState *L,int func,int nargs,int nres){
     Closure *cl=AS_CL(L->stack[func]);
     Proto *p=cl->p; int i,bse;
+    if(!p->vmopt) proto_fuse(p);
     if(L->nci>=LUC_MAXCI) luc_error("stack overflow (too much recursion)");
     if(p->isvararg){
         int actual=nargs>p->nparams?nargs:p->nparams;
@@ -2783,7 +2873,7 @@ static void pushframe(LucState *L,int func,int nargs,int nres){
         for(i=p->nparams;i<p->maxstack;i++) L->stack[bse+i]=NIL;
     } else {
         int room=nargs>p->maxstack?nargs:p->maxstack;
-        ensure_stack(L,func+2+room+8);
+        if(func+2+room+8 > L->stacksize) ensure_stack(L,func+2+room+8);
         bse=func+1;
         for(i=p->nparams;i<p->maxstack;i++) L->stack[bse+i]=NIL;
         for(i=nargs;i<p->nparams;i++) L->stack[bse+i]=NIL;
@@ -2887,6 +2977,15 @@ static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Val
             }
         }
     }
+    if(tv.t==LT_TABLE && kv.t==LT_STR && vv.t==LT_NUM){
+        /* Fast path: numeric field the table holds itself (no __index/__newindex) */
+        Entry *e=hash_find_str(AS_TAB(tv),AS_STR(kv));
+        if(e && e->v.t==LT_NUM){
+            double o=e->v.u.n;
+            e->v=mknum(which==0?o+vv.u.n : which==1?o-vv.u.n : which==2?o*vv.u.n : o/vv.u.n);
+            return;
+        }
+    }
     CallInfo *ci=&L->ci[L->nci-1]; Value *base=L->stack+ci->base;
     Value oldv=vm_index(tv,kv);
     if(oldv.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
@@ -2962,9 +3061,12 @@ static void vm_execute(LucState *L,int baselevel){
         &&vm_op_VARARG, &&vm_op_CLOSE, &&vm_op_FORPREP, &&vm_op_FORLOOP,
         &&vm_op_TFORLOOP, &&vm_op_SLICE, &&vm_op_NEXT, &&vm_op_APPEND,
         &&vm_op_ADDEQ, &&vm_op_SUBEQ, &&vm_op_MULEQ, &&vm_op_DIVEQ,
+        &&vm_op_LOADKA, &&vm_op_LOADKC,
+        &&vm_op_EQJ, &&vm_op_NEJ, &&vm_op_LTJ, &&vm_op_LEJ, &&vm_op_GTJ, &&vm_op_GEJ,
+        &&vm_op_LOADKG, &&vm_op_LOADKS,
         [OP_COUNT ... 255] = &&vm_op_BADOP
     };
-#define VM_OPS_LISTED 48
+#define VM_OPS_LISTED 58
     typedef char vm_dispatch_covers_all_ops[(OP_COUNT==VM_OPS_LISTED)?1:-1] __attribute__((unused));
 #else
 #define VM_LABEL(name) case OP_##name:
@@ -3017,6 +3119,11 @@ static void vm_execute(LucState *L,int baselevel){
                     }
                 }
             }
+            if(tv.t==LT_TABLE && kv.t==LT_STR){
+                /* Fast path: field that the table holds itself */
+                Entry *e=hash_find_str(AS_TAB(tv),AS_STR(kv));
+                if(e && e->v.t!=LT_NIL){ base[A]=e->v; VM_NEXT; }
+            }
             Value r=vm_index(tv,kv);
             if(r.t==LT_NIL && tv.t==LT_TABLE && AS_TAB(tv)->meta){
                 Value h=tab_get(AS_TAB(tv)->meta,MM_INDEX);
@@ -3044,6 +3151,11 @@ static void vm_execute(LucState *L,int baselevel){
                         }
                     }
                 }
+            }
+            if(tv.t==LT_TABLE && kv.t==LT_STR && vv.t!=LT_NIL){
+                /* Fast path: overwrite a field the table already holds (never __newindex) */
+                Entry *e=hash_find_str(AS_TAB(tv),AS_STR(kv));
+                if(e && e->v.t!=LT_NIL){ e->v=vv; VM_NEXT; }
             }
             if(tv.t==LT_TABLE && AS_TAB(tv)->meta){
                 /* __newindex: only for keys the table does not hold itself */
@@ -3224,6 +3336,12 @@ static void vm_execute(LucState *L,int baselevel){
             int na = b? b-1 : (int)(L->top-(func+1));
             int nres = c? c-1 : -1;
             Value f=L->stack[func];
+            if(f.t==LT_FUNC && AS_CL(f)->p->nojit){
+                /* Fast path: LUC closure the JIT declined -> straight to a new frame */
+                ci->savedpc=pc;
+                pushframe(L,func,na,nres);
+                goto reentry;
+            }
             if(f.t==LT_TABLE){
                 Table *mtb=AS_TAB(f)->meta;
                 Value hf = mtb? tab_get(mtb,MM_CALL) : NIL;
@@ -3272,7 +3390,7 @@ static void vm_execute(LucState *L,int baselevel){
                 VM_GCCHECK();                 /* C functions allocate (strings, lists...) */
             } else if(f.t==LT_FUNC){
                 ci->savedpc=pc;
-                int jn=luc_jit_call(L,func,na,nres);
+                int jn= AS_CL(f)->p->nojit? LUC_JIT_FALLBACK : luc_jit_call(L,func,na,nres);
                 if(jn!=LUC_JIT_FALLBACK){
                     ci=&L->ci[L->nci-1];      /* frames and stack may have moved */
                     base=L->stack+ci->base;
@@ -3335,14 +3453,86 @@ static void vm_execute(LucState *L,int baselevel){
             base=L->stack+ci->base;   /* ...and move the stack */
             L->top=nres>=0?ci->base+pr->maxstack:ci->base+A+got;
         } VM_NEXT;
-        VM_LABEL(ADDEQ) { vm_compound(L,0,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
-        VM_LABEL(SUBEQ) { vm_compound(L,1,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
-        VM_LABEL(MULEQ) { vm_compound(L,2,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
-        VM_LABEL(DIVEQ) { vm_compound(L,3,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(LOADKA) {
+            Value k=K[GET_Bx(ins)];
+            base[A]=k;
+            uint32_t nx=*pc;
+            Value x=base[GET_B(nx)], y=base[GET_C(nx)];
+            if(x.t==LT_NUM && y.t==LT_NUM){
+                double r;
+                switch(GET_OP(nx)){
+                    case OP_ADD: r=x.u.n+y.u.n; break;
+                    case OP_SUB: r=x.u.n-y.u.n; break;
+                    case OP_MUL: r=x.u.n*y.u.n; break;
+                    default:     r=x.u.n/y.u.n; break;
+                }
+                base[GET_A(nx)]=mknum(r);
+                pc++;
+            }
+        } VM_NEXT;
+        VM_LABEL(LOADKC) {
+            Value k=K[GET_Bx(ins)];
+            base[A]=k;
+            uint32_t nx=pc[0];
+            Value x=base[GET_B(nx)], y=base[GET_C(nx)];
+            if(x.t==LT_NUM && y.t==LT_NUM){
+                int c;
+                switch(GET_OP(nx)){
+                    case OP_EQ: c=x.u.n==y.u.n; break;
+                    case OP_NE: c=x.u.n!=y.u.n; break;
+                    case OP_LT: c=x.u.n<y.u.n;  break;
+                    case OP_LE: c=x.u.n<=y.u.n; break;
+                    case OP_GT: c=x.u.n>y.u.n;  break;
+                    default:    c=x.u.n>=y.u.n; break;
+                }
+                base[GET_A(nx)]=mkbool(c);
+                uint32_t jx=pc[1];
+                pc+=2;
+                if(!c) pc+=GET_sBx(jx);
+            }
+        } VM_NEXT;
+        VM_LABEL(LOADKG) {
+            Value k=K[GET_Bx(ins)];
+            base[A]=k;
+            uint32_t nx=*pc;
+            Value tv=base[GET_B(nx)];
+            if(tv.t==LT_TABLE){
+                Entry *e=hash_find_str(AS_TAB(tv),AS_STR(k));
+                if(e && e->v.t!=LT_NIL){ base[GET_A(nx)]=e->v; pc++; }
+            }
+        } VM_NEXT;
+        VM_LABEL(LOADKS) {
+            Value k=K[GET_Bx(ins)];
+            base[A]=k;
+            uint32_t nx=*pc;
+            Value tv=base[GET_A(nx)], vv=base[GET_C(nx)];
+            if(tv.t==LT_TABLE && vv.t!=LT_NIL){
+                Entry *e=hash_find_str(AS_TAB(tv),AS_STR(k));
+                if(e && e->v.t!=LT_NIL){ e->v=vv; pc++; }
+            }
+        } VM_NEXT;
+#define VM_CMPJ(expr,slow) do{ Value x=base[GET_B(ins)], y=base[GET_C(ins)]; \
+            int c_=(x.t==LT_NUM&&y.t==LT_NUM)? (expr) : (slow); \
+            base[A]=mkbool(c_); uint32_t jx_=*pc++; if(!c_) pc+=GET_sBx(jx_); }while(0)
+        VM_LABEL(EQJ) { VM_CMPJ(x.u.n==y.u.n, val_rawequal(x,y)); } VM_NEXT;
+        VM_LABEL(NEJ) { VM_CMPJ(x.u.n!=y.u.n, !val_rawequal(x,y)); } VM_NEXT;
+        VM_LABEL(LTJ) { VM_CMPJ(x.u.n<y.u.n,  vm_lessthan(x,y,0)); } VM_NEXT;
+        VM_LABEL(LEJ) { VM_CMPJ(x.u.n<=y.u.n, vm_lessthan(x,y,1)); } VM_NEXT;
+        VM_LABEL(GTJ) { VM_CMPJ(x.u.n>y.u.n,  vm_lessthan(y,x,0)); } VM_NEXT;
+        VM_LABEL(GEJ) { VM_CMPJ(x.u.n>=y.u.n, vm_lessthan(y,x,1)); } VM_NEXT;
+/* t.name op= number on a numeric field the table holds itself: no call, no metamethods */
+#define VM_FIELDOP(OPC) do{ Value tv_=base[A], kv_=base[GET_B(ins)], vv_=base[GET_C(ins)]; \
+            if(tv_.t==LT_TABLE && kv_.t==LT_STR && vv_.t==LT_NUM){ \
+                Entry *e_=hash_find_str(AS_TAB(tv_),AS_STR(kv_)); \
+                if(e_ && e_->v.t==LT_NUM){ e_->v.u.n = e_->v.u.n OPC vv_.u.n; VM_NEXT; } } }while(0)
+        VM_LABEL(ADDEQ) { VM_FIELDOP(+); vm_compound(L,0,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(SUBEQ) { VM_FIELDOP(-); vm_compound(L,1,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(MULEQ) { VM_FIELDOP(*); vm_compound(L,2,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
+        VM_LABEL(DIVEQ) { VM_FIELDOP(/); vm_compound(L,3,pc,base[A],base[GET_B(ins)],base[GET_C(ins)]); VM_RELOAD(); } VM_NEXT;
         VM_LABEL(RETURN) {
             int b=GET_B(ins);
             int n = b? b-1 : (int)(L->top-(ci->base+A));
-            close_upvals(L,ci->base);
+            if(L->openupv) close_upvals(L,ci->base);
             int func=ci->func, want=ci->nresults;
             for(int i=0;i<n;i++) L->stack[func+i]=base[A+i];
             L->nci--;
@@ -5204,7 +5394,8 @@ static const HelpTopic HELP_TOPICS[] = {
  "time.timeSpan(start, end) returns seconds; workDaysBetween and workDayOffset use Unix timestamps."},
 {"math",
  "math.floor/ceil/round/sqrt/sin/cos/random, math.pi.\n"
- "math.karatsuba(\"huge\", \"huge\") multiplies exactly.\n"
+ "math.karatsuba(\"huge\", \"huge\") multiplies exactly (Karatsuba, NTT for huge numbers).\n"
+ "math.bigpow(a, n) and math.factorial(n) return exact big integers as strings.\n"
  "math.length(123456789) is 9; math.length(\"hello\") is 5.\n"
  "math.letter(2, \"hello\") returns \"e\"; letter positions start at 1.\n"
  "Also: cbrt, exp2, log2, trunc, sign, hypot, gcd, lcm, ceiling, abs, trig/inverse trig,\n"

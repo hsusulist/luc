@@ -1,0 +1,9 @@
+create t = os.now()
+create n = 0
+repeat 1, 300000 as i do
+    create s = "item" .. i
+    if string.sub(s, 1, 4) == "item" then n = n + len(s) end
+    create u = string.upper(s)
+    n = n + string.byte(u, 1)
+end
+print("strops", n, os.now() - t)

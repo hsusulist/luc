@@ -73,6 +73,9 @@ struct Proto {
     Str *name, *source;
     int uses_karatsuba;   /* !karatsuba: exact big-int * here */
     int uses_strict;      /* !strict: no implicit globals, quoted dict keys */
+    int vmopt;            /* superinstructions applied (see proto_fuse) */
+    int jitid;            /* JIT cache slot + 1 (0 = not looked up yet) */
+    int nojit;            /* JIT declined this proto: callers skip the JIT hook */
 };
 
 struct Upval {
@@ -135,6 +138,14 @@ enum {
     OP_CALL, OP_RETURN, OP_CLOSURE, OP_VARARG, OP_CLOSE,
     OP_FORPREP, OP_FORLOOP, OP_TFORLOOP, OP_SLICE, OP_NEXT,
     OP_APPEND, OP_ADDEQ, OP_SUBEQ, OP_MULEQ, OP_DIVEQ,
+    /* superinstructions: never emitted by the compiler; proto_fuse() rewrites a hot
+       pair/triple in place at first interpretation (the following instructions stay
+       untouched, so every jump target and every slow path is the original code) */
+    OP_LOADKA,                 /* LOADK t,k ; ADD/SUB/MUL/DIV with t as an operand */
+    OP_LOADKC,                 /* LOADK t,k ; EQ..GE with t ; JMPIFNOT on the result */
+    OP_EQJ, OP_NEJ, OP_LTJ, OP_LEJ, OP_GTJ, OP_GEJ,   /* compare ; JMPIFNOT on it */
+    OP_LOADKG,                 /* LOADK t,"name" ; GETTABLE r,obj,t   (obj.name) */
+    OP_LOADKS,                 /* LOADK t,"name" ; SETTABLE obj,t,v   (obj.name = v) */
     OP_COUNT
 };
 

@@ -1,0 +1,22 @@
+-- same work as mandel.luc, but the hot loop is a function: the LUC JIT compiles it
+create function mandel(N)
+    create count = 0
+    repeat 1, N as y do
+        create ci = 2.0 * y / N - 1.0
+        repeat 1, N as x do
+            create cr = 2.0 * x / N - 1.5
+            create zr, zi = 0.0, 0.0
+            create k = 0
+            while k < 100 and zr * zr + zi * zi < 4.0 do
+                create nz = zr * zr - zi * zi + cr
+                zi = 2.0 * zr * zi + ci
+                zr = nz
+                k = k + 1
+            end
+            if k == 100 then count = count + 1 end
+        end
+    end
+    return count
+end
+create t = os.now()
+print("fn_mandel", mandel(400), os.now() - t)

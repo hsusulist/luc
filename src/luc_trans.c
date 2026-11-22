@@ -32,9 +32,18 @@ int  luc_aot_embedded(char **psrc,int *plen);
 #define VOFU  ((int)offsetof(Value,u))
 typedef char luc_trans_value_assert[(sizeof(Value)==16 && offsetof(Value,u)==8)?1:-1];
 
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__x86_64__) && (defined(__linux__) || defined(__FreeBSD__)) && !defined(LUC_NO_JIT))
 
+#if defined(_WIN32)
+#define LUC_JIT_WIN64 1
 #include <windows.h>
+#else
+/* Linux / FreeBSD x86-64: same code generator, System V calling convention.
+   Differences from Win64 handled below: args arrive in RDI/ESI/RDX; RSI, RDI and all
+   XMM registers are caller-saved, so they do not survive the MOD/POW helper calls. */
+#define LUC_JIT_SYSV 1
+#include <sys/mman.h>
+#endif
 
 /* 1. byte buffer */
 
@@ -740,9 +749,16 @@ static int gen_prologue(Gen *g){
     Ana *a=g->a;
     emit_push(b,R_RBP); emit_push(b,R_RBX); emit_push(b,R_RSI); emit_push(b,R_RDI);
     emit_push(b,12); emit_push(b,13); emit_push(b,14); emit_push(b,15);
+#if defined(LUC_JIT_SYSV)
+    emit_mov_rr32(b,12,R_RSI);             /* nargs (ESI) -> r12d, before RSI is reused */
+    emit_mov_rr64(b,R_RBX,R_RDI);          /* args (RDI) */
+    emit_mov_rr64(b,R_RSI,R_RDX);          /* out  (RDX) */
+    emit_mov_rr64(b,13,R_RDX);             /* out also in r13: RSI dies across calls */
+#else
     emit_mov_rr64(b,R_RBX,R_RCX);          /* args */
     emit_mov_rr64(b,R_RSI,8);              /* out  (R8) */
     emit_mov_rr32(b,12,R_RDX);             /* nargs -> r12d */
+#endif
     emit_stack_probe(b,a->framesz);
     emit_sub_rsp(b,a->framesz);
     for(int x=6;x<16;x++) if(a->savoff[x]>=0) emit_movaps_st_rsp(b,x,a->savoff[x]);
@@ -847,6 +863,10 @@ static int gen_body(Gen *g){
                 g_ldx(g,0,B);
                 g_ldx(g,1,C);
                 emit_call_abs(b, op==OP_MOD? (void*)jit_mod : (void*)jit_pow);
+#if defined(LUC_JIT_SYSV)
+                emit_mov_rr64(b,R_RSI,13);       /* out pointer back (RSI is caller-saved) */
+                g->kcv=0;                        /* EDI key cache is caller-saved too */
+#endif
                 g_kill(g,A);
                 g_stx(g,A,0);
                 break;
@@ -1143,6 +1163,9 @@ static void assign_homes(Ana *a){
     }
     /* XMM5 volatile: only if no CALL (MOD/POW helpers). */
     int base=hasmp?6:5, navail=16-base;
+#if defined(LUC_JIT_SYSV)
+    if(hasmp) navail=0;                 /* System V: every XMM register dies across a call */
+#endif
     for(int x=0;x<16;x++) a->savoff[x]=-1;
     for(int k=0;k<navail;k++){
         int best=-1; long long bw=0;
@@ -1259,8 +1282,11 @@ typedef struct { Proto *p; void *mem; size_t memsz; JitFn fn; int failed; } JitE
 static JitEnt *g_jit=NULL;
 static int g_jitn=0, g_jitcap=0;
 
+/* O(1): the slot index lives in the Proto (was a linear scan on every call, and a
+   freed Proto's address could match a stale entry). */
 static JitEnt *jit_find(Proto *p){
-    for(int i=0;i<g_jitn;i++) if(g_jit[i].p==p) return &g_jit[i];
+    int id=p->jitid;
+    if(id>0 && id<=g_jitn && g_jit[id-1].p==p) return &g_jit[id-1];
     return NULL;
 }
 static JitEnt *jit_add(Proto *p){
@@ -1272,8 +1298,23 @@ static JitEnt *jit_add(Proto *p){
     }
     JitEnt *e=&g_jit[g_jitn++];
     e->p=p; e->mem=NULL; e->memsz=0; e->fn=NULL; e->failed=0;
+    p->jitid=g_jitn;
     return e;
 }
+#if defined(LUC_JIT_SYSV)
+static void *jit_map(const unsigned char *code,int len,size_t *sz){
+    long pg=4096;
+    size_t n=((size_t)len+(size_t)pg-1)&~((size_t)pg-1);
+    void *m=mmap(NULL,n,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(m==MAP_FAILED) return NULL;
+    memcpy(m,code,(size_t)len);
+    if(mprotect(m,n,PROT_READ|PROT_EXEC)!=0){ munmap(m,n); return NULL; }
+    *sz=n;
+    return m;
+}
+static void jit_unmap(void *m,size_t n){ munmap(m,n); }
+#else
+static void jit_unmap(void *m,size_t n){ (void)n; VirtualFree(m,0,MEM_RELEASE); }
 static void *jit_map(const unsigned char *code,int len,size_t *sz){
     SIZE_T n=(SIZE_T)len;
     void *m=VirtualAlloc(NULL,n,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);
@@ -1285,16 +1326,17 @@ static void *jit_map(const unsigned char *code,int len,size_t *sz){
     *sz=(size_t)n;
     return m;
 }
+#endif
 
 /* Compile once, return native entry or NULL. */
 static JitFn jit_get(Proto *p){
     JitEnt *e=jit_find(p);
     if(e){ return e->failed? NULL : e->fn; }
     e=jit_add(p);
-    if(!e) return NULL;
+    if(!e){ p->nojit=1; return NULL; }
     unsigned char *img=NULL; int imglen=0; char err[160]; err[0]=0;
     if(!translate_proto(p,0,&img,&imglen,err,sizeof err)){
-        e->failed=1;
+        e->failed=1; p->nojit=1;
         if(getenv("LUC_JIT_LOG"))
             fprintf(stderr,"lucjit: fallback (%s), maxstack=%d, ncode=%d\n",
                 err[0]?err:"?",p->maxstack,p->ncode);
@@ -1303,14 +1345,16 @@ static JitFn jit_get(Proto *p){
     size_t sz=0;
     void *mem=jit_map(img,imglen,&sz);
     free(img);
-    if(!mem){ e->failed=1; return NULL; }
+    if(!mem){ e->failed=1; p->nojit=1; return NULL; }
     e->mem=mem; e->memsz=sz;
     memcpy(&e->fn,&mem,sizeof e->fn);       /* avoid fn-ptr cast UB */
     return e->fn;
 }
 
 void luc_jit_shutdown(void){
-    for(int i=0;i<g_jitn;i++) if(g_jit[i].mem) VirtualFree(g_jit[i].mem,0,MEM_RELEASE);
+    for(int i=0;i<g_jitn;i++){
+        if(g_jit[i].mem) jit_unmap(g_jit[i].mem,g_jit[i].memsz);
+    }
     free(g_jit); g_jit=NULL; g_jitn=g_jitcap=0;
 }
 
@@ -1348,6 +1392,7 @@ int luc_jit_run(Closure *cl){
     return 0;
 }
 
+#if defined(LUC_JIT_WIN64)
 /* 7. PE32+ writer */
 
 #define PE_IMAGEBASE   0x140000000ULL
@@ -1718,11 +1763,23 @@ int luc_aot_build(const char *src,int srclen,const char *outpath){
     return 0;
 }
 
-#else /* !_WIN32: no native; always interpret */
+#else  /* JIT on, no PE writer (System V) */
+int  luc_aot_embedded(char **psrc,int *plen){ (void)psrc;(void)plen; return 0; }
+int  luc_aot_build(const char *src,int srclen,const char *outpath){
+    (void)src;(void)srclen;(void)outpath;
+    fprintf(stderr,"luc build: AOT output is implemented for Windows x64 only\n");
+    return 1;
+}
+#endif /* LUC_JIT_WIN64 */
+
+#else /* no JIT for this platform: always interpret */
 
 int  luc_jit_run(Closure *cl){ (void)cl; return LUC_JIT_FALLBACK; }
 int  luc_jit_call(LucState *L,int func,int nargs,int nres){
-    (void)L;(void)func;(void)nargs;(void)nres; return LUC_JIT_FALLBACK;
+    (void)nargs;(void)nres;
+    /* no JIT here: mark the proto so the VM stops calling this hook for it */
+    if(L && func>=0 && L->stack[func].t==LT_FUNC) AS_CL(L->stack[func])->p->nojit=1;
+    return LUC_JIT_FALLBACK;
 }
 void luc_jit_shutdown(void){}
 int  luc_aot_embedded(char **psrc,int *plen){ (void)psrc;(void)plen; return 0; }

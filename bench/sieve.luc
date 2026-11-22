@@ -1,0 +1,16 @@
+create t = os.now()
+create N = 5000000
+create flags = []
+repeat 1, N + 1 as i do list.append(flags, true) end
+create cnt = 0
+repeat 2, N + 1 as i0 do end
+create i = 2
+while i <= N do
+    if flags[i] then
+        cnt = cnt + 1
+        create j = i * i
+        while j <= N do flags[j] = false; j = j + i end
+    end
+    i = i + 1
+end
+print("sieve", cnt, os.now() - t)

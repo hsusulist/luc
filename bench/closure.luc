@@ -1,0 +1,6 @@
+create t = os.now()
+create function mk(k) return function(x) return x + k end end
+create f = mk(3)
+create s = 0
+repeat 1, 5000000 as i do s = f(s) end
+print("closure", s, os.now() - t)

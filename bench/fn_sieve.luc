@@ -1,0 +1,19 @@
+-- sieve with the marking loop in a function; numbers in the list so the JIT takes it
+create function mark(flags, N)
+    create cnt = 0
+    create i = 2
+    while i <= N do
+        if flags[i] == 1 then
+            cnt = cnt + 1
+            create j = i * i
+            while j <= N do flags[j] = 0; j = j + i end
+        end
+        i = i + 1
+    end
+    return cnt
+end
+create t = os.now()
+create N = 5000000
+create flags = []
+repeat 1, N + 1 as i do list.append(flags, 1) end
+print("fn_sieve", mark(flags, N), os.now() - t)

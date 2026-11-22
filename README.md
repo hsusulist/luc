@@ -166,11 +166,19 @@ More in `demos/` (libs, net, window, ai, discord).
 | Feature | Windows | Linux |
 |---|---|---|
 | Interpreter and core libraries | yes | yes |
-| JIT and `luc build` | yes | no |
+| JIT (numeric functions, x86-64) | yes | yes |
+| `luc build` | yes | no |
 | HTTPS / WSS | yes | no (plain HTTP and TCP only) |
 | `window` (SDL2) | yes | no |
 | LCode editor | full | basic terminal editing |
 | GPU training (`lucTL`, CUDA via `lucffi`) | no | yes (`bash cuda/build_kaggle.sh`) |
+
+## Speed
+
+- The VM fuses common instruction pairs (constant + arithmetic, compare + jump, field get/set) and has a fast path for `t.name` on plain tables.
+- A function made only of numbers, number lists, loops and `if` (no calls, globals or closures) is compiled to x86-64 machine code on its first call. Put a hot loop inside such a function to get the JIT: `bench/fn_mandel.luc` runs about 12x faster than the same loop at the top level.
+- `math.karatsuba`, `math.bigpow` and `math.factorial` give exact big integers as strings; multiplication switches from schoolbook to Karatsuba to NTT as numbers grow.
+- `bash bench/speed.sh` compares LUC with Lua 5.4 and LuaJIT on the same machine.
 
 ## Documentation
 

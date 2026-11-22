@@ -2324,6 +2324,96 @@ static int big_split(const Big *s,int k,Big *lo,Big *hi){
     return 1;
 }
 
+/* NTT multiplication, O(n log n): for operands past NTT_LIMBS limbs Karatsuba's
+   O(n^1.585) loses.  Limbs are split into base-1000 digits, convolved modulo two
+   NTT primes and recombined with CRT: a coefficient is at most len * 999^2, below
+   p1*p2 ~ 4.7e17 for every length the primes allow (2^23 points = 8M digits each,
+   about 25 million decimal digits per operand; larger falls back to Karatsuba). */
+#define NTT_LIMBS 2200   /* ~20K decimal digits: measured crossover vs Karatsuba */
+#define NTT_LOG_MAX 23
+static const uint32_t NTT_P1=998244353u;   /* 119*2^23+1, generator 3 */
+static const uint32_t NTT_P2=469762049u;   /*   7*2^26+1, generator 3 */
+static uint32_t ntt_pow(uint64_t b,uint64_t e,uint32_t m){
+    uint64_t r=1; b%=m;
+    while(e){ if(e&1) r=r*b%m; b=b*b%m; e>>=1; }
+    return (uint32_t)r;
+}
+static void ntt_run(uint32_t *a,int n,int inv,uint32_t p){
+    for(int i=1,j=0;i<n;i++){
+        int bit=n>>1;
+        for(;j&bit;bit>>=1) j^=bit;
+        j^=bit;
+        if(i<j){ uint32_t t=a[i]; a[i]=a[j]; a[j]=t; }
+    }
+    for(int len=2;len<=n;len<<=1){
+        uint32_t w=ntt_pow(3,(p-1)/(uint32_t)len,p);
+        if(inv) w=ntt_pow(w,p-2,p);
+        int half=len>>1;
+        /* twiddles for this stage, computed once */
+        uint32_t *tw=(uint32_t*)malloc(sizeof(uint32_t)*(size_t)half);
+        if(!tw) return;
+        tw[0]=1;
+        for(int k=1;k<half;k++) tw[k]=(uint32_t)((uint64_t)tw[k-1]*w%p);
+        for(int i=0;i<n;i+=len){
+            for(int k=0;k<half;k++){
+                uint32_t u=a[i+k];
+                uint32_t v=(uint32_t)((uint64_t)a[i+k+half]*tw[k]%p);
+                uint32_t x=u+v; if(x>=p) x-=p;
+                uint32_t y=u+p-v; if(y>=p) y-=p;
+                a[i+k]=x; a[i+k+half]=y;
+            }
+        }
+        free(tw);
+    }
+    if(inv){
+        uint32_t ni=ntt_pow((uint32_t)n,p-2,p);
+        for(int i=0;i<n;i++) a[i]=(uint32_t)((uint64_t)a[i]*ni%p);
+    }
+}
+/* 1 = done, 0 = out of memory, -1 = too large for the NTT (caller uses Karatsuba) */
+static int big_mul_ntt(Big *r,const Big *a,const Big *b){
+    int na=a->n*3, nb=b->n*3, need=na+nb-1, n=1, lg=0;
+    while(n<need){ n<<=1; lg++; }
+    if(lg>NTT_LOG_MAX) return -1;
+    uint32_t *a1=(uint32_t*)calloc((size_t)n,4), *b1=(uint32_t*)calloc((size_t)n,4);
+    uint32_t *a2=(uint32_t*)calloc((size_t)n,4), *b2=(uint32_t*)calloc((size_t)n,4);
+    if(!a1||!b1||!a2||!b2){ free(a1); free(b1); free(a2); free(b2); return 0; }
+    for(int i=0;i<a->n;i++){ uint32_t v=a->d[i];
+        a1[3*i]=v%1000u; a1[3*i+1]=(v/1000u)%1000u; a1[3*i+2]=v/1000000u; }
+    for(int i=0;i<b->n;i++){ uint32_t v=b->d[i];
+        b1[3*i]=v%1000u; b1[3*i+1]=(v/1000u)%1000u; b1[3*i+2]=v/1000000u; }
+    memcpy(a2,a1,(size_t)n*4); memcpy(b2,b1,(size_t)n*4);
+    ntt_run(a1,n,0,NTT_P1); ntt_run(b1,n,0,NTT_P1);
+    ntt_run(a2,n,0,NTT_P2); ntt_run(b2,n,0,NTT_P2);
+    for(int i=0;i<n;i++){
+        a1[i]=(uint32_t)((uint64_t)a1[i]*b1[i]%NTT_P1);
+        a2[i]=(uint32_t)((uint64_t)a2[i]*b2[i]%NTT_P2);
+    }
+    free(b1); free(b2);
+    ntt_run(a1,n,1,NTT_P1); ntt_run(a2,n,1,NTT_P2);
+    /* CRT + carries in base 1000, then pack 3 digits per base-1e9 limb */
+    int nl=(need+2)/3+2;
+    r->d=(uint32_t*)calloc((size_t)nl,sizeof(uint32_t));
+    if(!r->d){ free(a1); free(a2); return 0; }
+    const uint64_t inv12=ntt_pow(NTT_P1,NTT_P2-2,NTT_P2);   /* P1^-1 mod P2 */
+    uint64_t carry=0;
+    for(int k=0;k<nl*3;k++){
+        uint64_t c=0;
+        if(k<need){
+            uint64_t r1=a1[k], r2=a2[k];
+            uint64_t t=(r2+NTT_P2-r1%NTT_P2)%NTT_P2*inv12%NTT_P2;
+            c=r1+(uint64_t)NTT_P1*t;
+        }
+        c+=carry;
+        uint32_t digit=(uint32_t)(c%1000u); carry=c/1000u;
+        int li=k/3, sh=k%3;
+        r->d[li]+=digit*(sh==0?1u:sh==1?1000u:1000000u);
+    }
+    free(a1); free(a2);
+    r->n=nl; big_trim(r);
+    return 1;
+}
+
 static int big_kmul(Big *r,const Big *a,const Big *b){
     if(big_is_zero(a)||big_is_zero(b)){
         r->d=(uint32_t*)calloc(1,sizeof(uint32_t)); if(!r->d) return 0;
@@ -2331,6 +2421,10 @@ static int big_kmul(Big *r,const Big *a,const Big *b){
     }
     int m=a->n<b->n?a->n:b->n;
     if(m<KARAT_LIMBS) return big_mul_naive(r,a,b);
+    if(m>=NTT_LIMBS){
+        int rc=big_mul_ntt(r,a,b);
+        if(rc>=0) return rc;
+    }
     int mx=a->n>b->n?a->n:b->n;
     int k=mx/2; if(k<1) k=1;
     Big a0,a1,b0,b1;
@@ -2432,6 +2526,95 @@ LFN(f_m_karatsuba){ UNUSED_SELF;
     RET(0,rv); return 1;
 }
 
+/* exact big-integer helpers built on big_mul (naive / Karatsuba / NTT by size) */
+static int big_set_u32(Big *b,uint32_t v){
+    b->d=(uint32_t*)malloc(2*sizeof(uint32_t)); if(!b->d) return 0;
+    b->d[0]=v%KBASE; b->d[1]=v/KBASE; b->n=2; big_trim(b); return 1;
+}
+/* one integer argument: number or integer string */
+static void big_arg(LucState *L,int base,int nargs,int i,const char *fn,Big *b,int *neg){
+    Value v=AR(i);
+    memset(b,0,sizeof *b); *neg=0;
+    if(v.t==LT_STR){
+        Str *s=AS_STR(v);
+        if(!big_is_intstr(s->s,s->len)||!big_from_str(s->s,s->len,b,neg))
+            luc_error("%s: argument #%d is not an integer",fn,i+1);
+    } else if(v.t==LT_NUM){
+        if(!big_from_num(v.u.n,b,neg)) luc_error("%s: argument #%d is not an integer",fn,i+1);
+    } else luc_error("%s: argument #%d must be an integer or integer string (got %s)",
+                     fn,i+1,type_name(v));
+}
+static Value big_result(Big *r,int neg,const char *fn){
+    char *s=NULL; int sl=0;
+    if(!big_to_str(r,neg && !big_is_zero(r),&s,&sl)){ big_free(r); luc_error("%s: out of memory",fn); }
+    Value rv=strv(s,sl);
+    free(s); big_free(r);
+    return rv;
+}
+/* math.bigpow(a, n): exact a^n for an integer a and integer n >= 0, as a string */
+LFN(f_m_bigpow){ UNUSED_SELF;
+    if(nargs<2) luc_error("bad argument #2 to 'bigpow' (exponent expected)");
+    double e=checknum(L,base,nargs,1,"bigpow");
+    if(e<0 || e!=floor(e) || e>4294967295.0) luc_error("bigpow: exponent must be an integer >= 0");
+    Big a; int neg;
+    big_arg(L,base,nargs,0,"bigpow",&a,&neg);
+    uint64_t n=(uint64_t)e;
+    Big r; if(!big_set_u32(&r,1)){ big_free(&a); luc_error("bigpow: out of memory"); }
+    int rneg = neg && (n&1);
+    while(n){                                   /* square-and-multiply */
+        if(n&1){
+            Big t; memset(&t,0,sizeof t);
+            if(!big_mul(&t,&r,&a)){ big_free(&a); big_free(&r); luc_error("bigpow: out of memory"); }
+            big_free(&r); r=t;
+        }
+        n>>=1;
+        if(n){
+            Big t; memset(&t,0,sizeof t);
+            if(!big_mul(&t,&a,&a)){ big_free(&a); big_free(&r); luc_error("bigpow: out of memory"); }
+            big_free(&a); a=t;
+        }
+    }
+    big_free(&a);
+    RET(0,big_result(&r,rneg,"bigpow")); return 1;
+}
+/* product lo*(lo+1)*...*hi by halving the range: balanced operands keep the fast
+   multiplications busy (one long chain would be O(n^2)) */
+static int big_range_prod(Big *r,uint32_t lo,uint32_t hi){
+    if(hi-lo<16){
+        uint64_t acc=1; int ok=big_set_u32(r,1);
+        for(uint32_t k=lo;ok && k<=hi;k++){
+            if(acc*(uint64_t)k >= (uint64_t)KBASE){
+                Big s,t; memset(&t,0,sizeof t);
+                if(!big_set_u32(&s,(uint32_t)acc)) return 0;
+                ok=big_mul(&t,r,&s); big_free(&s); big_free(r); *r=t; acc=1;
+            }
+            acc*=k;
+        }
+        if(ok && acc>1){
+            Big s,t; memset(&t,0,sizeof t);
+            if(!big_set_u32(&s,(uint32_t)acc)) return 0;
+            ok=big_mul(&t,r,&s); big_free(&s); big_free(r); *r=t;
+        }
+        return ok;
+    }
+    uint32_t mid=lo+(hi-lo)/2;
+    Big x,y; memset(&x,0,sizeof x); memset(&y,0,sizeof y);
+    if(!big_range_prod(&x,lo,mid)) return 0;
+    if(!big_range_prod(&y,mid+1,hi)){ big_free(&x); return 0; }
+    int ok=big_mul(r,&x,&y);
+    big_free(&x); big_free(&y);
+    return ok;
+}
+/* math.factorial(n): exact n! as a string (n integer, 0 <= n <= 10000000) */
+LFN(f_m_factorial){ UNUSED_SELF;
+    double n=checknum(L,base,nargs,0,"factorial");
+    if(n<0 || n!=floor(n) || n>10000000.0) luc_error("factorial: n must be an integer in 0..10000000");
+    Big r; memset(&r,0,sizeof r);
+    int ok = n<2? big_set_u32(&r,1) : big_range_prod(&r,2,(uint32_t)n);
+    if(!ok){ big_free(&r); luc_error("factorial: out of memory"); }
+    RET(0,big_result(&r,0,"factorial")); return 1;
+}
+
 /* bit32 */
 LFN(f_b_band){ UNUSED_SELF;
     uint32_t r=0xFFFFFFFFu;
@@ -2520,6 +2703,8 @@ void lucL_open_math(void){
     reg_math_case(m,"averageWeighted",f_m_average_weighted); reg(m,"histogram",f_m_histogram);
     reg(m,"random",f_m_random); reg(m,"randomseed",f_m_randomseed);
     reg(m,"karatsuba",f_m_karatsuba);
+    reg(m,"bigpow",f_m_bigpow);
+    reg(m,"factorial",f_m_factorial);
     reg(m,"round",f_m_round); reg(m,"clog",f_m_clog);
     reg(m,"cbrt",f_m_cbrt); reg(m,"exp2",f_m_exp2); reg(m,"log2",f_m_log2);
     reg(m,"trunc",f_m_trunc); reg(m,"sign",f_m_sign); reg(m,"hypot",f_m_hypot);

@@ -1,0 +1,8 @@
+-- same work as loop.luc inside a function (JIT)
+create function sumloop(n)
+    create s = 0
+    repeat 1, n as i do s = s + i * 0.5 end
+    return s
+end
+create t = os.now()
+print("fn_loop", sumloop(50000000), os.now() - t)

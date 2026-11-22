@@ -1,0 +1,5 @@
+create t = os.now()
+create parts = []
+repeat 1, 1000000 as i do list.append(parts, tostring(i)) end
+create s = table.concat and table.concat(parts, ",") or ""
+print("strcat", len(s), os.now() - t)

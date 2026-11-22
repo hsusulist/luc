@@ -1,0 +1,4 @@
+create t = os.now()
+create s = 0
+repeat 1, 50000000 as i do s = s + i * 0.5 end
+print("loop", s, os.now() - t)

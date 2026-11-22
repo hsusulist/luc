@@ -1,0 +1,7 @@
+create function fib(n)
+    if n < 2 then return n end
+    return fib(n - 1) + fib(n - 2)
+end
+create t = os.now()
+create r = fib(30)
+print("fib", r, os.now() - t)
