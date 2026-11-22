@@ -1,0 +1,78 @@
+-- demos/discord_libaries/discordtools.luc -- coins (bot.store), pages (bot.paginate), reminders (timers)
+-- needs the discord library:  luc install -p discord
+-- run: luc "demos/discord_libaries/discordtools.luc"
+-- Discord: /daily (once per day), /top (leaderboard pages), /remind in:10m text:stretch
+import discord("bot")
+
+bot.token("TOKEN_HERE")
+bot.run()
+
+bot.slash.new({ "name": "daily", "description": "claim 100 coins (once a day)" })
+bot.slash.new({ "name": "top", "description": "coin leaderboard" })
+bot.slash.new({ "name": "remind", "description": "remind you later", "options": [
+    { "name": "in", "type": "string", "required": true, "description": "10m, 1h30m ..." },
+    { "name": "text", "type": "string", "required": true } ] })
+
+-- coins live in discord_store.json, so they survive restarts
+task.spawn(function()
+    while true do
+        bot.slash.slash("daily")
+        create id = bot.who()
+        create today = os.date("%Y-%m-%d")
+        if bot.store.get("daily:" .. id) == today then
+            bot.slash.reply("Already claimed today.", true)
+        else
+            bot.store.set("daily:" .. id, today)
+            create total = bot.store.add("coins:" .. id, 100)
+            bot.slash.reply("+100 coins, you have " .. tostring(total))
+        end
+    end
+end)
+
+-- leaderboard: 5 people per page with Prev / Next buttons
+task.spawn(function()
+    while true do
+        bot.slash.slash("top")
+        create rows = []
+        repeat key, i in bot.store.keys("coins:") do
+            rows:append({ "id": string.sub(key, 7), "coins": bot.store.get(key, 0) })
+        end
+        rows:sort(function(a, b) return a.coins > b.coins end)
+        create pages = []
+        create text = ""
+        repeat r, i in rows do
+            text = text .. tostring(i + 1) .. ". <@" .. r.id .. ">  " .. tostring(r.coins) .. "\n"
+            if (i + 1) % 5 == 0 or i == rows:len() - 1 then
+                pages:append({ "title": "Top coins", "description": text })
+                text = ""
+            end
+        end
+        if pages:len() == 0 then
+            bot.slash.reply("Nobody has coins yet. Try /daily")
+        else
+            bot.paginate(pages, { "timeout": 90 })
+        end
+    end
+end)
+
+-- reminders: the timer runs in the background, the command answers at once
+task.spawn(function()
+    while true do
+        bot.slash.slash("remind")
+        create secs, err = bot.duration(bot.slash.get("in"))
+        if secs == nil then
+            bot.slash.reply(err, true)
+        else
+            create text = bot.slash.get("text")
+            create who = bot.who()
+            bot.slash.reply("OK, in " .. bot.slash.get("in"))
+            bot.after(secs, function() bot.dm(who, "Reminder: " .. text) end)
+        end
+    end
+end)
+
+-- every hour, a heartbeat line in #general (the library paces its own sends)
+bot.every("1h", function() bot.send("general", "still running") end)
+
+-- keep the script alive
+while true do task.wait(1) end

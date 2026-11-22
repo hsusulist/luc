@@ -40,6 +40,7 @@ create B = {
     "pending": [], "cur": nil,
     "paused": false, "running": false, "on": true,
     "evq": [], "voice": {}, "cd": {}, "presence": nil, "err": nil,
+    "blocked": 0, "sendlog": {},
 }
 
 create bot = {}
@@ -60,7 +61,57 @@ create function auth()
     return "Authorization: Bot " .. B.token .. "\r\nUser-Agent: DiscordBot (luc, 0.2.0-beta-1)"
 end
 
--- REST core: retries 429 (honours retry_after, up to 4 tries) and one 5xx.
+-- Rate limits. Discord allows about 5 messages per 5 seconds in one channel and
+-- answers 429 with a retry_after when you go over (a "global" 429 blocks every
+-- route). pace() makes the bot wait BEFORE sending, so the server rarely has to
+-- say no; rest_raw still honours any 429 that does come back.
+-- bot.debug.rate_limited / bot.debug.paced count both cases.
+create function is_msg_post(method, path)
+    if method != "POST" then return false end
+    if not string.startswith(path, "/channels/") then return false end
+    return string.endswith(path, "/messages")
+end
+
+-- wall-clock seconds: os.now() (new luc.exe); os.clock() is wall time on Windows anyway
+create function wall()
+    if os.now != nil then return os.now() end
+    return os.clock()
+end
+
+create function pace(method, path)
+    create now = wall()
+    if B.blocked > now then
+        task.wait(B.blocked - now)
+        now = wall()
+    end
+    if not is_msg_post(method, path) then return end
+    create old = B.sendlog[path]
+    create keep = []
+    if old != nil then
+        repeat t, i in old do
+            if t > now - 5.2 then keep:append(t) end
+        end
+    end
+    if keep:len() >= 5 then
+        create w = keep[0] + 5.2 - now
+        if w > 0 then
+            bot.debug.paced = (bot.debug.paced or 0) + 1
+            task.wait(w)
+            now = wall()
+        end
+        create k2 = []
+        create j = 1
+        while j < keep:len() do
+            k2:append(keep[j])
+            j = j + 1
+        end
+        keep = k2
+    end
+    keep:append(now)
+    B.sendlog[path] = keep
+end
+
+-- REST core: retries 429 (honours retry_after, up to 5 tries) and one 5xx.
 -- Returns body, code. On any >= 400 the API message is kept for bot.lasterror().
 -- A string body is sent as-is (raw JSON); tables are json.encode'd.
 create function rest_raw(method, path, payload, ctype, extra)
@@ -70,8 +121,9 @@ create function rest_raw(method, path, payload, ctype, extra)
     create tries = 0
     create r = nil
     create code = 0
-    while tries < 4 do
+    while tries < 5 do
         tries = tries + 1
+        pace(method, path)
         if method == "GET" then
             r, code = dn.get(url, hdr)
         else
@@ -81,8 +133,17 @@ create function rest_raw(method, path, payload, ctype, extra)
         if code == 429 then
             create ok, t = pcall(function() return json.decode(r) end)
             create wait = 1
-            if ok and t != nil and t.retry_after != nil then wait = t.retry_after end
-            if wait > 30 then wait = 30 end
+            if ok and type(t) == "table" and t.retry_after != nil then wait = t.retry_after end
+            bot.debug.rate_limited = (bot.debug.rate_limited or 0) + 1
+            -- a "global" limit blocks every route until it is over
+            if ok and type(t) == "table" and t["global"] == true then
+                B.blocked = wall() + wait + 0.05
+            end
+            if wait > 30 then
+                -- a ban-length wait (Cloudflare): do not sleep on it, report it
+                B.err = "rate limited for " .. tostring(math.floor(wait)) .. "s (429)"
+                return r, code
+            end
             task.wait(wait + 0.05)
         elseif code >= 500 and code < 600 and tries < 2 then
             task.wait(1)
@@ -876,9 +937,24 @@ create function qtake(q)
     return ev
 end
 
+-- Which queue is q? qtake() swaps in a new list object every time it pops, so a
+-- waiting task must look the queue up again on every pass. Holding the list it
+-- was first given made it read a stale copy: with several watchers (one task per
+-- slash command, say) an event could be handed out twice.
+create function qname(q)
+    if q == B.msgq then return "msgq" end
+    if q == B.joinq then return "joinq" end
+    if q == B.evq then return "evq" end
+    if q == B.intq then return "intq" end
+    return nil
+end
+
 create function wait_ev(q)
+    create name = qname(q)
     while true do
-        create ev = qtake(q)
+        create cur = q
+        if name != nil then cur = B[name] end
+        create ev = qtake(cur)
         if ev != nil then return ev end
         task.wait(0.01)
     end
@@ -2294,6 +2370,347 @@ bot.modal.get = function(a, b, c)
     create v = B.cur.fields[a]
     if v == nil then return b end
     return v
+end
+
+-- bot.who() -> id, name of whoever triggered the current command (slash, prefix or button).
+-- Handy as a store key:  bot.store.add("coins:" .. bot.who(), 5)
+bot.who = function(a)
+    if B.cur == nil then return nil end
+    return B.cur.uid, B.cur.author
+end
+
+-- ================= bot.store: a small persistent key-value file =================
+-- A bot forgets everything when it stops. The store keeps levels, coins and
+-- per-server settings in one JSON file next to the script.
+--   bot.store.set("coins:123", 50)      bot.store.get("coins:123", 0)
+--   bot.store.add("coins:123", 5)       bot.store.del("coins:123")
+--   bot.store.has("k")                  bot.store.keys("coins:")  (sorted list)
+--   bot.store.file("mybot.json")        (default: discord_store.json)
+-- Every change is written at once (temp file, then swapped in), so a crash
+-- never leaves a half-written file. Values: numbers, strings, booleans, tables.
+bot.store = {}
+create ST = { "path": "discord_store.json", "data": nil }
+
+-- (key, x) from either bot.store.f(key, x) or bot.store:f(key, x)
+create function sarg(a, b, c)
+    if a == bot.store then return b, c end
+    return a, b
+end
+
+create function st_read_file(p)
+    create f = io.open(p, "rb")
+    if f == nil then return nil end
+    create txt = f:read("a")
+    io.close(f)
+    return txt
+end
+
+create function st_load()
+    if ST.data != nil then return end
+    ST.data = {}
+    create txt = st_read_file(ST.path)
+    if txt == nil then txt = st_read_file(ST.path .. ".tmp") end   -- a swap that was cut short
+    if txt == nil or string.trim(txt) == "" then return end
+    create ok, t = pcall(function() return json.decode(txt) end)
+    if ok and type(t) == "table" then
+        ST.data = t
+    else
+        -- unreadable: keep the file as .bad and start empty instead of overwriting it
+        os.remove(ST.path .. ".bad")
+        os.rename(ST.path, ST.path .. ".bad")
+    end
+end
+
+create function st_save()
+    create tmp = ST.path .. ".tmp"
+    create f = io.open(tmp, "wb")
+    if f == nil then return nil, "cannot write " .. ST.path end
+    f:write(json.encode(ST.data))
+    io.close(f)
+    os.remove(ST.path)   -- Windows will not rename over an existing file
+    if not os.rename(tmp, ST.path) then return nil, "cannot replace " .. ST.path end
+    return true
+end
+
+bot.store.file = function(a, b)
+    create p = sarg(a, b)
+    if type(p) != "string" or p == "" then return nil, "need a file name" end
+    ST.path = p
+    ST.data = nil
+    return true
+end
+
+bot.store.get = function(a, b, c)
+    create k, d = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    create v = ST.data[tostring(k)]
+    if v == nil then return d end
+    return v
+end
+
+bot.store.set = function(a, b, c)
+    create k, v = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    ST.data[tostring(k)] = v
+    return st_save()
+end
+
+-- add(key, n = 1): number += n (missing counts as 0). Returns the new value.
+bot.store.add = function(a, b, c)
+    create k, n = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    if n == nil then n = 1 end
+    if type(n) != "number" then return nil, "add needs a number" end
+    st_load()
+    create cur = ST.data[tostring(k)]
+    if cur == nil then cur = 0 end
+    if type(cur) != "number" then return nil, tostring(k) .. " is not a number" end
+    create nv = cur + n
+    ST.data[tostring(k)] = nv
+    create ok, err = st_save()
+    if not ok then return nil, err end
+    return nv
+end
+
+bot.store.del = function(a, b)
+    create k = sarg(a, b)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    ST.data[tostring(k)] = nil
+    return st_save()
+end
+
+bot.store.has = function(a, b)
+    create k = sarg(a, b)
+    if k == nil then return false end
+    st_load()
+    return ST.data[tostring(k)] != nil
+end
+
+-- keys(prefix?) -> sorted list of the keys (only those starting with prefix)
+bot.store.keys = function(a, b)
+    create p = sarg(a, b)
+    st_load()
+    create out = []
+    repeat k, v in ST.data do   -- dict tables iterate (key, value)
+        if p == nil or string.startswith(k, p) then out:append(k) end
+    end
+    out:sort()
+    return out
+end
+
+-- ================= bot.paginate: pages with Prev / Next buttons =================
+-- bot.paginate(pages, opts?) shows one page at a time in the place the command
+-- ran (or opts.channel). pages: list of embeds, strings or {title=, description=}.
+-- opts: timeout = seconds without a click before the buttons turn off (60),
+--       anyone = true lets everybody flip (default: only the person who asked),
+--       start = first page, 0-based (0), channel = where to post.
+-- Blocks until it times out; returns true. Footer shows "Page x/n".
+create PG_N = 0
+
+create function pg_embed(p)
+    if type(p) == "table" and p._fields != nil then return p end
+    if type(p) == "table" then return bot.embed.create(p) end
+    return bot.embed.create({ "description": tostring(p) })
+end
+
+bot.paginate = function(a, b)
+    if a == bot then a, b = b, nil end
+    if type(a) != "list" or a:len() == 0 then return nil, "need a list of pages" end
+    create opts = b
+    if opts == nil then opts = {} end
+    create es = []
+    create foot = []
+    repeat p, i in a do
+        create e = pg_embed(p)
+        es:append(e)
+        foot:append(e._footer)
+    end
+    create n = es:len()
+    PG_N = PG_N + 1
+    create pid = "pg" .. tostring(PG_N) .. "_"
+    create timeout = opts.timeout or 60
+    create i = opts.start or 0
+    if i < 0 or i >= n then i = 0 end
+    create origin = B.cur
+
+    create render = function(idx, off)
+        create e = es[idx]
+        if n == 1 then return embed_payload(e, nil) end   -- one page: plain embed, no buttons
+        create tag = "Page " .. tostring(idx + 1) .. "/" .. tostring(n)
+        if foot[idx] != nil then e._footer = foot[idx] .. "  -  " .. tag else e._footer = tag end
+        create btns = [
+            { "label": "<", "id": pid .. "p", "style": 2, "disabled": off or idx == 0 },
+            { "label": tostring(idx + 1) .. "/" .. tostring(n), "id": pid .. "i", "style": 2, "disabled": true },
+            { "label": ">", "id": pid .. "x", "style": 2, "disabled": off or idx == n - 1 }
+        ]
+        return { "embeds": [embed_json(e)], "components": embed_rows(btns, nil) }
+    end
+    create restore = function()
+        repeat e, k in es do e._footer = foot[k] end
+    end
+
+    create via_int = origin != nil and origin.kind == "int" and opts.channel == nil
+    create owner = nil
+    create cid = nil
+    create mid = nil
+    create tok = nil
+    create app = nil
+    if via_int then
+        owner = origin.uid
+        cid = origin.channel
+        tok = origin.itoken
+        app = origin.app or B.app
+        create ok, err = interaction_send(render(i, false))
+        if not ok then restore() return nil, err end
+    else
+        if origin != nil then owner = origin.uid end
+        create target = opts.channel
+        if target == nil and origin != nil then target = origin.channel end
+        cid = resolve_channel(target)
+        if cid == nil then restore() return nil, "no channel in context" end
+        create r, code = rest("POST", "/channels/" .. cid .. "/messages", render(i, false))
+        if r == nil then restore() return nil, code end
+        if code != 200 and code != 201 then restore() return nil, B.err or r end
+        mid = json.decode(r).id
+    end
+
+    if n == 1 then
+        restore()
+        B.cur = origin
+        return true
+    end
+    create last = nil
+    create deadline = wall() + timeout
+    while wall() < deadline do
+        create ev = qtake(B.intq)
+        if ev == nil then
+            task.wait(0.05)
+        elseif ev.kind == "comp" and ev.ctype == 2 and ev.cid != nil and string.startswith(ev.cid, pid) then
+            B.cur = make_cur(ev)
+            if owner != nil and opts.anyone != true and tostring(ev.uid) != tostring(owner) then
+                -- answer strangers privately so Discord does not show "interaction failed"
+                interaction_send({ "content": "Only the person who asked can flip these pages.", "flags": 64 })
+            else
+                if ev.cid == pid .. "p" and i > 0 then i = i - 1 end
+                if ev.cid == pid .. "x" and i < n - 1 then i = i + 1 end
+                interaction_send(render(i, false), 7)
+                last = B.cur
+                deadline = wall() + timeout
+            end
+        else
+            B.intq:append(ev)
+            task.wait(0.01)
+        end
+    end
+
+    -- time is up: grey the buttons out (edit the message in place)
+    create dead = render(i, true)
+    if last != nil then
+        rest("PATCH", "/webhooks/" .. tostring(last.app or B.app) .. "/" .. last.itoken .. "/messages/@original", dead)
+    elseif via_int then
+        rest("PATCH", "/webhooks/" .. tostring(app) .. "/" .. tostring(tok) .. "/messages/@original", dead)
+    else
+        rest("PATCH", "/channels/" .. cid .. "/messages/" .. mid, dead)
+    end
+    restore()
+    B.cur = origin
+    return true
+end
+
+-- ================= timers: bot.every / bot.after =================
+-- bot.after("10m", fn)  runs fn once later;  bot.every("1h", fn)  runs it forever.
+-- Time: seconds (1.5) or text like "45s", "10m", "1h30m", "2d", "1w".
+-- Both return a handle: h:cancel(), h.alive, h.runs. fn(h) runs in the
+-- background without a command context, so give bot.send a channel:
+--   bot.every("1h", function() bot.send("general", "hourly ping") end)
+-- bot.stop() pauses timers too (they resume with bot.on(true)); a missed tick
+-- is skipped, never replayed. An error inside fn is kept in
+-- bot.debug.timer_error and the timer keeps running.
+create function dur_secs(x)
+    if type(x) == "number" then return x end
+    if type(x) != "string" then return nil end
+    create total = 0
+    create num = ""
+    create any = false
+    create i = 1
+    while i <= string.len(x) do
+        create b = string.byte(x, i)
+        create ch = string.sub(x, i, i)
+        if (b >= 48 and b <= 57) or b == 46 then
+            num = num .. ch
+        elseif ch != " " then
+            create v = tonumber(num)
+            if v == nil then return nil end
+            if ch == "s" then total = total + v
+            elseif ch == "m" then total = total + v * 60
+            elseif ch == "h" then total = total + v * 3600
+            elseif ch == "d" then total = total + v * 86400
+            elseif ch == "w" then total = total + v * 604800
+            else return nil end
+            num = ""
+            any = true
+        end
+        i = i + 1
+    end
+    if num != "" then
+        if any then return nil end       -- "1h30": a number without a unit
+        return tonumber(num)             -- plain "90" = seconds
+    end
+    if not any then return nil end
+    return total
+end
+
+bot.duration = function(a, b)
+    if a == bot then a = b end
+    create s = dur_secs(a)
+    if s == nil then return nil, "bad duration (use seconds or text like \"10m\", \"1h30m\")" end
+    return s
+end
+
+create function timer_new(kind, d, fn)
+    create secs = dur_secs(d)
+    if secs == nil or secs <= 0 then
+        return nil, "bad duration (use seconds or text like \"10m\", \"1h30m\")"
+    end
+    if type(fn) != "function" then return nil, "need a function" end
+    create h = { "alive": true, "kind": kind, "secs": secs, "runs": 0 }
+    h.cancel = function(self)
+        h.alive = false
+        return true
+    end
+    task.spawn(function()
+        create due = wall() + secs
+        while h.alive do
+            if wall() >= due then
+                if not B.paused then
+                    h.runs = h.runs + 1
+                    create ok, err = pcall(function() fn(h) end)
+                    if not ok then bot.debug.timer_error = tostring(err) end
+                end
+                if kind == "after" then
+                    h.alive = false
+                    return
+                end
+                due = due + secs
+                if due < wall() then due = wall() + secs end
+            end
+            task.wait(0.1)
+        end
+    end)
+    return h
+end
+
+bot.after = function(a, b, c)
+    if a == bot then a, b = b, c end
+    return timer_new("after", a, b)
+end
+
+bot.every = function(a, b, c)
+    if a == bot then a, b = b, c end
+    return timer_new("every", a, b)
 end
 
 

@@ -1,0 +1,28 @@
+-- Gradient descent by hand with nums.matrix (no autograd): fit y = 2x + 1.
+import nums
+random.seed(3)
+create xs = []
+create ys = []
+create i = 0
+while i < 50 do
+    create x = random.uniform(-2, 2)
+    xs.append([x])
+    ys.append([2 * x + 1 + random.uniform(-0.05, 0.05)])
+    i = i + 1
+end
+create w = [[0.0]]
+create b = [[0.0]]
+create n = len(xs)
+create step = 0
+while step < 400 do
+    -- pred = x*w + b ; err = pred - y ; loss = mean(err^2)
+    create err = matrix.sub(matrix.add(matrix.matMul(xs, w), b), ys)
+    -- dw = 2/n * x^T err ; db = 2/n * sum(err)
+    create dw = matrix.mul(matrix.matMul(matrix.transpose(xs), err), 2 / n)
+    create db = matrix.mul(matrix.sum(err), 2 / n)
+    w = matrix.sub(w, matrix.mul(dw, 0.1))
+    b = matrix.sub(b, db * 0.1)
+    if step % 100 == 0 then print("step", step, "loss", matrix.mean(matrix.pow(err, 2))) end
+    step = step + 1
+end
+print("w =", w[0][0], " b =", b[0][0], "(target 2 and 1)")

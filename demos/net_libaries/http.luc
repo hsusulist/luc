@@ -4,5 +4,10 @@
 import net("n")
 
 create page, code = n.get("https://example.com")
-print(code)
-print(string.len(page))
+if page == nil then
+    -- no internet, bad certificate, TLS problem...: n.get returns nil and the reason
+    print("request failed: " .. tostring(code))
+else
+    print(code)
+    print(len(page))
+end

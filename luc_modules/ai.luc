@@ -99,6 +99,36 @@ end
 ai.hardcoding = ai.forge
 ai.fullcontrol = ai.forge
 
+--- Device choice: ai.use("gpu") or ai.use("cpu")
+--- Sets the default for every ai.LMTrain made afterwards.
+--- A model can still pick its own: ai.LMTrain({ ..., "gpu": true })
+ai.current_device = "cpu"
+
+function ai.use(dev)
+    dev = string.lower(tostring(dev or "cpu"))
+    if dev == "cuda" then dev = "gpu" end
+    if dev != "cpu" and dev != "gpu" then
+        error("ai.use: expected \"cpu\" or \"gpu\", got \"" .. dev .. "\"", 2)
+    end
+    if dev == "gpu" then
+        create A = ai.LucTL
+        if not A or not A.available then
+            error("ai.use(\"gpu\"): no GPU backend. Build it first with: bash cuda/build_kaggle.sh"
+                .. ((A and A.error) and ("\n  reason: " .. tostring(A.error)) or ""), 2)
+        end
+        create ok, hw = pcall(A.lucTL.hardware)
+        print("[ai] using GPU" .. ((ok and hw and hw.name) and (": " .. hw.name) or ""))
+    else
+        print("[ai] using CPU")
+    end
+    ai.current_device = dev
+    if ai.LMTrain and ai.LMTrain.DEFAULTS then ai.LMTrain.DEFAULTS.backend = dev end
+    return dev
+end
+
+ai.device = function() return ai.current_device end
+
+
 function ai.profile()
     create lucTL = ai.LucTL
     if not lucTL or not lucTL.available then
@@ -280,6 +310,10 @@ end
     grad_accum = 4      -- effective batch = batch_size x 4 (low RAM!)
     sample_every = 25   -- print a generated text snippet every 25 epochs
     preset = "tiny"     -- or "small", "base", "medium", "auto"
+
+10. CPU OR GPU
+    ai.use("gpu")      -- every LMTrain after this runs on the GPU
+    ai.use("cpu")      -- back to the CPU (the default)
 
 Type `ai.h()` to see this menu anytime!
 ]=])

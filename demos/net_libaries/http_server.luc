@@ -23,7 +23,7 @@ http.post("/api/notes", function(req, res)
         return res:status(400):json({ "error": "send JSON like {\"text\": \"...\"}" })
     end
     notes:append(req.json.text)
-    res:status(201):json({ "count": notes:len() })
+    res:status(201):json({ "count": len(notes) })
 end)
 
 http.get("/api/notes", function(req, res)

@@ -1,0 +1,44 @@
+# Catppuccin Latte for lcode (palette: github.com/catppuccin/catppuccin)
+# Colors are #rrggbb or r,g,b. Missing keys fall back to the dark theme.
+# Backgrounds
+code=#eff1f5
+line=#dee0e8
+ex=#e6e9ef
+top=#dce0e8
+log=#dee0e8
+sel=#d2d4dc
+# Syntax
+key=#8839ef
+str=#40a02b
+num=#fe640b
+com=#7c7f93
+fn=#1e66f5
+dir=#ea76cb
+# Gutter / title text
+tcur=#4c4f69
+tdim=#8c8fa1
+
+# Editor / explorer / popups (optional; defaults are lcode's classic colors)
+txt=#4c4f69
+acc=#acb0be
+accfg=#4c4f69
+pan=#bcc0cc
+pop=#ccd0da
+exdir=#1e66f5
+exluc=#40a02b
+exlua=#7287fd
+exwarn=#df8e1d
+exbin=#d20f39
+
+# Dialogs: :setting, :git, :plugin, find panels, suggestions (optional)
+modal=#e6e9ef
+modalside=#dce0e8
+modalfoot=#dce0e8
+modalrow=#ccd0da
+modalborder=#e6e9ef
+accdim=#bcc0cc
+modaltext=#4c4f69
+modaldim=#8c8fa1
+value=#1e66f5
+on=#40a02b
+action=#04a5e5

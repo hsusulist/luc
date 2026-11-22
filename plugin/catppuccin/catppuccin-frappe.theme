@@ -1,0 +1,44 @@
+# Catppuccin Frappé for lcode (palette: github.com/catppuccin/catppuccin)
+# Colors are #rrggbb or r,g,b. Missing keys fall back to the dark theme.
+# Backgrounds
+code=#303446
+line=#383c50
+ex=#292c3c
+top=#232634
+log=#383c50
+sel=#494e63
+# Syntax
+key=#ca9ee6
+str=#a6d189
+num=#ef9f76
+com=#838ba7
+fn=#8caaee
+dir=#f4b8e4
+# Gutter / title text
+tcur=#c6d0f5
+tdim=#838ba7
+
+# Editor / explorer / popups (optional; defaults are lcode's classic colors)
+txt=#c6d0f5
+acc=#626880
+accfg=#c6d0f5
+pan=#51576d
+pop=#414559
+exdir=#8caaee
+exluc=#a6d189
+exlua=#babbf1
+exwarn=#e5c890
+exbin=#e78284
+
+# Dialogs: :setting, :git, :plugin, find panels, suggestions (optional)
+modal=#292c3c
+modalside=#232634
+modalfoot=#232634
+modalrow=#414559
+modalborder=#292c3c
+accdim=#51576d
+modaltext=#c6d0f5
+modaldim=#838ba7
+value=#8caaee
+on=#a6d189
+action=#99d1db

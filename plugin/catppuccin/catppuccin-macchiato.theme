@@ -1,0 +1,44 @@
+# Catppuccin Macchiato for lcode (palette: github.com/catppuccin/catppuccin)
+# Colors are #rrggbb or r,g,b. Missing keys fall back to the dark theme.
+# Backgrounds
+code=#24273a
+line=#2d3044
+ex=#1e2030
+top=#181926
+log=#2d3044
+sel=#404459
+# Syntax
+key=#c6a0f6
+str=#a6da95
+num=#f5a97f
+com=#8087a2
+fn=#8aadf4
+dir=#f5bde6
+# Gutter / title text
+tcur=#cad3f5
+tdim=#8087a2
+
+# Editor / explorer / popups (optional; defaults are lcode's classic colors)
+txt=#cad3f5
+acc=#5b6078
+accfg=#cad3f5
+pan=#494d64
+pop=#363a4f
+exdir=#8aadf4
+exluc=#a6da95
+exlua=#b7bdf8
+exwarn=#eed49f
+exbin=#ed8796
+
+# Dialogs: :setting, :git, :plugin, find panels, suggestions (optional)
+modal=#1e2030
+modalside=#181926
+modalfoot=#181926
+modalrow=#363a4f
+modalborder=#1e2030
+accdim=#494d64
+modaltext=#cad3f5
+modaldim=#8087a2
+value=#8aadf4
+on=#a6da95
+action=#91d7e3

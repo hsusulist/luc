@@ -1,0 +1,44 @@
+# Catppuccin Mocha for lcode (palette: github.com/catppuccin/catppuccin)
+# Colors are #rrggbb or r,g,b. Missing keys fall back to the dark theme.
+# Backgrounds
+code=#1e1e2e
+line=#282839
+ex=#181825
+top=#11111b
+log=#282839
+sel=#3b3d4f
+# Syntax
+key=#cba6f7
+str=#a6e3a1
+num=#fab387
+com=#7f849c
+fn=#89b4fa
+dir=#f5c2e7
+# Gutter / title text
+tcur=#cdd6f4
+tdim=#7f849c
+
+# Editor / explorer / popups (optional; defaults are lcode's classic colors)
+txt=#cdd6f4
+acc=#585b70
+accfg=#cdd6f4
+pan=#45475a
+pop=#313244
+exdir=#89b4fa
+exluc=#a6e3a1
+exlua=#b4befe
+exwarn=#f9e2af
+exbin=#f38ba8
+
+# Dialogs: :setting, :git, :plugin, find panels, suggestions (optional)
+modal=#181825
+modalside=#11111b
+modalfoot=#11111b
+modalrow=#313244
+modalborder=#181825
+accdim=#45475a
+modaltext=#cdd6f4
+modaldim=#7f849c
+value=#89b4fa
+on=#a6e3a1
+action=#89dceb
