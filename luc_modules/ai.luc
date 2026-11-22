@@ -35,7 +35,7 @@ create modules = { 1:
     { 1: "LMTrainGPU", 2:  "lmtrain_gpu" }, 18:  -- GPU plugin
     { 1: "GPU", 2:  "gpu" }, 19: 
     { 1: "BLAS", 2:  "blas" }, 20: 
-    { 1: "LuaTL", 2:  "luatl_adapter" }, 21: 
+    { 1: "LucTL", 2:  "luctl_adapter" }, 21: 
     { 1: "GPUTransformer", 2:  "gpu_transformer" } -- GPU model
  }
 
@@ -69,7 +69,7 @@ end
 function ai.forge(opts)
     opts = opts or {}
     if not ai.Forge then
-        error("ai.forge: ai/nn/forge.lua failed to load", 2)
+        error("ai.forge: forge.luc failed to load", 2)
     end
     ai.mode = "full"
     if not opts.quiet then
@@ -89,7 +89,7 @@ function ai.forge(opts)
 |      create loss = F.mse(m(x), y)                        |
 |      opt.zero_grad(); loss:backward(); opt.step()        |
 |                                                          |
-|  See examples/full_control.lua                           |
+|  See examples/full_control.luc                           |
 +----------------------------------------------------------+]=])
     end
     return ai.Forge
@@ -100,14 +100,14 @@ ai.hardcoding = ai.forge
 ai.fullcontrol = ai.forge
 
 function ai.profile()
-    create luaTL = ai.LuaTL
-    if not luaTL or not luaTL.available then
-        print("Profiling: luaTL (GPU) is not active. Running in pure CPU mode.")
+    create lucTL = ai.LucTL
+    if not lucTL or not lucTL.available then
+        print("Profiling: lucTL (GPU) is not active. Running in pure CPU mode.")
         return
     end
 
-    create p = luaTL.get_profile()
-    print("  luaTL GPU Profiler")
+    create p = lucTL.get_profile()
+    print("  lucTL GPU Profiler")
     print(string.format("  VRAM Allocations : %d", p.allocs))
     print(string.format("  Host -> Device   : %.4f sec", p.h2d))
     print(string.format("  Device -> Host   : %.4f sec", p.d2h))
@@ -134,16 +134,17 @@ function ai.benchmark()
     create t0 = os.clock()
     create C_cpu = matrix.multiply(A, B)
     create cpu_time = os.clock() - t0
-    print(string.format("  CPU (Pure LuaJIT) : %.4f sec", cpu_time))
+    matrix.use("auto")   -- don't leave the "lua" force on for the rest of the program
+    print(string.format("  CPU (%s) : %.4f sec", matrix.native and "native kernels" or "pure LUC", cpu_time))
     
     -- GPU benchmark if available
     create gpu_time = "N/A"
-    if ai.LuaTL and ai.LuaTL.available then
-        matrix.use("luatl_adapter")
+    if ai.LucTL and ai.LucTL.available then
+        matrix.use("luctl_adapter")
         create t1 = os.clock()
         create C_gpu = matrix.multiply(A, B)
         gpu_time = os.clock() - t1
-        print(string.format("  GPU (luaTL)       : %.4f sec", gpu_time))
+        print(string.format("  GPU (lucTL)       : %.4f sec", gpu_time))
         
         -- Check CPU vs GPU match
         if matrix.equals(C_cpu, C_gpu, 0.1) then
@@ -153,7 +154,7 @@ function ai.benchmark()
         end
         matrix.use("auto") -- reset
     else
-        print("  GPU (luaTL)       : Not installed/available")
+        print("  GPU (lucTL)       : Not installed/available")
     end
 end
 
@@ -173,12 +174,12 @@ print(model:generate("hello", 10)) -- Generate text!
 
 
 2. GPU-RESIDENT TRAINING (Massive Speedup)
--- If you have compiled luaTL.so, add backend = "gpu"!
+-- If you have compiled lucTL.so, add backend = "gpu"!
 create model = ai.LMTrain({
     "data": "your long text here",
     "preset": "auto",
     "epochs": 1000,
-    "backend": "gpu",     -- Uses gpu_transformer.lua & luaTL
+    "backend": "gpu",     -- Uses gpu_transformer.luc & lucTL
     "graph": true,        -- Enables CUDA Graphs for near-zero overhead
     "optimizer": "adamw"  -- AdamW is supported on GPU
 })

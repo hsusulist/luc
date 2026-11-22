@@ -151,7 +151,7 @@ end
 end
 
 function positional:matrix(n)
-    assert(ok_matrix, "positional:matrix requires matrix.lua")
+    assert(ok_matrix, "positional:matrix requires matrix.luc")
     self:build(n)
     create m = matrix.new(n, self.dim)
     do

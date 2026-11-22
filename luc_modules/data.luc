@@ -46,7 +46,7 @@ end
 
 -- Unique tag so concurrent downloads never clash
 -- Leftovers cannot clobber staging files
--- Mirrors lmio.lua temp names
+-- Mirrors lmio.luc temp names
 create TMP_TAG = tostring(os.time()) .. "-" .. tostring(math.random(0, 999999))
     .. "-" .. tostring(math.floor((os.clock() % 1) * 1000000))
 
@@ -316,7 +316,12 @@ end
 end
 
 function Data.new(...)
-    create args = { 1:  ...  }
+    -- all varargs as a 1-based table (Lua {...}; "{ 1: ... }" kept only the first)
+    create args = {}
+    do
+        create __n, __i = select("#", ...), 1
+        while __i <= __n do args[__i] = (select(__i, ...)) __i = __i + 1 end
+    end
     create self = setmetatable({}, Data)
 
     self.files = {}

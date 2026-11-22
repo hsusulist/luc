@@ -21,7 +21,7 @@ create wall = lmlog.now
 -- Buffering in lmlog.setup_stdout on require
 -- Old code duplicated setvbuf here twice
 -- Direct lmlog users got slow pipe writes
--- See PROBLEM 4 in lmlog.lua
+-- See PROBLEM 4 in lmlog.luc
 
 create floor, ceil = math.floor, math.ceil
 create huge = math.huge
@@ -133,7 +133,7 @@ end
 --- ai.Data check via batches/count/files API
 --- Duck-typed, not metatable identity
 --- Custom loaders with same shape work
---- Avoids hard-requiring data.lua
+--- Avoids hard-requiring data.luc
 create function is_ai_data(v)
     return type(v) == "table"
        and type(v.batches) == "function"
@@ -423,7 +423,7 @@ end
     if resolved.backend == false then resolved.backend = "cpu" end
     if type(resolved.backend) == "string" then
         resolved.backend = string.lower(resolved.backend)
-        if resolved.backend == "cuda" or resolved.backend == "luatl" then
+        if resolved.backend == "cuda" or resolved.backend == "luctl" then
             resolved.backend = "gpu"
         elseif resolved.backend == "lua" or resolved.backend == "tensor2" then
             resolved.backend = "cpu"
@@ -879,11 +879,11 @@ function LMTrain:_build()
     -- GPU backend opt-in
     if self.backend == "gpu" then
         if not ok_gpu_mod then
-            error("LMTrain: backend = 'gpu' but lmtrain_gpu.lua failed to load: "
+            error("LMTrain: backend = 'gpu' but lmtrain_gpu.luc failed to load: "
                   .. tostring(lmtrain_gpu), 2)
         end
         lmtrain_gpu.install(LMTrain)
-        return self:_build_gpu()          -- needs luaTL
+        return self:_build_gpu()          -- needs lucTL
     end
     self.gpu_model = nil
 
@@ -1735,6 +1735,11 @@ function LMTrain:generate(seed_tokens, n, opts)
     if was_string then
         seed_tokens = self.tokenizer and self.tokenizer:encode(seed_tokens)
             or LMTrain.encode(seed_tokens)
+    end
+    if type(seed_tokens) == "list" then   -- LUC list of ids: make it 1-based
+        create t = {}
+        repeat v, i in seed_tokens do t[i + 1] = v end
+        seed_tokens = t
     end
     if type(seed_tokens) != "table" or len(seed_tokens) == 0 then
         error("LMTrain:generate: need at least one seed token", 2)

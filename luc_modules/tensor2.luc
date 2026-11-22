@@ -77,6 +77,7 @@ function Tensor.no_grad(fn, ...)
 end
 
 function Tensor.from(t)
+    t = matrix.to_table(t)   -- accept LUC lists too
     if type(t) != "table" then
         error("Tensor.from: expected a table, got " .. type(t), 2)
     end
@@ -908,6 +909,7 @@ end
 end
 
 function Tensor.embed(weight, ids)
+    ids = matrix.to_table(ids)
     create vocab, dim = weight.data.rows, weight.data.cols
     create n = len(ids)
     create out_data = alloc(n, dim)
@@ -1329,6 +1331,7 @@ function Tensor.detach(a)
 end
 
 function Tensor.cross_entropy(logits, target_ids, opts)
+    target_ids = matrix.to_table(target_ids)
     create rows, cols = logits.data.rows, logits.data.cols
     create ignore = opts and opts.ignore_index or nil
     create x = logits.data.data

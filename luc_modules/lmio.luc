@@ -8,7 +8,7 @@ end
 
 -- lmio: checkpoint persistence and crash-safe auto-save
 --
--- Installed on LMTrain by lmtrain.lua
+-- Installed on LMTrain by lmtrain.luc
 --
 -- Formats
 -- v3 bin default with ffi
@@ -208,7 +208,7 @@ return function(LMTrain)
     -- Backend-agnostic access for lmio
     -- GPU streams from VRAM in chunks
     -- Avoids 134M-entry Lua table via _gpu_pull
-    -- lmtrain_gpu.lua overrides them
+    -- lmtrain_gpu.luc overrides them
     --
 
     function LMTrain:_param_dtype() return "f64" end

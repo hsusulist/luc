@@ -1,0 +1,1038 @@
+-- lua2luc: 1-based access helper (works for LUC dicts and lists)
+create function __at(L, i)
+    if type(L) == "list" then
+        return L[i - 1]
+    end
+    return L[i]
+end
+
+create ffi  = require("lucffi")
+
+ffi.cdef[=[
+typedef struct {
+    int32_t  device, major, minor, mp_count, warp_size;
+    int32_t  max_threads_per_block, max_threads_per_mp, max_blocks_per_mp;
+    int32_t  regs_per_block, regs_per_mp, clock_khz, memory_clock_khz;
+    int32_t  memory_bus_width, l2_cache_size, concurrent_kernels;
+    int32_t  async_engines, unified_addressing, cooperative_launch;
+    int32_t  has_tensor_cores, has_fp16, has_bf16, ecc_enabled;
+    int32_t  integrated, cores_per_mp;
+    uint64_t shared_mem_per_block, shared_mem_per_mp;
+    uint64_t total_global_mem, free_global_mem;
+    double   peak_mem_bandwidth_gbs, peak_fp32_gflops, peak_fp16_gflops;
+    char     name[256];
+} lucTL_devinfo_t;
+
+typedef struct {
+    int32_t tm, tn, tk, block_x, block_y, grid_x, grid_y;
+    int32_t shmem_bytes, kernel_id, unroll, use_tensor_core, from_cache;
+    double  measured_ms;
+} lucTL_plan_t;
+
+typedef struct {
+    uint64_t bytes_reserved, bytes_in_use, peak_in_use;
+    uint64_t block_count, free_block_count;
+    uint64_t n_alloc, n_free, n_cuda_malloc, n_cuda_free;
+    uint64_t n_cache_hit, n_cache_miss, n_trim;
+} lucTL_pool_stats_t;
+
+typedef struct lucTL_pool_s lucTL_pool_t;
+
+typedef struct {
+    void*    data;
+    uint64_t nelem, nbytes;
+    int32_t  rows, cols, dtype, owns;
+    void*    pool;
+    int32_t  device, flags;
+} lucTL_tensor_t;
+
+typedef struct {
+    char*    base;
+    uint64_t capacity, offset, peak, alignment;
+    void*    pool;
+} lucTL_arena_t;
+
+typedef struct {
+    int32_t  op, dtype, act, flags;
+    int32_t  i0, i1, i2, i3;
+    float    f0, f1, f2, f3, f4, f5;
+    uint64_t n;
+    void    *p0, *p1, *p2, *p3, *p4, *p5;
+} lucTL_cmd_t;
+
+typedef struct {
+    lucTL_cmd_t* cmds;
+    int32_t      count, capacity, flags, status;
+    void        *stream, *ev_start, *ev_stop;
+    double       last_ms;
+    uint64_t     total_runs, total_ops;
+    int32_t      owns_stream, timing;
+} lucTL_pipeline_t;
+
+/* -- runtime -- */
+const char*  lucTL_version(void);
+void         lucTL_set_verbose(int on);
+int          lucTL_init(int device);
+void         lucTL_shutdown(void);
+const char*  lucTL_device_name(void);
+const char*  lucTL_get_last_error(void);
+int          lucTL_has_error(void);
+void         lucTL_clear_error(void);
+int          lucTL_sync(void);
+int          lucTL_get_devinfo(int device, lucTL_devinfo_t* out);
+int          lucTL_mem_info(uint64_t* freeb, uint64_t* totalb);
+
+/* -- streams / pinned host memory -- */
+void*        lucTL_stream_create(int nonblocking);
+void         lucTL_stream_destroy(void* s);
+int          lucTL_stream_sync(void* s);
+void*        lucTL_host_alloc_pinned(uint64_t bytes);
+void         lucTL_host_free_pinned(void* p);
+
+/* -- pool -- */
+lucTL_pool_t* lucTL_pool_create(int device);
+void          lucTL_pool_destroy(lucTL_pool_t* P);
+lucTL_pool_t* lucTL_default_pool(void);
+void*         lucTL_tensor_alloc(lucTL_pool_t* P, uint64_t bytes);
+void          lucTL_tensor_free(lucTL_pool_t* P, void* ptr);
+void          lucTL_pool_trim(lucTL_pool_t* P);
+int           lucTL_pool_get_stats(lucTL_pool_t* P, lucTL_pool_stats_t* out);
+int           lucTL_pool_owns(lucTL_pool_t* P, void* ptr);
+
+/* -- arena -- */
+lucTL_arena_t* lucTL_arena_create(lucTL_pool_t* P, uint64_t bytes);
+void           lucTL_arena_destroy(lucTL_arena_t* A);
+void*          lucTL_arena_alloc(lucTL_arena_t* A, uint64_t bytes);
+void           lucTL_arena_reset(lucTL_arena_t* A);
+
+/* -- tensors -- */
+int  lucTL_tensor_init(lucTL_tensor_t* t, int rows, int cols, int dtype, lucTL_pool_t* P);
+int  lucTL_tensor_wrap(lucTL_tensor_t* t, void* data, int rows, int cols, int dtype);
+void lucTL_tensor_release(lucTL_tensor_t* t);
+int  lucTL_tensor_view(lucTL_tensor_t* dst, const lucTL_tensor_t* src, int row_off, int rows, int cols);
+int  lucTL_tensor_zero(lucTL_tensor_t* t);
+int  lucTL_tensor_upload(lucTL_tensor_t* t, const float* host, uint64_t nelem);
+int  lucTL_tensor_download(const lucTL_tensor_t* t, float* host, uint64_t nelem);
+int  lucTL_tensor_copy(const lucTL_tensor_t* src, lucTL_tensor_t* dst);
+int  lucTL_tensor_cast(const lucTL_tensor_t* src, lucTL_tensor_t* dst);
+
+/* -- legacy raw pointer API -- */
+float* lucTL_gpu_malloc(uint64_t nelem);
+void   lucTL_gpu_free(float* p);
+int    lucTL_to_gpu(const float* host, float* dev, uint64_t nelem);
+int    lucTL_to_cpu(const float* dev, float* host, uint64_t nelem);
+int    lucTL_gpu_copy(const float* src, float* dst, uint64_t nelem);
+int    lucTL_gpu_zero(float* p, uint64_t nelem);
+
+/* -- autotuner -- */
+int  lucTL_plan_gemm(int M, int N, int K, int dtype, int allow_tc, lucTL_plan_t* out);
+void lucTL_set_tile_override(int kernel_id);
+void lucTL_tune_reset(void);
+int  lucTL_autotune_benchmark(int M, int N, int K, int dtype, int iters, lucTL_plan_t* out);
+
+/* -- math --*/
+int lucTL_gemm(const void* A, const void* B, void* C, const void* bias,
+               const void* gamma, const float* rowscale,
+               int M, int N, int K, int dtype,
+               float alpha, float beta, float eps, int pre_op, int post_op);
+int matmul_cuda(const float* A, const float* B, float* C, int M, int N, int K);
+int fused_rmsnorm_matmul_cuda(const float* x, const float* gamma, const float* W,
+                              float* out, const float* bias, int M, int N, int K, float eps);
+int fused_gelu_matmul_cuda(const float* x, const float* W, float* out,
+                           const float* bias, int M, int N, int K);
+int fused_silu_matmul_cuda(const float* x, const float* W, float* out,
+                           const float* bias, int M, int N, int K);
+int fused_matmul_gelu_cuda(const float* A, const float* B, float* C,
+                           const float* bias, int M, int N, int K);
+int lucTL_elementwise(const void* A, const void* B, void* C, uint64_t n,
+                      int dtype, int op, float alpha, float beta);
+int add_cuda(const float* A, const float* B, float* C, uint64_t n);
+int add_inplace_cuda(float* A, const float* B, uint64_t n, float alpha);
+int lucTL_rmsnorm(const void* x, const void* w, void* out,
+                  int rows, int cols, float eps, int dtype);
+int rmsnorm_cuda(const float* x, const float* w, float* out, int rows, int cols, float eps);
+int rmsnorm_inplace_cuda(float* x, const float* w, int rows, int cols, float eps);
+int lucTL_softmax(const void* x, const void* bias, void* out, int rows, int cols,
+                  float scale, int causal, int mask_offset, int dtype);
+int softmax_cuda(const float* x, float* out, int rows, int cols);
+int fused_add_bias_softmax_cuda(const float* x, const float* bias, float* out,
+                                int rows, int cols, float scale, int causal);
+int lucTL_bcast_add(const void* x, const void* v, void* out,
+                    int rows, int cols, float alpha, int dtype);
+int lucTL_transpose(const void* in, void* out, int rows, int cols, int dtype);
+int lucTL_rms_rowscale(const void* x, float* scale, int rows, int cols, float eps, int dtype);
+int lucTL_adamw(float* w, const void* g, float* m, float* v, void* w_lp,
+                uint64_t n, int grad_dtype, float lr, float beta1, float beta2,
+                float eps, float wd, int step, float clip);
+
+/* -- pipeline -- */
+lucTL_pipeline_t* lucTL_pipeline_create(int capacity, int timing);
+void              lucTL_pipeline_destroy(lucTL_pipeline_t* P);
+void              lucTL_pipeline_reset(lucTL_pipeline_t* P);
+int               lucTL_pipeline_push(lucTL_pipeline_t* P, const lucTL_cmd_t* cmd);
+int               lucTL_pipeline_run(lucTL_pipeline_t* P);
+int               lucTL_pipeline_wait(lucTL_pipeline_t* P);
+]=]
+
+--  Library loading
+create CANDIDATES
+-- lucffi.load also searches the script folder, LUC_PATH and the current folder
+if ffi.os == "Windows" then
+    CANDIDATES = { 1:  "lucTL", 2:  "lucTL.dll"  }
+else
+    CANDIDATES = { 1:  "lucTL", 2:  "./lucTL.so", 3:  "liblucTL.so"  }
+end
+
+create C, load_err
+do
+    create __L = (CANDIDATES)
+    repeat 1, len(__L) as __i do
+        create _ = __i + 1
+        create name = __at(__L, __i + 1)
+
+    create ok, lib = pcall(ffi.load, name)
+    if ok then C = lib break else load_err = lib end
+end
+end
+if not C then
+    error("lucTL: cannot load the native library (" .. tostring(load_err) ..
+          "). Build it with nvcc first: bash cuda/build_kaggle.sh (see cuda/README.txt)", 2)
+end
+
+create lucTL = { "_VERSION":  "lucTL 2.0", "C":  C  }
+
+-- ---------------------------------------------------------------------
+--  Constants
+-- ---------------------------------------------------------------------
+lucTL.F32, lucTL.F16, lucTL.BF16 = 0, 1, 2
+
+lucTL.dtype = { "f32":  0, "float":  0, "f16":  1, "half":  1, "bf16":  2, "bfloat16":  2  }
+lucTL.dtype_name = { (0):  "f32", (1):  "f16", (2):  "bf16"  }
+lucTL.dtype_size = { (0):  4, (1):  2, (2):  2  }
+
+lucTL.EW = { "COPY":  0, "ADD":  1, "SUB":  2, "MUL":  3, "DIV":  4, "SCALE":  5, "AXPY":  6, "FILL":  7, "RELU":  8, "GELU":  9, "SILU":  10, "TANH":  11, "SIGMOID":  12, "EXP":  13, "SQRT":  14, "RSQRT":  15, "NEG":  16, "RECIP":  17, "ABS":  18, "CLAMP":  19, "DRELU":  20, "DSILU":  21, "DGELU":  22 }
+
+lucTL.ACT = { "NONE":  0, "RELU":  1, "GELU":  2, "SILU":  3, "TANH":  4, "SIGMOID":  5  }
+lucTL.PRE = { "NONE":  0, "RMSNORM":  1, "GELU":  2, "SILU":  3, "RELU":  4  }
+
+lucTL.OP = { "NOP":  0, "GEMM":  1, "EW":  2, "RMSNORM":  3, "SOFTMAX":  4, "CAST":  5, "TRANSPOSE":  6, "BCAST_ADD":  7, "ADAMW":  8, "ZERO":  9, "COPY":  10, "SYNC":  11 }
+
+create STATUS_NAME = { (0):  "OK", (-1):  "NULL_POINTER", (-2):  "SHAPE", (-3):  "DTYPE", (-4):  "CUDA", (-5):  "OUT_OF_MEMORY", (-6):  "BAD_ARGUMENT", (-7):  "CAPACITY", (-8):  "UNSUPPORTED" }
+
+--  Cached ctypes and reusable scratch cdata (avoids per-call allocation)
+create tensor_ct  = ffi.typeof("lucTL_tensor_t")
+create devinfo_ct = ffi.typeof("lucTL_devinfo_t")
+create plan_ct    = ffi.typeof("lucTL_plan_t")
+create stats_ct   = ffi.typeof("lucTL_pool_stats_t")
+create float_ct   = ffi.typeof("float[?]")
+create u64_1      = ffi.new("uint64_t[1]")
+create u64_2      = ffi.new("uint64_t[1]")
+create scratch_plan  = plan_ct()
+create scratch_stats = stats_ct()
+
+--  Error handling
+create function last_error()
+    create msg = ffi.string(C.lucTL_get_last_error())
+    C.lucTL_clear_error()
+    if msg == "" then msg = "unspecified backend error" end
+    return msg
+end
+lucTL.last_error = last_error
+
+create function ck(status, ctx)
+    if status != 0 then
+        error(string.format("lucTL[%s]: %s (%s)", ctx or "?",
+              last_error(), STATUS_NAME[status] or ("status " .. tostring(status))), 3)
+    end
+    return status
+end
+lucTL.check = ck
+
+--  Runtime control
+lucTL.devinfo = nil
+lucTL.device  = "<uninitialized>"
+
+function lucTL.init(device, opts)
+    opts = opts or {}
+    C.lucTL_clear_error()
+    create n = C.lucTL_init(device or 0)
+    if n == 0 then
+        error("lucTL.init failed: " .. last_error(), 2)
+    end
+    C.lucTL_set_verbose(opts.verbose and 1 or 0)
+
+    lucTL.device  = ffi.string(C.lucTL_device_name())
+    lucTL.devinfo = devinfo_ct()
+    ck(C.lucTL_get_devinfo(-1, lucTL.devinfo), "get_devinfo")
+    lucTL.core_version = ffi.string(C.lucTL_version())
+    lucTL.pool = C.lucTL_default_pool()
+    return n, lucTL.device
+end
+
+function lucTL.shutdown() C.lucTL_shutdown() end
+function lucTL.sync() ck(C.lucTL_sync(), "sync") end
+function lucTL.set_verbose(on) C.lucTL_set_verbose(on and 1 or 0) end
+
+function lucTL.mem_info()
+    ck(C.lucTL_mem_info(u64_1, u64_2), "mem_info")
+    return tonumber(u64_1[0]), tonumber(u64_2[0])
+end
+
+function lucTL.hardware()
+    create d = lucTL.devinfo
+    if not d then return nil, "call lucTL.init() first" end
+    return { "name":  ffi.string(d.name), "sm":  string.format("sm_%d%d", d.major, d.minor), "major":  d.major, "minor":  d.minor, "multiprocessors":  d.mp_count, "cores_per_sm":  d.cores_per_mp, "cuda_cores":  d.mp_count * d.cores_per_mp, "warp_size":  d.warp_size, "max_threads_block":  d.max_threads_per_block, "max_threads_sm":  d.max_threads_per_mp, "shared_per_block":  tonumber(d.shared_mem_per_block), "shared_per_sm":  tonumber(d.shared_mem_per_mp), "total_vram":  tonumber(d.total_global_mem), "free_vram":  tonumber(d.free_global_mem), "l2_cache":  d.l2_cache_size, "bandwidth_gbs":  d.peak_mem_bandwidth_gbs, "gflops_fp32":  d.peak_fp32_gflops, "gflops_fp16":  d.peak_fp16_gflops, "tensor_cores":  d.has_tensor_cores != 0, "fp16":  d.has_fp16 != 0, "bf16":  d.has_bf16 != 0 }
+end
+
+--  Pool
+function lucTL.pool_stats(pool)
+    ck(C.lucTL_pool_get_stats(pool or nil, scratch_stats), "pool_stats")
+    create s = scratch_stats
+    return { "reserved":  tonumber(s.bytes_reserved), "in_use":  tonumber(s.bytes_in_use), "peak":  tonumber(s.peak_in_use), "blocks":  tonumber(s.block_count), "free_blocks":  tonumber(s.free_block_count), "allocs":  tonumber(s.n_alloc), "frees":  tonumber(s.n_free), "cuda_malloc":  tonumber(s.n_cuda_malloc), "cuda_free":  tonumber(s.n_cuda_free), "cache_hit":  tonumber(s.n_cache_hit), "cache_miss":  tonumber(s.n_cache_miss), "trims":  tonumber(s.n_trim) }
+end
+
+function lucTL.pool_trim(pool) C.lucTL_pool_trim(pool or nil) end
+
+--  Arena (bump allocator; Lua bumps `offset` with zero FFI calls)
+create Arena = {}
+Arena.__index = Arena
+
+function lucTL.Arena(bytes, pool)
+    create a = C.lucTL_arena_create(pool or nil, bytes)
+    if a == nil then error("lucTL.Arena: " .. last_error(), 2) end
+    return setmetatable({ "h":  ffi.gc(a, C.lucTL_arena_destroy)  }, Arena)
+end
+
+function Arena:reset()  self.h.offset = 0 return self end
+function Arena:used()   return tonumber(self.h.offset) end
+function Arena:peak()   return tonumber(self.h.peak) end
+function Arena:capacity() return tonumber(self.h.capacity) end
+
+--- Fast path: pure Lua pointer bump, no FFI transition at all.
+function Arena:raw(bytes)
+    create h   = self.h
+    create al  = 256
+    create off = math.floor((tonumber(h.offset) + al - 1) / al) * al
+    if off + bytes > tonumber(h.capacity) then
+        error("lucTL.Arena: exhausted (" .. off + bytes .. " > " ..
+              tonumber(h.capacity) .. " bytes)", 2)
+    end
+    h.offset = off + bytes
+    if h.offset > h.peak then h.peak = h.offset end
+    return h.base + off
+end
+
+--- Allocate a tensor whose storage lives in the arena (never freed
+--- individually; reclaimed wholesale by Arena:reset()).
+function Arena:tensor(rows, cols, dtype)
+    dtype = dtype or lucTL.F32
+    create n     = rows * cols
+    create bytes = n * lucTL.dtype_size[dtype]
+    create t     = tensor_ct()
+    ck(C.lucTL_tensor_wrap(t, self:raw(bytes), rows, cols, dtype), "arena.tensor")
+    return t
+end
+
+lucTL.ArenaClass = Arena
+
+--  Tensor : lucffi.metatype over lucTL_tensor_t (C struct memory, LUC table handle)
+create Tensor = {}
+
+create function dt_of(x)
+    if x == nil then return lucTL.F32 end
+    if type(x) == "number" then return x end
+    create d = lucTL.dtype[x]
+    if d == nil then error("lucTL: unknown dtype '" .. tostring(x) .. "'", 3) end
+    return d
+end
+lucTL.dt_of = dt_of
+
+--- Allocate an uninitialized device tensor.
+function lucTL.new(rows, cols, dtype, pool)
+    rows = math.floor(rows or 1)
+    cols = math.floor(cols or 1)
+    if rows <= 0 or cols <= 0 then
+        error("lucTL.new: shape must be positive, got " .. rows .. "x" .. cols, 2)
+    end
+    create t = tensor_ct()
+    ck(C.lucTL_tensor_init(t, rows, cols, dt_of(dtype), pool or nil), "new")
+    return t
+end
+
+function lucTL.zeros(rows, cols, dtype, pool)
+    create t = lucTL.new(rows, cols, dtype, pool)
+    ck(C.lucTL_tensor_zero(t), "zeros")
+    return t
+end
+
+--- Wrap an existing device pointer without taking ownership.
+function lucTL.wrap(ptr, rows, cols, dtype)
+    create t = tensor_ct()
+    ck(C.lucTL_tensor_wrap(t, ptr, rows, cols, dt_of(dtype)), "wrap")
+    return t
+end
+
+--- Build from a flat or nested Lua table (host staging is transient).
+function lucTL.from_table(data, shape, dtype)
+    if type(data) != "table" then
+        error("lucTL.from_table expects a table", 2)
+    end
+    create flat, rows, cols
+    if type(data[1]) == "table" then
+        rows, cols = len(data), len(data[1])
+        flat = {}
+        create k = 0
+        do
+    create __fa = (1)
+    create __fb = (rows )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+            create row = data[r]
+            if len(row) != cols then
+                error("lucTL.from_table: ragged row " .. r, 2)
+            end
+            do
+    create __fa = (1)
+    create __fb = (cols )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ k = k + 1 flat[k] = row[c] end
+end
+        end
+end
+    else
+        flat = data
+        if shape then rows, cols = shape[1], shape[2]
+        else rows, cols = 1, len(data) end
+    end
+    create n = rows * cols
+    if n != len(flat) then
+        error(string.format("lucTL.from_table: shape %dx%d != %d elements",
+                            rows, cols, len(flat)), 2)
+    end
+    create buf = float_ct(n)
+    ffi.fromtable(buf, flat, n)
+    create t = lucTL.new(rows, cols, dtype)
+    ck(C.lucTL_tensor_upload(t, buf, n), "from_table")
+    return t
+end
+
+function lucTL.random(rows, cols, scale, dtype)
+    scale = scale or 1.0
+    create n   = rows * cols
+    create buf = float_ct(n)
+    do
+    create __fa = (0)
+    create __fb = (n - 1 )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create i = __fa + __j * __fs
+ buf[i] = (math.random() * 2.0 - 1.0) * scale end
+end
+    create t = lucTL.new(rows, cols, dtype)
+    ck(C.lucTL_tensor_upload(t, buf, n), "random")
+    return t
+end
+
+--- Xavier / Glorot uniform initialisation.
+function lucTL.xavier(rows, cols, dtype)
+    return lucTL.random(rows, cols, math.sqrt(6.0 / (rows + cols)), dtype)
+end
+
+-- introspection
+function Tensor:shape()    return self.rows, self.cols end
+function Tensor:numel()    return tonumber(self.nelem) end
+function Tensor:bytes()    return tonumber(self.nbytes) end
+function Tensor:dtype_name() return lucTL.dtype_name[self.dtype] end
+function Tensor:ptr()      return self.data end
+function Tensor:is_null()  return self.data == nil end
+
+--  lifetime 
+function Tensor:free()
+    C.lucTL_tensor_release(self)
+    return self
+end
+
+function Tensor:zero()
+    ck(C.lucTL_tensor_zero(self), "zero")
+    return self
+end
+
+-- Non-owning row-slice view.  `rows`/`cols` default to the remainder.
+function Tensor:view(row_off, rows, cols)
+    create v = tensor_ct()
+    ck(C.lucTL_tensor_view(v, self, row_off or 0, rows or 0, cols or 0), "view")
+    return v
+end
+
+function Tensor:reshape(rows, cols)
+    if rows * cols != tonumber(self.nelem) then
+        error(string.format("lucTL:reshape %dx%d != %d elements",
+                            rows, cols, tonumber(self.nelem)), 2)
+    end
+    self.rows, self.cols = rows, cols
+    return self
+end
+
+function Tensor:clone()
+    create t = lucTL.new(self.rows, self.cols, self.dtype)
+    ck(C.lucTL_tensor_copy(self, t), "clone")
+    return t
+end
+
+function Tensor:copy_from(src)
+    ck(C.lucTL_tensor_copy(src, self), "copy_from")
+    return self
+end
+
+function Tensor:cast(dtype)
+    create t = lucTL.new(self.rows, self.cols, dt_of(dtype))
+    ck(C.lucTL_tensor_cast(self, t), "cast")
+    return t
+end
+
+-- host transfer
+function Tensor:upload(host_buf, n)
+    ck(C.lucTL_tensor_upload(self, host_buf, n or 0), "upload")
+    return self
+end
+
+function Tensor:download(host_buf, n)
+    ck(C.lucTL_tensor_download(self, host_buf, n or 0), "download")
+    return host_buf
+end
+
+function Tensor:tohost()
+    create n   = tonumber(self.nelem)
+    create buf = float_ct(n)
+    ck(C.lucTL_tensor_download(self, buf, n), "tohost")
+    return buf, n
+end
+
+function Tensor:totable()
+    create buf = self:tohost()
+    create out, rows, cols = {}, self.rows, self.cols
+    do
+    create __fa = (1)
+    create __fb = (rows )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+        create row = {}
+        create base = (r - 1) * cols
+        do
+    create __fa = (1)
+    create __fb = (cols )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ row[c] = buf[base + c - 1] end
+end
+        out[r] = row
+    end
+end
+    return out
+end
+
+function Tensor:toflat()
+    create buf, n = self:tohost()
+    create out = {}
+    out = ffi.totable(buf, n)
+    return out
+end
+
+function Tensor:get(r, c)
+    create buf = float_ct(1)
+    create off = ((r - 1) * self.cols + (c - 1))
+    create view = tensor_ct()
+    ck(C.lucTL_tensor_wrap(view, ffi.cast("char*", self.data) +
+        off * lucTL.dtype_size[self.dtype], 1, 1, self.dtype), "get")
+    ck(C.lucTL_tensor_download(view, buf, 1), "get")
+    return buf[0]
+end
+
+function Tensor:set(r, c, v)
+    create buf = float_ct(1)
+    buf[0] = v
+    create off = ((r - 1) * self.cols + (c - 1))
+    create view = tensor_ct()
+    ck(C.lucTL_tensor_wrap(view, ffi.cast("char*", self.data) +
+        off * lucTL.dtype_size[self.dtype], 1, 1, self.dtype), "set")
+    ck(C.lucTL_tensor_upload(view, buf, 1), "set")
+    return self
+end
+
+-- math : allocating variants 
+function Tensor:matmul(B, opts)
+    opts = opts or {}
+    if self.cols != B.rows then
+        error(string.format("lucTL:matmul shape mismatch (%dx%d)*(%dx%d)",
+                            self.rows, self.cols, B.rows, B.cols), 2)
+    end
+    create out = lucTL.new(self.rows, B.cols, self.dtype)
+    ck(C.lucTL_gemm(self.data, B.data, out.data,
+                    opts.bias and opts.bias.data or nil,
+                    opts.gamma and opts.gamma.data or nil, nil,
+                    self.rows, B.cols, self.cols, self.dtype,
+                    opts.alpha or 1.0, 0.0, opts.eps or 1e-5,
+                    opts.pre or 0, opts.act or 0), "matmul")
+    return out
+end
+
+--- In place: self = act(alpha*(pre(A)@B) + bias) + beta*self
+function Tensor:matmul_inplace(A, B, opts)
+    opts = opts or {}
+    if A.cols != B.rows or A.rows != self.rows or B.cols != self.cols then
+        error("lucTL:matmul_inplace shape mismatch", 2)
+    end
+    ck(C.lucTL_gemm(A.data, B.data, self.data,
+                    opts.bias and opts.bias.data or nil,
+                    opts.gamma and opts.gamma.data or nil, nil,
+                    A.rows, B.cols, A.cols, self.dtype,
+                    opts.alpha or 1.0, opts.beta or 0.0, opts.eps or 1e-5,
+                    opts.pre or 0, opts.act or 0), "matmul_inplace")
+    return self
+end
+
+function Tensor:fused_rmsnorm_matmul(W, gamma, bias, eps)
+    create out = lucTL.new(self.rows, W.cols, self.dtype)
+    ck(C.lucTL_gemm(self.data, W.data, out.data,
+                    bias and bias.data or nil,
+                    gamma and gamma.data or nil, nil,
+                    self.rows, W.cols, self.cols, self.dtype,
+                    1.0, 0.0, eps or 1e-5, lucTL.PRE.RMSNORM, 0),
+       "fused_rmsnorm_matmul")
+    return out
+end
+
+function Tensor:fused_gelu_matmul(W, bias)
+    create out = lucTL.new(self.rows, W.cols, self.dtype)
+    ck(C.lucTL_gemm(self.data, W.data, out.data, bias and bias.data or nil,
+                    nil, nil, self.rows, W.cols, self.cols, self.dtype,
+                    1.0, 0.0, 1e-5, lucTL.PRE.GELU, 0), "fused_gelu_matmul")
+    return out
+end
+
+function Tensor:fused_silu_matmul(W, bias)
+    create out = lucTL.new(self.rows, W.cols, self.dtype)
+    ck(C.lucTL_gemm(self.data, W.data, out.data, bias and bias.data or nil,
+                    nil, nil, self.rows, W.cols, self.cols, self.dtype,
+                    1.0, 0.0, 1e-5, lucTL.PRE.SILU, 0), "fused_silu_matmul")
+    return out
+end
+
+function Tensor:add(B)
+    create out = lucTL.new(self.rows, self.cols, self.dtype)
+    ck(C.lucTL_elementwise(self.data, B.data, out.data, self.nelem,
+                           self.dtype, lucTL.EW.ADD, 1.0, 1.0), "add")
+    return out
+end
+
+-- self += alpha * B  (no allocation whatsoever)
+function Tensor:add_inplace(B, alpha)
+    ck(C.lucTL_elementwise(self.data, B.data, self.data, self.nelem,
+                           self.dtype, lucTL.EW.AXPY, alpha or 1.0, 0.0),
+       "add_inplace")
+    return self
+end
+
+function Tensor:mul_inplace(B)
+    ck(C.lucTL_elementwise(self.data, B.data, self.data, self.nelem,
+                           self.dtype, lucTL.EW.MUL, 1.0, 0.0), "mul_inplace")
+    return self
+end
+
+function Tensor:scale_inplace(alpha, beta)
+    ck(C.lucTL_elementwise(self.data, nil, self.data, self.nelem,
+                           self.dtype, lucTL.EW.SCALE, alpha, beta or 0.0),
+       "scale_inplace")
+    return self
+end
+
+function Tensor:fill(v)
+    ck(C.lucTL_elementwise(nil, nil, self.data, self.nelem,
+                           self.dtype, lucTL.EW.FILL, v, 0.0), "fill")
+    return self
+end
+
+function Tensor:apply_inplace(op, alpha, beta)
+    ck(C.lucTL_elementwise(self.data, nil, self.data, self.nelem,
+                           self.dtype, op, alpha or 0.0, beta or 0.0),
+       "apply_inplace")
+    return self
+end
+
+function Tensor:relu_inplace() return self:apply_inplace(lucTL.EW.RELU) end
+function Tensor:gelu_inplace() return self:apply_inplace(lucTL.EW.GELU) end
+function Tensor:silu_inplace() return self:apply_inplace(lucTL.EW.SILU) end
+function Tensor:clamp_inplace(lo, hi)
+    return self:apply_inplace(lucTL.EW.CLAMP, lo, hi)
+end
+
+function Tensor:rmsnorm(weight, eps)
+    create out = lucTL.new(self.rows, self.cols, self.dtype)
+    ck(C.lucTL_rmsnorm(self.data, weight and weight.data or nil, out.data,
+                       self.rows, self.cols, eps or 1e-5, self.dtype), "rmsnorm")
+    return out
+end
+
+function Tensor:rmsnorm_inplace(weight, eps)
+    ck(C.lucTL_rmsnorm(self.data, weight and weight.data or nil, self.data,
+                       self.rows, self.cols, eps or 1e-5, self.dtype),
+       "rmsnorm_inplace")
+    return self
+end
+
+function Tensor:softmax(opts)
+    opts = opts or {}
+    create out = lucTL.new(self.rows, self.cols, self.dtype)
+    ck(C.lucTL_softmax(self.data, opts.bias and opts.bias.data or nil, out.data,
+                       self.rows, self.cols, opts.scale or 1.0,
+                       opts.causal and 1 or 0, opts.mask_offset or 0,
+                       self.dtype), "softmax")
+    return out
+end
+
+function Tensor:softmax_inplace(opts)
+    opts = opts or {}
+    ck(C.lucTL_softmax(self.data, opts.bias and opts.bias.data or nil, self.data,
+                       self.rows, self.cols, opts.scale or 1.0,
+                       opts.causal and 1 or 0, opts.mask_offset or 0,
+                       self.dtype), "softmax_inplace")
+    return self
+end
+
+function Tensor:bcast_add_inplace(vec, alpha)
+    ck(C.lucTL_bcast_add(self.data, vec.data, self.data,
+                         self.rows, self.cols, alpha or 1.0, self.dtype),
+       "bcast_add_inplace")
+    return self
+end
+
+function Tensor:transpose()
+    create out = lucTL.new(self.cols, self.rows, self.dtype)
+    ck(C.lucTL_transpose(self.data, out.data, self.rows, self.cols, self.dtype),
+       "transpose")
+    return out
+end
+
+-- operators / printing
+create function ts(t)
+    return string.format("lucTL.Tensor<%s>(%dx%d, %d bytes, %s)",
+        lucTL.dtype_name[t.dtype] or "?", t.rows, t.cols,
+        tonumber(t.nbytes), t.owns != 0 and "owned" or "view")
+end
+
+ffi.metatype(tensor_ct, { "__index":  Tensor, "__tostring":  ts, "__add":  function(a, b) return a:add(b) end, "__mul":  function(a, b) return a:matmul(b) end, "__len":  function(t) return tonumber(t.nelem) end })
+
+lucTL.Tensor      = lucTL.new
+lucTL.TensorClass = Tensor
+
+function Tensor:print(label)
+    if label then io.write(label, "\n") end
+    io.write(ts(self), "\n")
+    create rows = self:totable()
+    create rmax = math.min(len(rows), 16)
+    do
+    create __fa = (1)
+    create __fb = (rmax )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create r = __fa + __j * __fs
+
+        create row, cmax = rows[r], math.min(self.cols, 12)
+        create parts = {}
+        do
+    create __fa = (1)
+    create __fb = (cmax )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create c = __fa + __j * __fs
+ parts[c] = string.format("%9.4f", row[c]) end
+end
+        if self.cols > cmax then parts[len(parts) + 1] = "..." end
+        io.write("  ", table.concat(parts, " "), "\n")
+    end
+end
+    if len(rows) > rmax then io.write("  ...\n") end
+    return self
+end
+
+--  Autotuner
+create function plan_to_table(p)
+    return { "tm":  p.tm, "tn":  p.tn, "tk":  p.tk, "block":  { 1:  p.block_x, 2:  p.block_y  }, "grid":  { 1:  p.grid_x, 2:  p.grid_y  }, "shmem":  p.shmem_bytes, "kernel_id":  p.kernel_id, "unroll":  p.unroll, "tensor_core":  p.use_tensor_core != 0, "cached":  p.from_cache != 0, "ms":  p.measured_ms }
+end
+
+function lucTL.plan(M, N, K, dtype, allow_tc)
+    ck(C.lucTL_plan_gemm(M, N, K, dt_of(dtype),
+                         allow_tc == false and 0 or 1, scratch_plan), "plan")
+    return plan_to_table(scratch_plan)
+end
+
+function lucTL.autotune(M, N, K, dtype, iters)
+    ck(C.lucTL_autotune_benchmark(M, N, K, dt_of(dtype), iters or 8,
+                                  scratch_plan), "autotune")
+    return plan_to_table(scratch_plan)
+end
+
+function lucTL.set_tile_override(id) C.lucTL_set_tile_override(id or -1) end
+function lucTL.tune_reset() C.lucTL_tune_reset() end
+
+--  Pipeline : queue many GPU ops, run them with ONE FFI call
+create Pipeline = {}
+Pipeline.__index = Pipeline
+lucTL.PipelineClass = Pipeline
+
+function lucTL.Pipeline(capacity, timing)
+    create h = C.lucTL_pipeline_create(capacity or 512, timing and 1 or 0)
+    if h == nil then error("lucTL.Pipeline: " .. last_error(), 2) end
+    return setmetatable({ "h":  ffi.gc(h, C.lucTL_pipeline_destroy)  }, Pipeline)
+end
+
+function Pipeline:reset()
+    self.h.count = 0
+    self.h.status = 0
+    return self
+end
+
+--- Reserve the next command slot.  Pure struct arithmetic: LuaJIT
+--- compiles this down to a pointer add plus an integer store.
+function Pipeline:slot()
+    create h = self.h
+    create i = h.count
+    if i >= h.capacity then
+        error("lucTL.Pipeline: queue full (" .. tonumber(h.capacity) .. ")", 3)
+    end
+    h.count = i + 1
+    create c = h.cmds[i]
+    c.op, c.dtype, c.act, c.flags = 0, 0, 0, 0
+    c.i0, c.i1, c.i2, c.i3 = 0, 0, 0, 0
+    c.f0, c.f1, c.f2, c.f3, c.f4, c.f5 = 0, 0, 0, 0, 0, 0
+    c.n = 0
+    c.p0, c.p1, c.p2, c.p3, c.p4, c.p5 = nil, nil, nil, nil, nil, nil
+    return c
+end
+
+function Pipeline:gemm(A, B, Cout, opts)
+    opts = opts or {}
+    create c = self:slot()
+    c.op    = lucTL.OP.GEMM
+    c.dtype = A.dtype
+    c.act   = opts.act or 0
+    c.i0, c.i1, c.i2 = A.rows, B.cols, A.cols
+    c.i3    = opts.pre or 0
+    c.f0    = opts.alpha or 1.0
+    c.f1    = opts.beta  or 0.0
+    c.f2    = opts.eps   or 1e-5
+    c.p0, c.p1, c.p2 = A.data, B.data, Cout.data
+    c.p3 = opts.bias     and opts.bias.data     or nil
+    c.p4 = opts.gamma    and opts.gamma.data    or nil
+    c.p5 = opts.rowscale and opts.rowscale.data or nil
+    return self
+end
+
+function Pipeline:rmsnorm_matmul(x, W, out, gamma, bias, eps)
+    return self:gemm(x, W, out, { "pre":  lucTL.PRE.RMSNORM, "gamma":  gamma, "bias":  bias, "eps":  eps  })
+end
+
+function Pipeline:gelu_matmul(x, W, out, bias)
+    return self:gemm(x, W, out, { "pre":  lucTL.PRE.GELU, "bias":  bias  })
+end
+
+function Pipeline:silu_matmul(x, W, out, bias)
+    return self:gemm(x, W, out, { "pre":  lucTL.PRE.SILU, "bias":  bias  })
+end
+
+function Pipeline:ew(op, A, B, out, alpha, beta)
+    create c = self:slot()
+    c.op    = lucTL.OP.EW
+    c.dtype = out.dtype
+    c.i0    = op
+    c.f0    = alpha or 1.0
+    c.f1    = beta  or 0.0
+    c.n     = out.nelem
+    c.p0    = A and A.data or nil
+    c.p1    = B and B.data or nil
+    c.p2    = out.data
+    return self
+end
+
+function Pipeline:add(A, B, out, alpha, beta)
+    return self:ew(lucTL.EW.ADD, A, B, out, alpha or 1.0, beta or 1.0)
+end
+
+function Pipeline:add_inplace(dst, B, alpha)
+    return self:ew(lucTL.EW.AXPY, dst, B, dst, alpha or 1.0, 0.0)
+end
+
+function Pipeline:rmsnorm(x, w, out, eps)
+    create c = self:slot()
+    c.op    = lucTL.OP.RMSNORM
+    c.dtype = x.dtype
+    c.i0, c.i1 = x.rows, x.cols
+    c.f0    = eps or 1e-5
+    c.p0    = x.data
+    c.p1    = w and w.data or nil
+    c.p2    = out.data
+    return self
+end
+
+function Pipeline:softmax(x, out, opts)
+    opts = opts or {}
+    create c = self:slot()
+    c.op    = lucTL.OP.SOFTMAX
+    c.dtype = x.dtype
+    c.i0, c.i1 = x.rows, x.cols
+    c.i2    = opts.causal and 1 or 0
+    c.i3    = opts.mask_offset or 0
+    c.f0    = opts.scale or 1.0
+    c.p0    = x.data
+    c.p1    = opts.bias and opts.bias.data or nil
+    c.p2    = out.data
+    return self
+end
+
+function Pipeline:bcast_add(x, vec, out, alpha)
+    create c = self:slot()
+    c.op    = lucTL.OP.BCAST_ADD
+    c.dtype = x.dtype
+    c.i0, c.i1 = x.rows, x.cols
+    c.f0    = alpha or 1.0
+    c.p0, c.p1, c.p2 = x.data, vec and vec.data or nil, out.data
+    return self
+end
+
+function Pipeline:transpose(x, out)
+    create c = self:slot()
+    c.op    = lucTL.OP.TRANSPOSE
+    c.dtype = x.dtype
+    c.i0, c.i1 = x.rows, x.cols
+    c.p0, c.p2 = x.data, out.data
+    return self
+end
+
+function Pipeline:cast(src, dst)
+    create c = self:slot()
+    c.op = lucTL.OP.CAST
+    c.i0, c.i1 = src.dtype, dst.dtype
+    c.n  = src.nelem
+    c.p0, c.p2 = src.data, dst.data
+    return self
+end
+
+function Pipeline:adamw(w, g, m, v, w_lp, o)
+    o = o or {}
+    create c = self:slot()
+    c.op    = lucTL.OP.ADAMW
+    c.dtype = g.dtype
+    c.i0    = o.step or 1
+    c.f0    = o.lr    or 1e-3
+    c.f1    = o.beta1 or 0.9
+    c.f2    = o.beta2 or 0.999
+    c.f3    = o.eps   or 1e-8
+    c.f4    = o.wd    or 0.0
+    c.f5    = o.clip  or 0.0
+    c.n     = w.nelem
+    c.p0, c.p1, c.p2, c.p3 = w.data, g.data, m.data, v.data
+    c.p4 = w_lp and w_lp.data or nil
+    return self
+end
+
+function Pipeline:zero(t)
+    create c = self:slot()
+    c.op = lucTL.OP.ZERO
+    c.n  = t.nbytes
+    c.p2 = t.data
+    return self
+end
+
+function Pipeline:copy(src, dst)
+    create c = self:slot()
+    c.op = lucTL.OP.COPY
+    c.n  = src.nbytes
+    c.p0, c.p2 = src.data, dst.data
+    return self
+end
+
+function Pipeline:barrier()
+    self:slot().op = lucTL.OP.SYNC
+    return self
+end
+
+function Pipeline:async(on)
+    self.h.flags = on and 0 or 1
+    return self
+end
+
+--- The single FFI transition that executes the whole queue.
+function Pipeline:run(keep)
+    create rc = C.lucTL_pipeline_run(self.h)
+    if rc != 0 then
+        error("lucTL.Pipeline:run: " .. last_error() ..
+              " (" .. (STATUS_NAME[rc] or rc) .. ")", 2)
+    end
+    if not keep then self.h.count = 0 end
+    return self
+end
+
+function Pipeline:wait()
+    ck(C.lucTL_pipeline_wait(self.h), "pipeline.wait")
+    return self
+end
+
+function Pipeline:elapsed_ms() return self.h.last_ms end
+function Pipeline:size()       return self.h.count end
+function Pipeline:stats()
+    return { "runs":  tonumber(self.h.total_runs), "ops":  tonumber(self.h.total_ops), "last_ms":  self.h.last_ms  }
+end
+
+--  Convenience: fused free functions mirroring the C names
+function lucTL.matmul(A, B, opts) return A:matmul(B, opts) end
+
+function lucTL.adamw(w, g, m, v, w_lp, o)
+    o = o or {}
+    ck(C.lucTL_adamw(ffi.cast("float*", w.data), g.data,
+                     ffi.cast("float*", m.data), ffi.cast("float*", v.data),
+                     w_lp and w_lp.data or nil, w.nelem, g.dtype,
+                     o.lr or 1e-3, o.beta1 or 0.9, o.beta2 or 0.999,
+                     o.eps or 1e-8, o.wd or 0.0, o.step or 1, o.clip or 0.0),
+       "adamw")
+end
+
+--- Quick sanity benchmark: effective TFLOP/s of one GEMM shape.
+function lucTL.benchmark_gemm(M, N, K, dtype, iters)
+    iters = iters or 20
+    dtype = dt_of(dtype)
+    create A = lucTL.random(M, K, 0.1, dtype)
+    create B = lucTL.random(K, N, 0.1, dtype)
+    create Cc = lucTL.zeros(M, N, dtype)
+    Cc:matmul_inplace(A, B)             -- warm up
+    lucTL.sync()
+    create t0 = os.clock()
+    do
+    create __fa = (1)
+    create __fb = (iters )
+    create __fs = 1
+    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
+    repeat 1, __fn as __j do
+        create _ = __fa + __j * __fs
+ Cc:matmul_inplace(A, B) end
+end
+    lucTL.sync()
+    create dt = (os.clock() - t0) / iters
+    A:free() B:free() Cc:free()
+    return { "seconds":  dt, "tflops":  (2.0 * M * N * K) / dt / 1e12  }
+end
+
+return lucTL

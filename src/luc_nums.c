@@ -1586,6 +1586,197 @@ LFN(f_nums_list_api){
     return 0;
 }
 
+/* ======================================================================
+ * nums.matrix element-wise math on nested lists (no autograd)
+ * ====================================================================== */
+
+enum { EW_ADD=0, EW_SUB, EW_MUL, EW_DIV, EW_POW };
+enum { EU_NEG=0, EU_ABS, EU_SQRT, EU_EXP, EU_LOG, EU_RELU, EU_SIGMOID, EU_TANH };
+
+static double ew_bin(int op,double a,double b){
+    switch(op){
+        case EW_ADD: return a+b;
+        case EW_SUB: return a-b;
+        case EW_MUL: return a*b;
+        case EW_DIV: return a/b;
+        default:     return pow(a,b);
+    }
+}
+
+static double ew_un(int op,double x){
+    switch(op){
+        case EU_NEG:     return -x;
+        case EU_ABS:     return fabs(x);
+        case EU_SQRT:    return sqrt(x);
+        case EU_EXP:     return exp(x);
+        case EU_LOG:     return log(x);
+        case EU_RELU:    return x>0?x:0;
+        case EU_SIGMOID: return x>=0?1.0/(1.0+exp(-x)):exp(x)/(1.0+exp(x));
+        default:         return tanh(x);
+    }
+}
+
+static int ew_rank(Value v){
+    int r=0;
+    while(v.t==LT_LIST){
+        Table *t=AS_TAB(v); r++;
+        if(!t->alen) break;
+        v=t->arr[0];
+    }
+    return r;
+}
+
+static Value ew_bin_rec(int op,Value a,Value b,int ra,int rb,int depth,const char *fn){
+    if(depth>64) luc_error("matrix.%s: nesting is too deep",fn);
+    int al=a.t==LT_LIST, bl=b.t==LT_LIST;
+    if(!al&&!bl){
+        if(a.t!=LT_NUM||b.t!=LT_NUM) luc_error("matrix.%s: entries must be numbers",fn);
+        return mknum(ew_bin(op,a.u.n,b.u.n));
+    }
+    Table *out=tab_new(1);
+    if(al&&bl&&ra==rb){
+        Table *ta=AS_TAB(a),*tb=AS_TAB(b);
+        int la=ta->alen,lb=tb->alen,n=0;
+        if(la==lb) n=la;
+        else if(la==1) n=lb;
+        else if(lb==1) n=la;
+        else luc_error("matrix.%s: shapes do not match (%d vs %d)",fn,la,lb);
+        for(int i=0;i<n;i++)
+            list_push(out,ew_bin_rec(op,ta->arr[la==1?0:i],tb->arr[lb==1?0:i],ra-1,rb-1,depth+1,fn));
+    }else if(al&&(!bl||ra>rb)){
+        Table *ta=AS_TAB(a);
+        for(int i=0;i<ta->alen;i++) list_push(out,ew_bin_rec(op,ta->arr[i],b,ra-1,rb,depth+1,fn));
+    }else{
+        Table *tb=AS_TAB(b);
+        for(int i=0;i<tb->alen;i++) list_push(out,ew_bin_rec(op,a,tb->arr[i],ra,rb-1,depth+1,fn));
+    }
+    return mkobj(LT_LIST,out);
+}
+
+static Value ew_un_rec(LucState *L,int base,int nargs,int op,Value v,Value fnv,int depth,const char *fn){
+    if(depth>64) luc_error("matrix.%s: nesting is too deep",fn);
+    if(v.t==LT_LIST){
+        Table *t=AS_TAB(v),*out=tab_new(1);
+        for(int i=0;i<t->alen;i++) list_push(out,ew_un_rec(L,base,nargs,op,t->arr[i],fnv,depth+1,fn));
+        return mkobj(LT_LIST,out);
+    }
+    if(op<0){
+        int scratch=base+nargs+4;
+        ensure_stack(L,scratch+4);
+        L->stack[scratch]=fnv;
+        L->stack[scratch+1]=v;
+        vm_call(L,scratch,1,1);
+        return L->stack[scratch];
+    }
+    if(v.t!=LT_NUM) luc_error("matrix.%s: entries must be numbers",fn);
+    return mknum(ew_un(op,v.u.n));
+}
+
+static int ew_is_vector(Table *t){
+    for(int i=0;i<t->alen;i++) if(t->arr[i].t==LT_LIST) return 0;
+    return 1;
+}
+
+static Value ew_softmax_rec(Value v,int depth){
+    if(depth>64) luc_error("matrix.softmax: nesting is too deep");
+    if(v.t!=LT_LIST) luc_error("matrix.softmax: expected a list");
+    Table *t=AS_TAB(v),*out=tab_new(1);
+    if(ew_is_vector(t)){
+        double mx=-INFINITY,sum=0;
+        for(int i=0;i<t->alen;i++){
+            if(t->arr[i].t!=LT_NUM) luc_error("matrix.softmax: entries must be numbers");
+            if(t->arr[i].u.n>mx) mx=t->arr[i].u.n;
+        }
+        double *e=(double*)malloc((size_t)(t->alen?t->alen:1)*sizeof(double));
+        if(!e) luc_error("matrix.softmax: out of memory");
+        for(int i=0;i<t->alen;i++){ e[i]=exp(t->arr[i].u.n-mx); sum+=e[i]; }
+        for(int i=0;i<t->alen;i++) list_push(out,mknum(e[i]/sum));
+        free(e);
+    }else{
+        for(int i=0;i<t->alen;i++) list_push(out,ew_softmax_rec(t->arr[i],depth+1));
+    }
+    return mkobj(LT_LIST,out);
+}
+
+static void ew_sum_rec(Value v,double *sum,long *cnt,int depth){
+    if(depth>64) luc_error("matrix.sum: nesting is too deep");
+    if(v.t==LT_LIST){
+        Table *t=AS_TAB(v);
+        for(int i=0;i<t->alen;i++) ew_sum_rec(t->arr[i],sum,cnt,depth+1);
+    }else if(v.t==LT_NUM){ *sum+=v.u.n; (*cnt)++; }
+    else luc_error("matrix.sum: entries must be numbers");
+}
+
+LFN(f_nums_elem_api){
+    const char *fn=self->name;
+    int op=-1;
+    if(!strcmp(fn,"add")) op=EW_ADD;
+    else if(!strcmp(fn,"sub")) op=EW_SUB;
+    else if(!strcmp(fn,"mul")) op=EW_MUL;
+    else if(!strcmp(fn,"div")) op=EW_DIV;
+    else if(!strcmp(fn,"pow")) op=EW_POW;
+    if(op>=0){
+        if(nargs!=2) luc_error("matrix.%s: expected two arguments",fn);
+        Value a=AR(0),b=AR(1);
+        RET(0,ew_bin_rec(op,a,b,ew_rank(a),ew_rank(b),0,fn)); return 1;
+    }
+    int u=-2;
+    if(!strcmp(fn,"neg")) u=EU_NEG;
+    else if(!strcmp(fn,"abs")) u=EU_ABS;
+    else if(!strcmp(fn,"sqrt")) u=EU_SQRT;
+    else if(!strcmp(fn,"exp")) u=EU_EXP;
+    else if(!strcmp(fn,"log")) u=EU_LOG;
+    else if(!strcmp(fn,"relu")) u=EU_RELU;
+    else if(!strcmp(fn,"sigmoid")) u=EU_SIGMOID;
+    else if(!strcmp(fn,"tanh")) u=EU_TANH;
+    else if(!strcmp(fn,"apply")) u=-1;
+    if(u>=-1){
+        if(u==-1){
+            if(nargs!=2) luc_error("matrix.apply: expected (list, function)");
+            Value f=AR(1);
+            if(f.t!=LT_FUNC&&f.t!=LT_CFUNC) luc_error("matrix.apply: second argument must be a function");
+            RET(0,ew_un_rec(L,base,nargs,-1,AR(0),f,0,fn)); return 1;
+        }
+        if(nargs!=1) luc_error("matrix.%s: expected one argument",fn);
+        RET(0,ew_un_rec(L,base,nargs,u,AR(0),NIL,0,fn)); return 1;
+    }
+    if(!strcmp(fn,"softmax")){
+        if(nargs!=1) luc_error("matrix.softmax: expected one list");
+        RET(0,ew_softmax_rec(AR(0),0)); return 1;
+    }
+    if(!strcmp(fn,"sum")||!strcmp(fn,"mean")){
+        int mean=!strcmp(fn,"mean");
+        if(nargs<1||nargs>2) luc_error("matrix.%s: expected (list [, axis])",fn);
+        if(nargs==1){
+            double sum=0; long cnt=0;
+            ew_sum_rec(AR(0),&sum,&cnt,0);
+            if(mean&&!cnt) luc_error("matrix.mean: list is empty");
+            RET(0,mknum(mean?sum/(double)cnt:sum)); return 1;
+        }
+        int axis=checkint(L,base,nargs,1,fn);
+        if(axis!=0&&axis!=1) luc_error("matrix.%s: axis must be 0 (columns) or 1 (rows)",fn);
+        NumsMatrix a={0,0,NULL};
+        if(!nums_matrix_read(L,base,nargs,0,fn,&a)) return 0;
+        Table *out=tab_new(1);
+        int cnt=axis==0?a.rows:a.cols;
+        if(axis==0){
+            for(int j=0;j<a.cols;j++){
+                double s=0; for(int i=0;i<a.rows;i++) s+=a.v[i*a.cols+j];
+                list_push(out,mknum(mean&&cnt?s/cnt:s));
+            }
+        }else{
+            for(int i=0;i<a.rows;i++){
+                double s=0; for(int j=0;j<a.cols;j++) s+=a.v[i*a.cols+j];
+                list_push(out,mknum(mean&&cnt?s/cnt:s));
+            }
+        }
+        nums_matrix_free(&a);
+        RET(0,mkobj(LT_LIST,out)); return 1;
+    }
+    luc_error("matrix.%s: not implemented",fn);
+    return 0;
+}
+
 static void luc_nums_open(Table *math,Table *random){
     nums_list_api=tab_new(0); nums_search_api=tab_new(0);
     nums_time_api=tab_new(0); nums_text_api=V.stringlib;
@@ -1693,6 +1884,23 @@ static void luc_nums_open(Table *math,Table *random){
     nums_list_register(nums_matrix_api,"svd",f_nums_matrix_api);
     nums_list_register(nums_matrix_api,"cholesky",f_nums_matrix_api);
     nums_list_register(nums_matrix_api,"matrixPower",f_nums_matrix_api);
+    nums_list_register(nums_matrix_api,"add",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"sub",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"mul",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"div",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"pow",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"neg",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"abs",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"sqrt",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"exp",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"log",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"relu",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"sigmoid",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"tanh",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"softmax",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"sum",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"mean",f_nums_elem_api);
+    nums_list_register(nums_matrix_api,"apply",f_nums_elem_api);
     nums_list_register(nums_sets_api,"union",f_nums_sets_api);
     nums_list_register(nums_sets_api,"intersect",f_nums_sets_api);
     nums_list_register(nums_sets_api,"difference",f_nums_sets_api);

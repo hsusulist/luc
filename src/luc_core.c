@@ -101,8 +101,9 @@ static Str *mm_cached(Str **slot,const char *name){
     if(V.loaded){ tab_set(V.loaded,mkobj(LT_STR,s),mkobj(LT_STR,s)); *slot=s; }
     return s;
 }
-static Str *g_mm_index, *g_mm_call, *g_mm_tostring;
+static Str *g_mm_index, *g_mm_call, *g_mm_tostring, *g_mm_newindex;
 #define MM_INDEX    mkobj(LT_STR,mm_cached(&g_mm_index,"__index"))
+#define MM_NEWINDEX mkobj(LT_STR,mm_cached(&g_mm_newindex,"__newindex"))
 #define MM_CALL     mkobj(LT_STR,mm_cached(&g_mm_call,"__call"))
 #define MM_TOSTRING mkobj(LT_STR,mm_cached(&g_mm_tostring,"__tostring"))
 
@@ -2918,6 +2919,18 @@ static void vm_compound(LucState *L,int which,uint32_t *pc,Value tv,Value kv,Val
         else nv=mknum(arith_num(oldv)/arith_num(vv));
     }
     (void)base;
+    if(tv.t==LT_TABLE && AS_TAB(tv)->meta){
+        Value h=tab_get(AS_TAB(tv)->meta,MM_NEWINDEX);
+        if(h.t!=LT_NIL && tab_get(AS_TAB(tv),kv).t==LT_NIL){
+            if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                L->ci[L->nci-1].savedpc=pc;
+                meta_callv(L,h,(Value[]){tv,kv,nv},3);
+                L->top=L->ci[L->nci-1].base+L->ci[L->nci-1].cl->p->maxstack;
+                return;
+            }
+            if(h.t==LT_TABLE){ vm_setindex(h,kv,nv); return; }
+        }
+    }
     vm_setindex(tv,kv,nv);
 }
 
@@ -3030,6 +3043,20 @@ static void vm_execute(LucState *L,int baselevel){
                             tb->arr[i]=vv; VM_NEXT;
                         }
                     }
+                }
+            }
+            if(tv.t==LT_TABLE && AS_TAB(tv)->meta){
+                /* __newindex: only for keys the table does not hold itself */
+                Value h=tab_get(AS_TAB(tv)->meta,MM_NEWINDEX);
+                if(h.t!=LT_NIL && tab_get(AS_TAB(tv),kv).t==LT_NIL){
+                    if(h.t==LT_FUNC||h.t==LT_CFUNC){
+                        ci->savedpc=pc;
+                        meta_callv(L,h,(Value[]){tv,kv,vv},3);
+                        ci=&L->ci[L->nci-1]; base=L->stack+ci->base; pc=ci->savedpc;
+                        L->top=ci->base+pr->maxstack;
+                        VM_NEXT;
+                    }
+                    if(h.t==LT_TABLE){ vm_setindex(h,kv,vv); VM_NEXT; }
                 }
             }
             vm_setindex(base[A],base[GET_B(ins)],base[GET_C(ins)]);
@@ -4243,52 +4270,63 @@ static int pkg_fetch(const char *rel,const char *tmp,const char *label,long *siz
     return ok;
 }
 
-/* Bundle format: "#=lucpkg: name" header, "#=lucfile: <name>" starts a file, "#=endpkg" ends.
-   All-or-nothing: the whole bundle is validated, written as <name>.part files, and only then
-   renamed over the old files - a broken download never leaves half-updated modules. */
-static int pkg_unpack_bundle(const char *path,const char *outdir){
+/* (a part's text may start with blank lines, so a header line ends at exactly one line break)
+   Package file = a .luic container (same framing as `luc pack`):
+       !luic1
+       lib <name>
+       parts <n>
+       ==== <file name> <byte size>
+       <exactly size bytes>
+       ...
+   Parts here are real file names (ai.luc, matrix.luc ...), so a package is not meant to be
+   loaded with `import` - luc pack's own part names are plain identifiers and are rejected
+   by `luc <pkg>.luic`, which keeps the two kinds from being mixed up.
+   All-or-nothing: the whole file is checked first, every part is written as <name>.part,
+   and only then renamed over the old files - a broken download never leaves half-updated
+   modules. Returns the number of files written, or -1 (nothing changed). */
+static int pkg_unpack_bundle(const char *path,const char *outdir,const char *libname){
     int len; char *src=read_file(path,&len);
-    char names[128][256];
-    int count=0, pass, ok=1;
+    char names[128][128]; const char *bodies[128]; int sizes[128];
+    int count=0, want=0, ok=1;
+    const char *p, *end;
+    char line[300];
     if(!src) return -1;
-    if(len<9 || strncmp(src,"#=lucpkg:",9)!=0){ free(src); return -1; }   /* e.g. an HTML error page */
-    for(pass=0;pass<2 && ok;pass++){
-        FILE *cur=NULL;
-        size_t i=0;
-        count=0;
-        while(i<(size_t)len){
-            char *line=src+i;
-            char *nl=(char*)memchr(line,'\n',(size_t)len-i);
-            size_t ll=nl? (size_t)(nl-line) : (size_t)len-i;
-            size_t wl=ll;
-            if(wl>0 && line[wl-1]=='\r') wl--;
-            if(wl>=11 && !strncmp(line,"#=lucfile: ",11)){
-                size_t n2=wl-11;
-                if(cur){ if(fclose(cur)!=0) ok=0; cur=NULL; }
-                if(n2==0 || n2>=sizeof names[0] || count>=128){ ok=0; break; }
-                memcpy(names[count],line+11,n2); names[count][n2]=0;
-                if(strchr(names[count],'/')||strchr(names[count],'\\')||strchr(names[count],':')||
-                   names[count][0]=='.'){ ok=0; break; }
-                if(pass==1){
-                    char out[1400];
-                    snprintf(out,sizeof out,"%s/%s.part",outdir,names[count]);
-                    cur=fopen(out,"wb");
-                    if(!cur){ ok=0; break; }
-                }
-                count++;
-            } else if(wl>=8 && !strncmp(line,"#=endpkg",8)){
-                if(cur){ if(fclose(cur)!=0) ok=0; cur=NULL; }
-            } else if(wl>=9 && !strncmp(line,"#=lucpkg:",9)){
-                /* header */
-            } else if(cur){
-                if(fwrite(line,1,wl,cur)!=wl || fputc('\n',cur)==EOF){ ok=0; break; }
-            }
-            i+=ll+(nl?1:0);
+    p=src; end=src+len;
+#define PKG_LINE() do{ size_t n_=0; while(p<end&&*p!='\n'&&*p!='\r'){ if(n_+1<sizeof line) line[n_]=*p; n_++; p++; } \
+        line[n_<sizeof line?n_:sizeof line-1]=0; if(p<end&&*p=='\r') p++; if(p<end&&*p=='\n') p++; }while(0)
+    PKG_LINE();
+    if(strcmp(line,"!luic1")!=0) ok=0;                         /* e.g. an HTML error page */
+    if(ok){ PKG_LINE(); if(strncmp(line,"lib ",4)!=0||strcmp(line+4,libname)!=0) ok=0; }
+    if(ok){ PKG_LINE(); if(sscanf(line,"parts %d",&want)!=1||want<1||want>128) ok=0; }
+    while(ok && count<want){
+        char pn[128]; int blen=-1;
+        PKG_LINE();
+        if(sscanf(line,"==== %127s %d",pn,&blen)!=2||blen<0||blen>end-p){ ok=0; break; }
+        for(int i=0;pn[i];i++){
+            unsigned char c=(unsigned char)pn[i];
+            if(!(isalnum(c)||c=='_'||c=='.'||c=='-')) ok=0;     /* no path separators, no ':' */
         }
-        if(cur){ if(fclose(cur)!=0) ok=0; }
-        if(count==0) ok=0;
+        if(pn[0]=='.') ok=0;
+        if(!ok) break;
+        memcpy(names[count],pn,strlen(pn)+1);
+        bodies[count]=p; sizes[count]=blen;
+        p+=blen;
+        if(p<end&&*p=='\r') p++;
+        if(p<end&&*p=='\n') p++; else { ok=0; break; }
+        count++;
     }
-    free(src);
+#undef PKG_LINE
+    if(ok){
+        for(int k=0;k<count&&ok;k++){
+            char out[1400];
+            FILE *f;
+            snprintf(out,sizeof out,"%s/%s.part",outdir,names[k]);
+            f=fopen(out,"wb");
+            if(!f){ ok=0; break; }
+            if(sizes[k]>0 && fwrite(bodies[k],1,(size_t)sizes[k],f)!=(size_t)sizes[k]) ok=0;
+            if(fclose(f)!=0) ok=0;
+        }
+    }
     for(int k=0;k<count;k++){
         char part[1400],dest[1400];
         snprintf(part,sizeof part,"%s/%s.part",outdir,names[k]);
@@ -4300,21 +4338,22 @@ static int pkg_unpack_bundle(const char *path,const char *outdir){
         if(rename(part,dest)!=0){ remove(part); ok=0; }
 #endif
     }
+    free(src);
     return ok? count : -1;
 }
 
-/* ai / discord: one .lucpkg bundle unpacked into luc_modules next to luc.exe */
+/* ai / discord: one .luic package unpacked into luc_modules next to luc.exe */
 static int pkg_install_bundle(const char *name){
     char mods[1200],tmp[1300],rel[256],label[64];
     long sz=0;
     int n;
     pkg_install_path(mods,sizeof mods,"luc_modules");
     pkg_mkdir(mods);
-    snprintf(tmp,sizeof tmp,"%s/%s.lucpkg.tmp",mods,name);
-    snprintf(rel,sizeof rel,"packages/%s.lucpkg",name);
+    snprintf(tmp,sizeof tmp,"%s/%s.luic.tmp",mods,name);
+    snprintf(rel,sizeof rel,"packages/%s.luic",name);
     snprintf(label,sizeof label,"%s",name);
     if(!pkg_fetch(rel,tmp,label,&sz)){ remove(tmp); pkg_report_fail(rel); return 1; }
-    n=pkg_unpack_bundle(tmp,mods);
+    n=pkg_unpack_bundle(tmp,mods,name);
     remove(tmp);
     if(n<=0){
         fprintf(stderr,"luc install: the downloaded %s package is damaged; nothing was changed\n",name);
@@ -4753,7 +4792,7 @@ static void print_help(void){
     "  import x from lib   load part x (or symbol x) from lib.luic / lib.luc\n\n"
     "internals\n"
     "  lexer -> parser -> AST -> bytecode -> VM  (mark & sweep GC)\n"
-    "  metatable-lite: __index __call __add..__pow __unm __tostring\n",
+    "  metatable-lite: __index __newindex __call __add..__pow __unm __tostring\n",
     LUC_VERSION);
 }
 

@@ -378,6 +378,7 @@ end
 end
 
 function Transformer:forward(ids)
+    ids = matrix.to_table(ids)   -- accept LUC lists of ids
     if type(ids) != "table" or len(ids) == 0 then
         error("Transformer:forward: need a non-empty table of token ids", 2)
     end
@@ -847,6 +848,7 @@ end
 --- Much faster on CPU prompts
 --- Uses teacher-forced pass
 function Transformer:prefill(ids, state)
+    ids = matrix.to_table(ids)   -- accept LUC lists of ids
     if type(ids) != "table" or len(ids) == 0 then
         error("Transformer:prefill: need a non-empty table of token ids", 2)
     end

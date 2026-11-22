@@ -14,11 +14,11 @@ do
     if ffi then
         create ok = pcall(ffi.cdef, [=[
             typedef long time_t2_;
-            struct luatl_tv { long tv_sec; long tv_usec; };
-            int gettimeofday(struct luatl_tv *tv, void *tz);
+            struct luctl_tv { long tv_sec; long tv_usec; };
+            int gettimeofday(struct luctl_tv *tv, void *tz);
         ]=])
         if ok and ffi.os != "Windows" then
-            create tv = ffi.new("struct luatl_tv")
+            create tv = ffi.new("struct luctl_tv")
             now = function()
                 ffi.C.gettimeofday(tv, nil)
                 return tonumber(tv.tv_sec) + tonumber(tv.tv_usec) * 1e-6

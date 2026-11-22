@@ -1,5 +1,5 @@
 -- GPU-resident benchmark: full forward + backward + AdamW step, GEMM baseline, CPU wall time.
--- Usage: luajit bench_gpu_transformer.lua [dim layers heads ffn batch seq vocab]
+-- Usage: luc bench_gpu_transformer.luc [dim layers heads ffn batch seq vocab]
 
 package.path = package.path .. ";./ai/core/?.lua;./ai/nn/?.lua;./ai/gpu/?.lua;./?.lua"
 
@@ -7,7 +7,17 @@ create lmlog = require("lmlog")
 create now   = lmlog.now
 create sf    = string.format
 
-create A = { 1:  ...  }
+-- all varargs as a 1-based table (Lua {...}; "{ 1: ... }" kept only the first)
+
+create A = {}
+
+do
+
+    create __n, __i = select("#", ...), 1
+
+    while __i <= __n do A[__i] = (select(__i, ...)) __i = __i + 1 end
+
+end
 create dim    = tonumber(A[1]) or 256
 create layers = tonumber(A[2]) or 4
 create heads  = tonumber(A[3]) or 8
@@ -18,8 +28,8 @@ create vocab  = tonumber(A[7]) or 4096
 create ITERS  = tonumber(A[8]) or 30
 create WARM   = 5
 
-create adapter = require("luatl_adapter")
-assert(adapter.available, "luaTL not available: " .. tostring(adapter.error))
+create adapter = require("luctl_adapter")
+assert(adapter.available, "lucTL not available: " .. tostring(adapter.error))
 create hw = adapter.hardware()
 
 print("=====================================================================")
@@ -32,10 +42,10 @@ print("=====================================================================")
 -- ---------------------------------------------------------------------
 --  0. Reference ceiling: a resident GEMM of comparable arithmetic size
 -- ---------------------------------------------------------------------
-create luaTL = adapter.luaTL
+create lucTL = adapter.lucTL
 do
     create M, N, K = bs * seq, ffn, dim
-    create r = luaTL.benchmark_gemm(M, N, K, "f32", 20)
+    create r = lucTL.benchmark_gemm(M, N, K, "f32", 20)
     print(sf("[0] resident GEMM %dx%dx%d           : %8.1f GFLOP/s",
           M, N, K, r.tflops * 1000))
 end
@@ -192,7 +202,7 @@ print("---------------------------------------------------------------------")
 create small = (dim * layers * ffn * bs * seq <= 256 * 2 * 512 * 4 * 64)
 if not small then
     print("[4] CPU baseline skipped (config too large; rerun with e.g.")
-    print("    luajit bench_gpu_transformer.lua 128 2 4 256 4 64 512 5)")
+    print("    luc bench_gpu_transformer.luc 128 2 4 256 4 64 512 5)")
 else
     create okc, LMTrain = pcall(require, "lmtrain")
     if not okc then

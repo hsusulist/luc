@@ -1,5 +1,23 @@
 -- Discord bot (import discord). Needs a token + MESSAGE CONTENT / SERVER MEMBERS intents.
--- Groups: bot.msg, bot.user, bot.slash, bot.debug, bot.embed, bot.buttons, bot.select.
+-- Groups: bot.msg, bot.user, bot.slash, bot.debug, bot.embed, bot.buttons, bot.select,
+--         bot.modal, bot.voice, bot.channels (+ bot.status, bot.guard/cooldown/need, bot.args).
+-- New: slash options/sub-commands/ephemeral/defer, modals, context menus, reactions,
+--      kick/ban/timeout/roles, reply/pin/thread/file upload, presence, permission checks,
+--      events: user.leave, msg.reaction/edited/deleted, voice.update, channels.created/deleted.
+--      bot.lasterror() = text of the last failed API call.
+--
+-- Quick tour (every call also works as bot:fn(...)):
+--   bot.status("with luc", "playing")                       presence (before or after run)
+--   bot.slash.new({ "name": "echo", "options": [{ "name": "text", "type": "string", "required": true }] })
+--   bot.slash.slash("echo")  bot.slash.get("text")  bot.slash.reply("hi", true)   -- true = only they see it
+--   bot.slash.defer()  ...slow work...  bot.slash.reply("done")                   -- commands > 3 s
+--   bot.modal.show("id", "Title", [{ "id": "a", "label": "A" }])  vals = bot.modal.wait("id")
+--   cmd = bot.prefix("!")  bot.args()  bot.arg(1)                                  -- "!ban @x spam"
+--   if bot.guard({ "perm": "ban", "cooldown": 5 }) then bot.user.ban(bot.arg(1), "spam") end
+--   bot.msg.react("👍")  bot.msg.reply("ok")  bot.msg.pin()  bot.msg.thread("topic")
+--   bot.msg.file("pic.png", "#general", "caption")   bot.msg.reaction()   bot.msg.edited()
+--   bot.user.kick/ban/unban/timeout/untimeout/addrole/removerole   bot.user.can("kick")
+-- Intents: guilds, members, messages + content, reactions, voice states.
 -- bot:run(token) only starts the bot (throws on failure); silent unless LUC_WSDEBUG=1.
 -- NOTE: bot.prefix / bot.user.join / cmd.slash BLOCK per event (own task); unmatched stay queued.
 import net("dn")
@@ -8,6 +26,7 @@ create json = require("json")
 create API = "https://discord.com/api/v10"
 create GW = "wss://gateway.discord.gg/?v=10&encoding=json"
 if gw_test_url != nil then GW = gw_test_url end
+if api_test_url != nil then API = api_test_url end
 
 create B = {
     "token": nil, "ws": nil, "seq": nil, "session": nil, "app": nil,
@@ -18,6 +37,8 @@ create B = {
     "guilds": {}, "channels": {}, "members": {},
     "pending": [], "cur": nil,
     "paused": false, "running": false, "on": true,
+    "evq": [], "voice": {}, "cd": {}, "presence": nil, "err": nil,
+    "blocked": 0, "sendlog": {},
 }
 
 create bot = {}
@@ -38,30 +59,148 @@ create function auth()
     return "Authorization: Bot " .. B.token .. "\r\nUser-Agent: DiscordBot (luc, 0.2.0-beta-1)"
 end
 
--- REST with one 429 retry. Returns body, code.
-create function rest(method, path, body)
-    create url = API .. path
-    create payload = nil
-    if body != nil then payload = json.encode(body) end
-    create r = nil
-    create code = 0
-    if method == "GET" then
-        r, code = dn.get(url, auth())
-    else
-        r, code = dn.request(method, url, payload, "application/json", auth())
+-- Rate limits. Discord allows about 5 messages per 5 seconds in one channel and
+-- answers 429 with a retry_after when you go over (a "global" 429 blocks every
+-- route). pace() makes the bot wait BEFORE sending, so the server rarely has to
+-- say no; rest_raw still honours any 429 that does come back.
+-- bot.debug.rate_limited / bot.debug.paced count both cases.
+create function is_msg_post(method, path)
+    if method != "POST" then return false end
+    if not string.startswith(path, "/channels/") then return false end
+    return string.endswith(path, "/messages")
+end
+
+-- wall-clock seconds: os.now() (new luc.exe); os.clock() is wall time on Windows anyway
+create function wall()
+    if os.now != nil then return os.now() end
+    return os.clock()
+end
+
+create function pace(method, path)
+    create now = wall()
+    if B.blocked > now then
+        task.wait(B.blocked - now)
+        now = wall()
     end
-    if code == 429 and r != nil then
-        create t = json.decode(r)
-        create wait = 1
-        if t.retry_after != nil then wait = t.retry_after end
-        task.wait(wait)
-        if method == "GET" then
-            r, code = dn.get(url, auth())
-        else
-            r, code = dn.request(method, url, payload, "application/json", auth())
+    if not is_msg_post(method, path) then return end
+    create old = B.sendlog[path]
+    create keep = []
+    if old != nil then
+        repeat t, i in old do
+            if t > now - 5.2 then keep:append(t) end
         end
     end
+    if keep:len() >= 5 then
+        create w = keep[0] + 5.2 - now
+        if w > 0 then
+            bot.debug.paced = (bot.debug.paced or 0) + 1
+            task.wait(w)
+            now = wall()
+        end
+        create k2 = []
+        create j = 1
+        while j < keep:len() do
+            k2:append(keep[j])
+            j = j + 1
+        end
+        keep = k2
+    end
+    keep:append(now)
+    B.sendlog[path] = keep
+end
+
+-- REST core: retries 429 (honours retry_after, up to 5 tries) and one 5xx.
+-- Returns body, code. On any >= 400 the API message is kept for bot.lasterror().
+-- A string body is sent as-is (raw JSON); tables are json.encode'd.
+create function rest_raw(method, path, payload, ctype, extra)
+    create url = API .. path
+    create hdr = auth()
+    if extra != nil then hdr = hdr .. "\r\n" .. extra end
+    create tries = 0
+    create r = nil
+    create code = 0
+    while tries < 5 do
+        tries = tries + 1
+        pace(method, path)
+        if method == "GET" then
+            r, code = dn.get(url, hdr)
+        else
+            r, code = dn.request(method, url, payload, ctype or "application/json", hdr)
+        end
+        if r == nil or type(code) != "number" then break end
+        if code == 429 then
+            create ok, t = pcall(function() return json.decode(r) end)
+            create wait = 1
+            if ok and type(t) == "table" and t.retry_after != nil then wait = t.retry_after end
+            bot.debug.rate_limited = (bot.debug.rate_limited or 0) + 1
+            -- a "global" limit blocks every route until it is over
+            if ok and type(t) == "table" and t["global"] == true then
+                B.blocked = wall() + wait + 0.05
+            end
+            if wait > 30 then
+                -- a ban-length wait (Cloudflare): do not sleep on it, report it
+                B.err = "rate limited for " .. tostring(math.floor(wait)) .. "s (429)"
+                return r, code
+            end
+            task.wait(wait + 0.05)
+        elseif code >= 500 and code < 600 and tries < 2 then
+            task.wait(1)
+        else
+            break
+        end
+    end
+    if r != nil and type(code) == "number" and code >= 400 then
+        create ok2, t2 = pcall(function() return json.decode(r) end)
+        if ok2 and type(t2) == "table" and t2.message != nil then
+            B.err = tostring(t2.message) .. " (" .. tostring(code) .. ")"
+        else
+            B.err = "http " .. tostring(code)
+        end
+    elseif r != nil then
+        B.err = nil
+    end
     return r, code
+end
+
+create function rest(method, path, body, extra)
+    create payload = nil
+    if type(body) == "string" then payload = body
+    elseif body != nil then payload = json.encode(body) end
+    if payload == nil and (method == "PUT" or method == "POST" or method == "PATCH") then
+        payload = "{}"   -- the API wants a Content-Length on these
+    end
+    return rest_raw(method, path, payload, nil, extra)
+end
+
+-- (r, code) -> true on any 2xx, else nil + the API's message
+create function ok_call(r, code)
+    if r == nil then return nil, code end
+    if type(code) == "number" and code >= 200 and code < 300 then return true end
+    return nil, B.err or tostring(code)
+end
+
+-- percent-encode (emoji, audit-log reasons)
+create function urlenc(s)
+    s = tostring(s)
+    create out = ""
+    create i = 1
+    create n = string.len(s)
+    while i <= n do
+        create c = string.sub(s, i, i)
+        create b = string.byte(s, i)
+        if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or c == "-" or c == "_" or c == "." or c == "~" then
+            out = out .. c
+        else
+            out = out .. "%" .. string.tohex(c)
+        end
+        i = i + 1
+    end
+    return out
+end
+
+create function reason_hdr(reason)
+    if reason == nil then return nil end
+    return "X-Audit-Log-Reason: " .. urlenc(string.sub(tostring(reason), 1, 100))
 end
 
 create function gw_send(t)
@@ -76,6 +215,11 @@ create function cache_guild(g)
     if g.channels != nil then
         repeat ch, i in g.channels do
             B.channels[ch.id] = { "name": ch.name, "guild": g.id }
+        end
+    end
+    if g.voice_states != nil then
+        repeat v, i in g.voice_states do
+            if v.channel_id != nil then B.voice[v.user_id] = v.channel_id end
         end
     end
     if g.members != nil then
@@ -96,22 +240,52 @@ create function flush_pending()
             path = "/applications/" .. B.app .. "/guilds/" .. p.guild .. "/commands"
         end
         create r, code = rest("POST", path, p.b)
-        if code == 429 then keep:append(p) end
+        if code == 429 then keep:append(p)
+        elseif code != 200 and code != 201 then
+            bot.debug.slash_error = tostring(p.b.name) .. ": " .. tostring(B.err or code)
+        end
     end
     B.pending = keep
 end
 
 -- interaction answer with a full data object (content/embeds/components).
--- interaction_reply(text) is the text-only shortcut.
-create function interaction_send(data)
+-- First answer = callback; after bot.slash.defer() it edits the "thinking"
+-- message; any later answer is a followup. kind: 4 message (default),
+-- 7 = update the message a button/select sits on.
+create function interaction_send(data, kind)
     create cur = B.cur
     if cur == nil or cur.kind != "int" then return nil, "no interaction" end
-    create r, code = rest("POST",
+    create app = cur.app or B.app
+    if cur.ephemeral == true and data.flags == nil then data.flags = 64 end
+    create r = nil
+    create code = 0
+    if cur.replied then
+        r, code = rest("POST", "/webhooks/" .. tostring(app) .. "/" .. cur.itoken, data)
+        if r == nil then return nil, code end
+        if type(code) == "number" and code >= 200 and code < 300 then
+            create ok, t = pcall(function() return json.decode(r) end)
+            if ok and type(t) == "table" then return true, t.id end
+            return true
+        end
+        return nil, B.err or r
+    end
+    if cur.deferred then
+        data.flags = nil   -- editing the "thinking" message: privacy was fixed at defer time
+        r, code = rest("PATCH", "/webhooks/" .. tostring(app) .. "/" .. cur.itoken .. "/messages/@original", data)
+        cur.replied = true
+        if r == nil then return nil, code end
+        if code == 200 then return true end
+        return nil, B.err or r
+    end
+    r, code = rest("POST",
         "/interactions/" .. cur.iid .. "/" .. cur.itoken .. "/callback",
-        { "type": 4, "data": data })
+        { "type": kind or 4, "data": data })
     if r == nil then return nil, code end
-    if code == 204 or code == 200 then return true end
-    return nil, r
+    if code == 204 or code == 200 then
+        cur.replied = true
+        return true
+    end
+    return nil, B.err or r
 end
 
 create function interaction_reply(text)
@@ -149,6 +323,224 @@ create function debug_servers()
         if g != nil then n = n + 1 end
     end
     bot.debug.servers = n
+end
+
+-- ---- helpers: events, permissions, ids ----
+-- permission bit per name (Discord permission flags); admin always wins
+create PERMS = {
+    "admin": 8, "administrator": 8, "kick": 2, "ban": 4,
+    "channels": 16, "manage_channels": 16, "guild": 32, "manage_guild": 32,
+    "audit": 128, "messages": 8192, "manage_messages": 8192,
+    "mention_everyone": 131072, "nicknames": 134217728,
+    "roles": 268435456, "manage_roles": 268435456,
+    "moderate": 1099511627776, "timeout": 1099511627776
+}
+-- same flags as strings (default_member_permissions wants a string)
+create PERMSTR = {
+    "admin": "8", "administrator": "8", "kick": "2", "ban": "4",
+    "channels": "16", "manage_channels": "16", "guild": "32", "manage_guild": "32",
+    "audit": "128", "messages": "8192", "manage_messages": "8192",
+    "mention_everyone": "131072", "nicknames": "134217728",
+    "roles": "268435456", "manage_roles": "268435456",
+    "moderate": "1099511627776", "timeout": "1099511627776"
+}
+
+-- event queue for the extra gateway events (reaction/edit/delete/leave/voice/channel)
+create function push_ev(ev)
+    B.evq:append(ev)
+    if B.evq:len() > 500 then
+        create nq = []
+        create k = 1
+        while k < B.evq:len() do
+            nq:append(B.evq[k])
+            k = k + 1
+        end
+        B.evq = nq
+    end
+end
+
+create function has_bit(p, bit)
+    if p == nil then return false end
+    return math.floor(p / bit) % 2 == 1
+end
+
+create function list_has(list, v)
+    if list == nil then return false end
+    repeat x, i in list do
+        if x == v then return true end
+    end
+    return false
+end
+
+-- does this member have a permission? `given` = permission string an
+-- interaction hands us; otherwise computed from role ids + cached guild roles.
+create function can_bit(guild, uid, roles, given, bit)
+    if given != nil then
+        create gp = tonumber(given)
+        return has_bit(gp, 8) or has_bit(gp, bit)
+    end
+    if guild == nil or uid == nil then return false end
+    create g = B.guilds[guild]
+    if g == nil then return false end
+    if g.owner_id == uid then return true end
+    if g.roles == nil then return false end
+    repeat r, i in g.roles do
+        if r.id == guild or list_has(roles, r.id) then
+            create p = tonumber(r.permissions)
+            if has_bit(p, 8) or has_bit(p, bit) then return true end
+        end
+    end
+    return false
+end
+
+-- server to act in: explicit id, else where the command ran, else the only server
+create function guild_of(g)
+    if g != nil then return g end
+    if B.cur != nil and B.cur.guild != nil then return B.cur.guild end
+    create only = nil
+    create n = 0
+    repeat id, gg in B.guilds do
+        n = n + 1
+        only = id
+    end
+    if n == 1 then return only end
+    return nil
+end
+
+-- "<@123>", "<@!123>", a raw id, or a known name -> id
+create function parse_user(s)
+    if s == nil then return nil end
+    s = string.trim(tostring(s))
+    if string.sub(s, 1, 2) == "<@" then
+        create t = string.sub(s, 3)
+        if string.sub(t, 1, 1) == "!" then t = string.sub(t, 2) end
+        create e = string.find(t, ">")
+        if e != nil then t = string.sub(t, 1, e - 1) end
+        return t
+    end
+    -- a name the bot has seen, else a plain number = already an id
+    create known = bot.user.getid(s)
+    if known != nil then return known end
+    if tonumber(s) != nil then return s end
+    return nil
+end
+
+-- role by id, "<@&id>" or name (case-insensitive)
+create function role_id(guild, want)
+    if want == nil then return nil end
+    want = tostring(want)
+    if string.sub(want, 1, 3) == "<@&" then
+        create t = string.sub(want, 4)
+        create e = string.find(t, ">")
+        if e != nil then t = string.sub(t, 1, e - 1) end
+        return t
+    end
+    create g = nil
+    if guild != nil then g = B.guilds[guild] end
+    if g == nil or g.roles == nil then return want end
+    create lw = string.lower(want)
+    repeat r, i in g.roles do
+        if r.id == want or string.lower(r.name) == lw then return r.id end
+    end
+    return want
+end
+
+create function fetch_roles(guild, uid)
+    create r, code = rest("GET", "/guilds/" .. guild .. "/members/" .. uid, nil)
+    if r == nil or code != 200 then return nil end
+    create t = json.decode(r)
+    return t.roles
+end
+
+create function split_words(s)
+    create out = []
+    create i = 1
+    create n = string.len(s)
+    create cur = ""
+    while i <= n do
+        create c = string.sub(s, i, i)
+        if c == " " or c == "\t" then
+            if string.len(cur) > 0 then
+                out:append(cur)
+                cur = ""
+            end
+        else
+            cur = cur .. c
+        end
+        i = i + 1
+    end
+    if string.len(cur) > 0 then out:append(cur) end
+    return out
+end
+
+create function basename(p)
+    create i = string.len(p)
+    while i > 0 do
+        create c = string.sub(p, i, i)
+        if c == "/" or c == "\\" then return string.sub(p, i + 1) end
+        i = i - 1
+    end
+    return p
+end
+
+-- seconds since epoch (UTC) -> "2026-11-14T07:30:00Z"
+create function iso_utc(t)
+    create days = math.floor(t / 86400)
+    create secs = t - days * 86400
+    create z = days + 719468
+    create era = math.floor(z / 146097)
+    create doe = z - era * 146097
+    create yoe = math.floor((doe - math.floor(doe / 1460) + math.floor(doe / 36524) - math.floor(doe / 146096)) / 365)
+    create y = yoe + era * 400
+    create doy = doe - (365 * yoe + math.floor(yoe / 4) - math.floor(yoe / 100))
+    create mp = math.floor((5 * doy + 2) / 153)
+    create d = doy - math.floor((153 * mp + 2) / 5) + 1
+    create m = mp + 3
+    if mp >= 10 then m = mp - 9 end
+    if m <= 2 then y = y + 1 end
+    create hh = math.floor(secs / 3600)
+    create mi = math.floor((secs - hh * 3600) / 60)
+    create ss = math.floor(secs - hh * 3600 - mi * 60)
+    return string.format("%04d-%02d-%02dT%02d:%02d:%02dZ", y, m, d, hh, mi, ss)
+end
+
+-- slash options: fill out[name] = value, return the sub-command ("add" / "list")
+create function flatten_opts(list, out)
+    create sub = nil
+    if list == nil then return nil end
+    repeat o, i in list do
+        if o.type == 1 or o.type == 2 then
+            sub = o.name
+            if o.options != nil then
+                repeat p, j in o.options do
+                    if p.type == 1 then
+                        sub = sub .. " " .. p.name
+                        if p.options != nil then
+                            repeat q, k in p.options do
+                                out[q.name] = q.value
+                            end
+                        end
+                    else
+                        out[p.name] = p.value
+                    end
+                end
+            end
+        else
+            out[o.name] = o.value
+        end
+    end
+    return sub
+end
+
+-- the "current context" for an interaction event (what B.cur holds while a
+-- slash command / button / select / modal handler runs)
+create function make_cur(ev)
+    return { "kind": "int", "iid": ev.id, "itoken": ev.token, "channel": ev.channel,
+             "author": ev.author, "app": ev.app, "uid": ev.uid, "guild": ev.guild,
+             "perms": ev.perms, "opts": ev.opts, "sub": ev.sub, "target": ev.target,
+             "tname": ev.tname, "tcontent": ev.tcontent, "resolved": ev.resolved,
+             "fields": ev.fields, "mid": ev.mid, "cmd": ev.name or ev.cid,
+             "comp": ev.kind == "comp", "replied": false, "deferred": false, "ephemeral": false }
 end
 
 -- heartbeat with explicit null seq: the gateway requires "d":null
@@ -197,8 +589,10 @@ create function handle_packet(m)
         if B.session != nil and B.seq != nil then
             gw_send({ "op": 6, "d": { "token": B.token, "session_id": B.session, "seq": B.seq } })
         else
-            gw_send({ "op": 2, "d": { "token": B.token, "intents": 33283,
-                "properties": { "os": "windows", "browser": "luc", "device": "luc" } } })
+            create idf = { "token": B.token, "intents": 34435,
+                "properties": { "os": "windows", "browser": "luc", "device": "luc" } }
+            if B.presence != nil then idf.presence = B.presence end
+            gw_send({ "op": 2, "d": idf })
         end
         return
     end
@@ -247,11 +641,13 @@ create function handle_packet(m)
     if ev == "MESSAGE_CREATE" then
         if d.author == nil then return end
         B.members[d.author.id] = { "name": d.author.username }
-        B.msgq:append({ "kind": "msg", "id": d.id, "content": d.content,
-            "channel": d.channel_id, "guild": d.guild_id,
+        create mroles = nil
+        if d.member != nil then mroles = d.member.roles end
+        B.msgq:append({ "kind": "msg", "id": d.id, "mid": d.id, "content": d.content,
+            "channel": d.channel_id, "guild": d.guild_id, "roles": mroles,
             "author": d.author.username, "uid": d.author.id })
         -- live cache for all-channel lookups (non-destructive, capped)
-        B.recent:append({ "content": d.content, "channel": d.channel_id,
+        B.recent:append({ "id": d.id, "content": d.content, "channel": d.channel_id,
             "author": d.author.username, "uid": d.author.id })
         if B.recent:len() > 200 then
             create nq = []
@@ -268,24 +664,72 @@ create function handle_packet(m)
         if d.data == nil then return end
         create uid = nil
         create aname = nil
+        create perms = nil
         if d.member != nil and d.member.user != nil then
             uid = d.member.user.id
             aname = d.member.user.username
+            perms = d.member.permissions
         elseif d.user != nil then
             uid = d.user.id
             aname = d.user.username
         end
+        if uid != nil and aname != nil then B.members[uid] = { "name": aname } end
         if d.application_id != nil then B.app = d.application_id end
+        create imid = nil
+        if d.message != nil then imid = d.message.id end
         if d.type == 3 and d.data.component_type != nil then
             -- button (2) or select (3): queued for buttons:click / select:choose
             B.intq:append({ "kind": "comp", "ctype": d.data.component_type,
                 "cid": d.data.custom_id, "values": d.data.values,
                 "id": d.id, "token": d.token, "channel": d.channel_id,
-                "uid": uid, "author": aname, "app": d.application_id })
+                "uid": uid, "author": aname, "app": d.application_id,
+                "guild": d.guild_id, "perms": perms, "mid": imid })
             return
         end
+        if d.type == 5 then
+            -- modal submit: custom_id + { field id: text }
+            create fields = {}
+            if d.data.components != nil then
+                repeat row, ri in d.data.components do
+                    if row.components != nil then
+                        repeat ci, cj in row.components do
+                            if ci.custom_id != nil then fields[ci.custom_id] = ci.value end
+                        end
+                    end
+                end
+            end
+            B.intq:append({ "kind": "modal", "cid": d.data.custom_id, "fields": fields,
+                "id": d.id, "token": d.token, "channel": d.channel_id,
+                "uid": uid, "author": aname, "app": d.application_id,
+                "guild": d.guild_id, "perms": perms, "mid": imid })
+            return
+        end
+        if d.type == 4 then return end   -- autocomplete: not handled
+        -- slash command (data.type 1), user menu (2) or message menu (3)
+        create opts = {}
+        create sub = flatten_opts(d.data.options, opts)
+        create tid = d.data.target_id
+        create tname = nil
+        create tcontent = nil
+        create res = d.data.resolved
+        if res != nil then
+            if res.users != nil then
+                repeat uk, uv in res.users do
+                    B.members[uk] = { "name": uv.username }
+                end
+            end
+            if tid != nil then
+                if res.users != nil and res.users[tid] != nil then tname = res.users[tid].username end
+                if res.messages != nil and res.messages[tid] != nil then
+                    tcontent = res.messages[tid].content
+                end
+            end
+        end
         B.intq:append({ "kind": "int", "id": d.id, "token": d.token,
-            "name": d.data.name, "channel": d.channel_id, "uid": uid, "app": d.application_id })
+            "name": d.data.name, "channel": d.channel_id, "uid": uid,
+            "author": aname, "app": d.application_id, "guild": d.guild_id,
+            "perms": perms, "opts": opts, "sub": sub, "target": tid,
+            "tname": tname, "tcontent": tcontent, "resolved": res, "mid": imid })
         return
     end
     if ev == "GUILD_MEMBER_ADD" then
@@ -293,6 +737,131 @@ create function handle_packet(m)
             B.members[d.user.id] = { "name": d.user.username }
             B.joinq:append({ "kind": "join", "uid": d.user.id,
                 "name": d.user.username, "guild": d.guild_id })
+        end
+        return
+    end
+    if ev == "MESSAGE_UPDATE" then
+        if d.content == nil or d.author == nil then return end
+        repeat m, i in B.recent do
+            if m.id == d.id then m.content = d.content end
+        end
+        push_ev({ "kind": "edit", "mid": d.id, "content": d.content,
+            "channel": d.channel_id, "guild": d.guild_id,
+            "author": d.author.username, "uid": d.author.id })
+        return
+    end
+    if ev == "MESSAGE_DELETE" then
+        create dcontent = nil
+        create dauthor = nil
+        create duid = nil
+        repeat m, i in B.recent do
+            if m.id == d.id then
+                dcontent = m.content
+                dauthor = m.author
+                duid = m.uid
+            end
+        end
+        push_ev({ "kind": "del", "mid": d.id, "content": dcontent,
+            "channel": d.channel_id, "guild": d.guild_id,
+            "author": dauthor, "uid": duid })
+        return
+    end
+    if ev == "MESSAGE_REACTION_ADD" or ev == "MESSAGE_REACTION_REMOVE" then
+        if d.user_id == bot.debug.id then return end
+        create emoji = nil
+        if d.emoji != nil then
+            emoji = d.emoji.name
+            if d.emoji.id != nil and d.emoji.name != nil then
+                emoji = d.emoji.name .. ":" .. d.emoji.id
+            end
+        end
+        create rname = nil
+        if d.member != nil and d.member.user != nil then
+            rname = d.member.user.username
+            B.members[d.user_id] = { "name": rname }
+        elseif B.members[d.user_id] != nil then
+            rname = B.members[d.user_id].name
+        end
+        create rkind = "react"
+        if ev == "MESSAGE_REACTION_REMOVE" then rkind = "unreact" end
+        push_ev({ "kind": rkind, "emoji": emoji, "mid": d.message_id,
+            "channel": d.channel_id, "guild": d.guild_id,
+            "uid": d.user_id, "author": rname })
+        return
+    end
+    if ev == "GUILD_MEMBER_REMOVE" then
+        if d.user != nil then
+            push_ev({ "kind": "leave", "uid": d.user.id,
+                "name": d.user.username, "guild": d.guild_id })
+        end
+        return
+    end
+    if ev == "VOICE_STATE_UPDATE" then
+        if d.user_id == nil then return end
+        create old = B.voice[d.user_id]
+        B.voice[d.user_id] = d.channel_id
+        create vname = nil
+        if B.members[d.user_id] != nil then vname = B.members[d.user_id].name end
+        if d.member != nil and d.member.user != nil then vname = d.member.user.username end
+        if old != d.channel_id then
+            push_ev({ "kind": "voice", "uid": d.user_id, "name": vname,
+                "channel": d.channel_id, "old": old, "guild": d.guild_id })
+        end
+        return
+    end
+    if ev == "CHANNEL_CREATE" or ev == "THREAD_CREATE" or ev == "CHANNEL_UPDATE" then
+        if d.id != nil then
+            B.channels[d.id] = { "name": d.name, "guild": d.guild_id }
+            if ev == "CHANNEL_CREATE" then
+                push_ev({ "kind": "chan", "id": d.id, "name": d.name,
+                    "guild": d.guild_id, "ctype": d.type })
+            end
+        end
+        return
+    end
+    if ev == "CHANNEL_DELETE" then
+        if d.id != nil then
+            B.channels[d.id] = nil
+            push_ev({ "kind": "chandel", "id": d.id, "name": d.name, "guild": d.guild_id })
+        end
+        return
+    end
+    if ev == "GUILD_ROLE_CREATE" or ev == "GUILD_ROLE_UPDATE" then
+        create rg = B.guilds[d.guild_id]
+        if rg != nil and d.role != nil then
+            create nl = []
+            create found = false
+            if rg.roles != nil then
+                repeat r, i in rg.roles do
+                    if r.id == d.role.id then
+                        nl:append(d.role)
+                        found = true
+                    else
+                        nl:append(r)
+                    end
+                end
+            end
+            if not found then nl:append(d.role) end
+            rg.roles = nl
+        end
+        return
+    end
+    if ev == "GUILD_ROLE_DELETE" then
+        create dg = B.guilds[d.guild_id]
+        if dg != nil and dg.roles != nil then
+            create nl2 = []
+            repeat r, i in dg.roles do
+                if r.id != d.role_id then nl2:append(r) end
+            end
+            dg.roles = nl2
+        end
+        return
+    end
+    if ev == "GUILD_UPDATE" then
+        create ug = B.guilds[d.id]
+        if ug != nil then
+            ug.name = d.name
+            ug.owner_id = d.owner_id
         end
         return
     end
@@ -361,13 +930,29 @@ create function qtake(q)
     end
     if q == B.msgq then B.msgq = nq end
     if q == B.joinq then B.joinq = nq end
+    if q == B.evq then B.evq = nq end
     if q == B.intq then B.intq = nq end
     return ev
 end
 
+-- Which queue is q? qtake() swaps in a new list object every time it pops, so a
+-- waiting task must look the queue up again on every pass. Holding the list it
+-- was first given made it read a stale copy: with several watchers (one task per
+-- slash command, say) an event could be handed out twice.
+create function qname(q)
+    if q == B.msgq then return "msgq" end
+    if q == B.joinq then return "joinq" end
+    if q == B.evq then return "evq" end
+    if q == B.intq then return "intq" end
+    return nil
+end
+
 create function wait_ev(q)
+    create name = qname(q)
     while true do
-        create ev = qtake(q)
+        create cur = q
+        if name != nil then cur = B[name] end
+        create ev = qtake(cur)
         if ev != nil then return ev end
         task.wait(0.01)
     end
@@ -438,12 +1023,19 @@ bot.prefix = function(a, b)
         create ev = wait_ev(B.msgq)
         create c = ev.content
         if c != nil and string.startswith(c, p) then
-            create rest = string.sub(c, string.len(p) + 1)
+            create after = string.sub(c, string.len(p) + 1)
+            create word = after
+            create argstr = ""
+            create sp = string.find(after, " ")
+            if sp != nil then
+                word = string.sub(after, 1, sp - 1)
+                argstr = string.trim(string.sub(after, sp + 1))
+            end
             B.cur = { "kind": "channel", "channel": ev.channel,
-                      "guild": ev.guild, "author": ev.author }
-            create sp = string.find(rest, " ")
-            if sp != nil then return string.sub(rest, 1, sp - 1) end
-            return rest
+                      "guild": ev.guild, "author": ev.author,
+                      "uid": ev.uid, "mid": ev.mid, "roles": ev.roles,
+                      "cmd": word, "args": argstr }
+            return word
         end
         B.msgq:append(ev)
         task.wait(0.01)
@@ -455,7 +1047,7 @@ bot.user.join = function(a)
     while true do
         create ev = wait_ev(B.joinq)
         B.cur = { "kind": "channel", "channel": nil,
-                  "guild": ev.guild, "author": ev.name }
+                  "guild": ev.guild, "author": ev.name, "uid": ev.uid }
         return ev.uid
     end
 end
@@ -774,6 +1366,15 @@ create function embed_rows(btns, sels)
     return rows
 end
 
+-- embed (+ its buttons/menus) -> message payload
+create function embed_payload(e, text)
+    create payload = { "embeds": [embed_json(e)] }
+    create rows = embed_rows(e._buttons, e._selects)
+    if rows:len() > 0 then payload.components = rows end
+    if text != nil then payload.content = text end
+    return payload
+end
+
 -- send the embed: e:send() in a command (origin place, incl. interactions),
 -- e:send(channel) or e:send(channel, text) anywhere. Buttons linked via
 -- buttons:new(..., embed) ride along. Returns true, message id (REST path).
@@ -781,10 +1382,7 @@ bot.embed.send = function(a, b, c)
     if a == bot.embed then return nil, "not an embed" end
     create e, channel, text = a, b, c
     if e == nil or e._fields == nil then return nil, "not an embed" end
-    create payload = { "embeds": [embed_json(e)] }
-    create rows = embed_rows(e._buttons, e._selects)
-    if rows:len() > 0 then payload.components = rows end
-    if text != nil then payload.content = text end
+    create payload = embed_payload(e, text)
     if channel == nil then
         if B.cur != nil and B.cur.kind == "int" then
             return interaction_send(payload)
@@ -900,8 +1498,7 @@ bot.buttons.click = function(a, b)
         if ev.kind == "comp" and ev.ctype == 2 and ev.cid != nil then
             create known = button_by_id(ev.cid)
             if ev.cid == id or (known != nil and known.label == id) then
-                B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
-                          "channel": ev.channel, "author": ev.author }
+                B.cur = make_cur(ev)
                 return true, ev.author
             end
         end
@@ -945,8 +1542,7 @@ bot.select.choose = function(a, b)
     while true do
         create ev = wait_ev(B.intq)
         if ev.kind == "comp" and ev.ctype == 3 and ev.cid == id then
-            B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
-                      "channel": ev.channel, "author": ev.author }
+            B.cur = make_cur(ev)
             create v = nil
             if ev.values != nil and ev.values:len() > 0 then v = ev.values[0] end
             return v, ev.author
@@ -956,35 +1552,218 @@ bot.select.choose = function(a, b)
     end
 end
 
+-- ================= slash commands =================
 bot.slash = {}
+
+create OPT_TYPES = { "sub": 1, "string": 3, "text": 3, "integer": 4, "int": 4,
+    "bool": 5, "boolean": 5, "user": 6, "channel": 7, "role": 8, "mention": 9,
+    "number": 10, "float": 10, "file": 11, "attachment": 11 }
+
+-- one option -> API json (no nesting)
+create function build_leaf(o)
+    create t = o.type
+    if type(t) == "string" then t = OPT_TYPES[string.lower(t)] end
+    if t == nil then t = 3 end
+    create jo = { "name": o.name, "description": o.description or o.name, "type": t }
+    if o.required then jo.required = true end
+    if o.min != nil then jo.min_value = o.min end
+    if o.max != nil then jo.max_value = o.max end
+    if o.choices != nil then
+        create cl = []
+        repeat c, i in o.choices do
+            if type(c) == "table" then
+                cl:append({ "name": c.name, "value": c.value })
+            else
+                cl:append({ "name": tostring(c), "value": c })
+            end
+        end
+        jo.choices = cl
+    end
+    return jo
+end
+
+-- option, or sub-command holding options
+create function build_opt(o)
+    create jo = build_leaf(o)
+    if jo.type == 1 then
+        jo.required = nil
+        jo.options = nil
+        if o.options != nil then
+            create sl = []
+            repeat so, j in o.options do
+                sl:append(build_leaf(so))
+            end
+            jo.options = sl
+        end
+    end
+    return jo
+end
+
+-- new("ping")                              global command, description = name
+-- new("ping", "guild", guild_id)           one server (shows up instantly)
+-- new({ "name": "echo", "description": "...", "options": [ ... ], "scope": "guild", "guild": id,
+--       "perm": "ban", "kind": "chat" })
+--   option: { "name": "text", "type": "string|integer|number|bool|user|channel|role|file|sub",
+--             "description": "...", "required": true, "choices": ["a", "b"], "min": 1, "max": 9 }
+--   sub-command: { "name": "add", "type": "sub", "options": [ ...options... ] }
+--   kind: "chat" (default) | "user" | "message"  (right-click context menus)
+--   perm: "admin" / "kick" / ... who can see the command by default
 bot.slash.new = function(a, b, c, d)
     if a == bot.slash then a, b, c, d = b, c, d, nil end
-    create bb = { "name": a, "description": a, "type": 1 }
-    create scope = b
+    create bb = nil
+    create scope, guild = b, c
+    if type(a) == "table" then
+        create t = a
+        if t.name == nil then return nil, "need a name" end
+        create ktype = 1
+        if t.kind == "user" then ktype = 2 elseif t.kind == "message" then ktype = 3 end
+        bb = { "name": t.name, "type": ktype }
+        if ktype == 1 then
+            bb.description = t.description or t.name
+            if t.options != nil then
+                create ol = []
+                repeat o, i in t.options do
+                    ol:append(build_opt(o))
+                end
+                bb.options = ol
+            end
+        end
+        if t.perm != nil and PERMSTR[t.perm] != nil then
+            bb.default_member_permissions = PERMSTR[t.perm]
+        end
+        if t.dm == false then bb.dm_permission = false end
+        if t.scope != nil then scope = t.scope end
+        if t.guild != nil then guild = t.guild end
+    else
+        if a == nil then return nil, "need a name" end
+        bb = { "name": a, "description": d or a, "type": 1 }
+    end
     -- "global" (or "gobal" typo, or nil) = global command;
     -- "guild" + guild id = guild-only command
     if scope == nil or scope == "global" or scope == "gobal" then scope = nil end
-    B.pending:append({ "b": bb, "scope": scope, "guild": c })
+    B.pending:append({ "b": bb, "scope": scope, "guild": guild })
     flush_pending()
     return true
 end
+
+-- remove a command by name: delete("ping") or delete("ping", "guild", guild_id)
+bot.slash.delete = function(a, b, c)
+    if a == bot.slash then a, b, c = b, c, nil end
+    if B.app == nil then return nil, "not connected yet" end
+    create path = "/applications/" .. B.app .. "/commands"
+    if b == "guild" and c != nil then path = "/applications/" .. B.app .. "/guilds/" .. c .. "/commands" end
+    create r, code = rest("GET", path, nil)
+    if r == nil or code != 200 then return nil, B.err or code end
+    create list = json.decode(r)
+    repeat cmd, i in list do
+        if cmd.name == a then
+            return ok_call(rest("DELETE", path .. "/" .. cmd.id, nil))
+        end
+    end
+    return nil, "no such command"
+end
+
 bot.slash.slash = function(a, b)
     if a == bot.slash then a = b end
     create name = a
     while true do
         create ev = wait_ev(B.intq)
-        if ev.name == name then
-            create aname = nil
-            if ev.uid != nil and B.members[ev.uid] != nil then
-                aname = B.members[ev.uid].name
-            end
-            B.cur = { "kind": "int", "iid": ev.id, "itoken": ev.token,
-                      "channel": ev.channel, "author": aname, "app": ev.app }
+        if ev.kind == "int" and ev.name == name then
+            B.cur = make_cur(ev)
             return true
         end
         B.intq:append(ev)
         task.wait(0.01)
     end
+end
+
+-- option value from the running command (default when missing)
+bot.slash.get = function(a, b, c)
+    if a == bot.slash then a, b = b, c end
+    if B.cur == nil or B.cur.opts == nil then return b end
+    create v = B.cur.opts[a]
+    if v == nil then return b end
+    return v
+end
+-- the sub-command that was used ("add", "list"...), nil for plain commands
+bot.slash.sub = function(a)
+    if B.cur == nil then return nil end
+    return B.cur.sub
+end
+-- right-click menu commands: target id, name (user menu), text (message menu)
+bot.slash.target = function(a)
+    if B.cur == nil then return nil end
+    return B.cur.target, B.cur.tname, B.cur.tcontent
+end
+-- url of a file option
+bot.slash.file = function(a, b)
+    if a == bot.slash then a = b end
+    create id = bot.slash.get(a)
+    if id == nil or B.cur.resolved == nil or B.cur.resolved.attachments == nil then return nil end
+    create f = B.cur.resolved.attachments[id]
+    if f == nil then return nil end
+    return f.url
+end
+
+-- text or embed -> interaction data
+create function reply_data(a)
+    if type(a) == "table" and a._fields != nil then return embed_payload(a, nil) end
+    return { "content": a }
+end
+
+-- answer the command. reply("text") / reply(embed) / reply("text", true) = only
+-- the caller sees it (later answers of that command stay private too).
+-- First call answers, after defer() it fills the "thinking" message, later
+-- calls are followups.
+bot.slash.reply = function(a, b, c)
+    if a == bot.slash then a, b = b, c end
+    if B.cur == nil or B.cur.kind != "int" then return nil, "no interaction" end
+    if b == true then B.cur.ephemeral = true end
+    return interaction_send(reply_data(a))
+end
+
+-- "thinking..." for commands that take longer than 3 seconds.
+-- defer(true) = private. Then call reply() whenever the work is done.
+bot.slash.defer = function(a, b)
+    if a == bot.slash then a = b end
+    create cur = B.cur
+    if cur == nil or cur.kind != "int" then return nil, "no interaction" end
+    if cur.replied or cur.deferred then return true end
+    create data = {}
+    if a == true then
+        cur.ephemeral = true
+        data.flags = 64
+    end
+    create kind = 5
+    if cur.comp then kind = 6 end
+    create r, code = rest("POST", "/interactions/" .. cur.iid .. "/" .. cur.itoken .. "/callback",
+        { "type": kind, "data": data })
+    if r == nil then return nil, code end
+    if code == 204 or code == 200 then
+        cur.deferred = true
+        return true
+    end
+    return nil, B.err or r
+end
+
+-- change the message the command already answered with
+bot.slash.edit = function(a, b)
+    if a == bot.slash then a = b end
+    create cur = B.cur
+    if cur == nil or cur.kind != "int" then return nil, "no interaction" end
+    if not cur.replied and not cur.deferred then return interaction_send(reply_data(a)) end
+    create app = cur.app or B.app
+    create r, code = rest("PATCH", "/webhooks/" .. tostring(app) .. "/" .. cur.itoken .. "/messages/@original", reply_data(a))
+    return ok_call(r, code)
+end
+
+-- inside a button/select handler: replace the message the component sits on
+bot.slash.update = function(a, b)
+    if a == bot.slash then a = b end
+    create cur = B.cur
+    if cur == nil or cur.kind != "int" then return nil, "no interaction" end
+    if cur.replied or cur.deferred then return bot.slash.edit(a) end
+    return interaction_send(reply_data(a), 7)
 end
 
 -- pause switch: bot:on() reads state, "bot":stop() pauses, "bot":on(true) resumes
@@ -1018,5 +1797,919 @@ bot.guild = function(a, b)
     if g == nil then return nil end
     return { "name": g.name, "id": a }
 end
+
+-- =====================================================================
+-- extra events: each call blocks for the NEXT matching event (like
+-- bot.user.join); other events stay queued. B.cur is set so bot.send /
+-- bot.msg.reply / bot.msg.react work right inside the handler.
+-- =====================================================================
+
+-- a member left or was removed: returns id, name
+bot.user.leave = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "leave" then
+            B.cur = { "kind": "channel", "channel": nil, "guild": ev.guild,
+                      "author": ev.name, "uid": ev.uid }
+            return ev.uid, ev.name
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- a reaction was added (or removed: reaction(emoji, "remove")).
+-- reaction() = any emoji, reaction("👍") = only that one.
+-- returns emoji, who, message id
+bot.msg.reaction = function(a, b, c)
+    if a == bot.msg then a, b = b, c end
+    create want = a
+    create rkind = "react"
+    if b == "remove" or a == "remove" then
+        rkind = "unreact"
+        if a == "remove" then want = nil end
+    end
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == rkind and (want == nil or ev.emoji == want) then
+            B.cur = { "kind": "channel", "channel": ev.channel, "guild": ev.guild,
+                      "author": ev.author, "uid": ev.uid, "mid": ev.mid }
+            return ev.emoji, ev.author, ev.mid
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- a message was edited: returns new text, author, message id
+bot.msg.edited = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "edit" then
+            B.cur = { "kind": "channel", "channel": ev.channel, "guild": ev.guild,
+                      "author": ev.author, "uid": ev.uid, "mid": ev.mid }
+            return ev.content, ev.author, ev.mid
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- a message was deleted: returns old text (nil if it was not cached), author, id
+bot.msg.deleted = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "del" then
+            B.cur = { "kind": "channel", "channel": ev.channel, "guild": ev.guild,
+                      "author": ev.author, "uid": ev.uid }
+            return ev.content, ev.author, ev.mid
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- someone joined / moved / left a voice channel: returns id, new channel
+-- (nil = left), old channel, name
+bot.voice = {}
+bot.voice.update = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "voice" then
+            B.cur = { "kind": "channel", "channel": nil, "guild": ev.guild,
+                      "author": ev.name, "uid": ev.uid }
+            return ev.uid, ev.channel, ev.old, ev.name
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- channel created / deleted: returns name, id
+bot.channels = {}
+bot.channels.created = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "chan" then
+            B.cur = { "kind": "channel", "channel": ev.id, "guild": ev.guild }
+            return ev.name, ev.id
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+bot.channels.deleted = function(a)
+    while true do
+        create ev = wait_ev(B.evq)
+        if ev.kind == "chandel" then
+            B.cur = { "kind": "channel", "channel": nil, "guild": ev.guild }
+            return ev.name, ev.id
+        end
+        B.evq:append(ev)
+        task.wait(0.01)
+    end
+end
+
+-- last API error text (after a call returned nil)
+bot.lasterror = function(a)
+    return B.err
+end
+
+-- =====================================================================
+-- reactions
+-- react("👍")                    on the message that triggered the command
+-- react(channel, message_id, "👍")   anywhere  (custom emoji: "name:id")
+-- =====================================================================
+create function msg_target(a, b)
+    -- (channel, message) from explicit args or the running command
+    create ch, mid = a, b
+    if ch == nil and B.cur != nil then ch = B.cur.channel end
+    if mid == nil and B.cur != nil then mid = B.cur.mid end
+    return resolve_channel(ch), mid
+end
+
+bot.msg.react = function(a, b, c, d)
+    if a == bot.msg then a, b, c, d = b, c, d, nil end
+    create ch, mid, emoji = nil, nil, nil
+    if b == nil then
+        emoji = a
+        ch, mid = msg_target(nil, nil)
+    else
+        ch, mid = msg_target(a, b)
+        emoji = c
+    end
+    if ch == nil or mid == nil or emoji == nil then return nil, "need channel, message id and emoji" end
+    return ok_call(rest("PUT", "/channels/" .. ch .. "/messages/" .. mid .. "/reactions/" .. urlenc(emoji) .. "/@me", nil))
+end
+
+-- remove the bot's own reaction, or another user's: unreact(ch, id, emoji, user?)
+bot.msg.unreact = function(a, b, c, d, e)
+    if a == bot.msg then a, b, c, d = b, c, d, e end
+    create ch, mid, emoji, who = nil, nil, nil, nil
+    if b == nil then
+        emoji = a
+        ch, mid = msg_target(nil, nil)
+    else
+        ch, mid = msg_target(a, b)
+        emoji = c
+        who = d
+    end
+    if ch == nil or mid == nil or emoji == nil then return nil, "need channel, message id and emoji" end
+    create target = "@me"
+    if who != nil then target = parse_user(who) or who end
+    return ok_call(rest("DELETE", "/channels/" .. ch .. "/messages/" .. mid .. "/reactions/" .. urlenc(emoji) .. "/" .. target, nil))
+end
+
+-- who reacted with this emoji: names list (first 100)
+bot.msg.reactions = function(a, b, c, d)
+    if a == bot.msg then a, b, c, d = b, c, d, nil end
+    create ch, mid, emoji = nil, nil, nil
+    if b == nil then
+        emoji = a
+        ch, mid = msg_target(nil, nil)
+    else
+        ch, mid = msg_target(a, b)
+        emoji = c
+    end
+    if ch == nil or mid == nil or emoji == nil then return nil, "need channel, message id and emoji" end
+    create r, code = rest("GET", "/channels/" .. ch .. "/messages/" .. mid .. "/reactions/" .. urlenc(emoji) .. "?limit=100", nil)
+    if r == nil or code != 200 then return nil, B.err or code end
+    create out = []
+    repeat u, i in json.decode(r) do
+        out:append(u.username)
+        B.members[u.id] = { "name": u.username }
+    end
+    return out
+end
+
+-- =====================================================================
+-- moderation (target = id, "<@id>" mention, or a name the bot has seen;
+-- guild optional inside commands / single-server bots)
+-- =====================================================================
+create function mod_prep(target, guild)
+    create uid = parse_user(target)
+    if uid == nil then return nil, nil, "unknown user" end
+    create g = guild_of(guild)
+    if g == nil then return nil, nil, "no server (pass the guild id)" end
+    return uid, g, nil
+end
+
+-- kick(target, reason?, guild?)
+bot.user.kick = function(a, b, c, d)
+    if a == bot.user then a, b, c = b, c, d end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    return ok_call(rest("DELETE", "/guilds/" .. g .. "/members/" .. uid, nil, reason_hdr(b)))
+end
+
+-- ban(target, reason?, guild?, delete_days?)   delete_days 0-7 of their messages
+bot.user.ban = function(a, b, c, d, e)
+    if a == bot.user then a, b, c, d = b, c, d, e end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    create days = tonumber(d) or 0
+    if days > 7 then days = 7 end
+    if days < 0 then days = 0 end
+    return ok_call(rest("PUT", "/guilds/" .. g .. "/bans/" .. uid,
+        { "delete_message_seconds": days * 86400 }, reason_hdr(b)))
+end
+
+-- unban(user_id, reason?, guild?)
+bot.user.unban = function(a, b, c, d)
+    if a == bot.user then a, b, c = b, c, d end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    return ok_call(rest("DELETE", "/guilds/" .. g .. "/bans/" .. uid, nil, reason_hdr(b)))
+end
+
+-- timeout(target, seconds, reason?, guild?)   max 28 days
+bot.user.timeout = function(a, b, c, d, e)
+    if a == bot.user then a, b, c, d = b, c, d, e end
+    create uid, g, err = mod_prep(a, d)
+    if uid == nil then return nil, err end
+    create secs = tonumber(b)
+    if secs == nil or secs <= 0 then return nil, "need seconds" end
+    if secs > 2419200 then secs = 2419200 end
+    return ok_call(rest("PATCH", "/guilds/" .. g .. "/members/" .. uid,
+        { "communication_disabled_until": iso_utc(os.time() + secs) }, reason_hdr(c)))
+end
+
+-- untimeout(target, reason?, guild?)
+bot.user.untimeout = function(a, b, c, d)
+    if a == bot.user then a, b, c = b, c, d end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    return ok_call(rest("PATCH", "/guilds/" .. g .. "/members/" .. uid,
+        "{\"communication_disabled_until\":null}", reason_hdr(b)))
+end
+
+-- addrole(target, role, guild?)   role = id, "<@&id>" or name
+bot.user.addrole = function(a, b, c, d)
+    if a == bot.user then a, b, c = b, c, d end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    create rid = role_id(g, b)
+    if rid == nil then return nil, "need a role" end
+    return ok_call(rest("PUT", "/guilds/" .. g .. "/members/" .. uid .. "/roles/" .. rid, nil))
+end
+
+bot.user.removerole = function(a, b, c, d)
+    if a == bot.user then a, b, c = b, c, d end
+    create uid, g, err = mod_prep(a, c)
+    if uid == nil then return nil, err end
+    create rid = role_id(g, b)
+    if rid == nil then return nil, "need a role" end
+    return ok_call(rest("DELETE", "/guilds/" .. g .. "/members/" .. uid .. "/roles/" .. rid, nil))
+end
+
+-- "<@123>" / "123" / known name -> id
+bot.user.parse = function(a, b)
+    if a == bot.user then a = b end
+    return parse_user(a)
+end
+
+-- can(perm) = the person who ran the command; can(perm, who) = someone else.
+-- perm: admin kick ban channels guild audit messages roles nicknames moderate/timeout
+bot.user.can = function(a, b, c)
+    if a == bot.user then a, b = b, c end
+    if a == nil then return false, "need a permission name" end
+    create bit = PERMS[string.lower(a)]
+    if bit == nil then return false, "unknown permission " .. a end
+    create cur = B.cur
+    if b == nil then
+        if cur == nil then return false, "no command context" end
+        return can_bit(cur.guild, cur.uid, cur.roles, cur.perms, bit)
+    end
+    create g = guild_of(nil)
+    create uid = parse_user(b)
+    if g == nil or uid == nil then return false, "unknown user or server" end
+    return can_bit(g, uid, fetch_roles(g, uid), nil, bit)
+end
+
+-- =====================================================================
+-- prefix-command helpers: guard against spam / missing permissions
+-- =====================================================================
+-- the text after the command word:  !ban @x spam  ->  "@x spam"
+bot.args = function(a)
+    if B.cur == nil or B.cur.args == nil then return "" end
+    return B.cur.args
+end
+-- nth word after the command (1-based), nil if missing
+bot.arg = function(a, b)
+    if a == bot then a = b end
+    create words = split_words(bot.args())
+    create n = tonumber(a)
+    if n == nil or n < 1 or n > words:len() then return nil end
+    return words[n - 1]
+end
+
+-- cooldown(seconds, key?) per user + command. true = go ahead,
+-- false + seconds left = too soon. Resets the timer when it lets you through.
+bot.cooldown = function(a, b, c)
+    if a == bot then a, b = b, c end
+    create secs = tonumber(a)
+    if secs == nil then return false, "need seconds" end
+    create cur = B.cur
+    create who = "?"
+    create cmd = "?"
+    if cur != nil then
+        if cur.uid != nil then who = tostring(cur.uid) end
+        if cur.cmd != nil then cmd = tostring(cur.cmd) end
+    end
+    if b != nil then cmd = tostring(b) end
+    create key = cmd .. ":" .. who
+    create now = os.time()
+    create untilt = B.cd[key]
+    if untilt != nil and now < untilt then return false, untilt - now end
+    B.cd[key] = now + secs
+    return true
+end
+
+-- need("admin") -> true, or tells the user and returns false
+bot.need = function(a, b, c)
+    if a == bot then a, b = b, c end
+    if bot.user.can(a) then return true end
+    create text = b
+    if text == nil then text = "you need the " .. tostring(a) .. " permission for that" end
+    if B.cur != nil and B.cur.kind == "int" then B.cur.ephemeral = true end
+    bot.msg.send(text)
+    return false
+end
+
+-- guard({ "perm": "admin", "cooldown": 5, "quiet": true }) -> true when allowed.
+-- quiet = do not tell the user why it said no.
+bot.guard = function(a, b)
+    if a == bot then a = b end
+    if a == nil then return true end
+    if a.perm != nil then
+        if not bot.user.can(a.perm) then
+            if not a.quiet then
+                if B.cur != nil and B.cur.kind == "int" then B.cur.ephemeral = true end
+                bot.msg.send("you need the " .. tostring(a.perm) .. " permission for that")
+            end
+            return false
+        end
+    end
+    if a.cooldown != nil then
+        create ok, left = bot.cooldown(a.cooldown)
+        if not ok then
+            if not a.quiet then
+                if B.cur != nil and B.cur.kind == "int" then B.cur.ephemeral = true end
+                bot.msg.send("slow down, try again in " .. tostring(left) .. "s")
+            end
+            return false
+        end
+    end
+    return true
+end
+
+-- =====================================================================
+-- more message tools
+-- =====================================================================
+-- reply("text") inside a command quotes the message that triggered it;
+-- reply(channel, message_id, "text") anywhere. Text may also be an embed.
+bot.msg.reply = function(a, b, c, d)
+    if a == bot.msg then a, b, c, d = b, c, d, nil end
+    create ch, mid, text = nil, nil, nil
+    if b == nil then
+        text = a
+        if B.cur == nil then return nil, "reply needs a command context" end
+        if B.cur.kind == "int" then return bot.slash.reply(text) end
+        ch, mid = msg_target(nil, nil)
+    else
+        ch, mid = msg_target(a, b)
+        text = c
+    end
+    if ch == nil or mid == nil then return nil, "no message to reply to" end
+    create payload = nil
+    if type(text) == "table" and text._fields != nil then payload = embed_payload(text, nil)
+    else payload = { "content": text } end
+    payload.message_reference = { "message_id": mid, "fail_if_not_exists": false }
+    create r, code = rest("POST", "/channels/" .. ch .. "/messages", payload)
+    if r == nil then return nil, code end
+    if code == 200 or code == 201 then return true, json.decode(r).id end
+    return nil, B.err or r
+end
+
+-- pin / unpin: pin() in a command, or pin(channel, message_id).
+-- Uses Discord's current /messages/pins route, falls back to the old one on 404.
+bot.msg.pin = function(a, b, c)
+    if a == bot.msg then a, b = b, c end
+    create ch, mid = msg_target(a, b)
+    if ch == nil or mid == nil then return nil, "need channel and message id" end
+    create r, code = rest("PUT", "/channels/" .. ch .. "/messages/pins/" .. mid, nil)
+    if code == 404 then r, code = rest("PUT", "/channels/" .. ch .. "/pins/" .. mid, nil) end
+    return ok_call(r, code)
+end
+bot.msg.unpin = function(a, b, c)
+    if a == bot.msg then a, b = b, c end
+    create ch, mid = msg_target(a, b)
+    if ch == nil or mid == nil then return nil, "need channel and message id" end
+    create r, code = rest("DELETE", "/channels/" .. ch .. "/messages/pins/" .. mid, nil)
+    if code == 404 then r, code = rest("DELETE", "/channels/" .. ch .. "/pins/" .. mid, nil) end
+    return ok_call(r, code)
+end
+
+-- thread("name") in a command = thread on the triggering message;
+-- thread("name", false, channel) = standalone thread; thread("name", msg_id, channel).
+-- returns true + the thread id (a channel id: bot.send(id, "hi") works)
+bot.msg.thread = function(a, b, c, d)
+    if a == bot.msg then a, b, c = b, c, d end
+    create name, mid, ch = a, b, c
+    if name == nil then return nil, "need a name" end
+    if ch == nil and B.cur != nil then ch = B.cur.channel end
+    if mid == nil and B.cur != nil and B.cur.kind == "channel" then mid = B.cur.mid end
+    ch = resolve_channel(ch)
+    if ch == nil then return nil, "no channel" end
+    create r, code = nil, 0
+    if mid == nil or mid == false then
+        r, code = rest("POST", "/channels/" .. ch .. "/threads",
+            { "name": name, "type": 11, "auto_archive_duration": 1440 })
+    else
+        r, code = rest("POST", "/channels/" .. ch .. "/messages/" .. mid .. "/threads",
+            { "name": name, "auto_archive_duration": 1440 })
+    end
+    if r == nil then return nil, code end
+    if code == 200 or code == 201 then
+        create t = json.decode(r)
+        create gid = nil
+        if B.cur != nil then gid = B.cur.guild end
+        B.channels[t.id] = { "name": name, "guild": gid }
+        return true, t.id
+    end
+    return nil, B.err or r
+end
+
+-- upload a file: file("pic.png")  file("pic.png", "#general", "caption")
+-- (channel nil = where the command ran). 25 MB max. In a slash command the
+-- bot answers "thinking" first, then posts the file.
+bot.msg.file = function(a, b, c, d)
+    if a == bot.msg then a, b, c = b, c, d end
+    create path, ch, text = a, b, c
+    if path == nil then return nil, "need a file path" end
+    create f, ferr = io.open(path, "rb")
+    if f == nil then return nil, "cannot open " .. tostring(path) end
+    create data = f:read("a")
+    io.close(f)
+    if data == nil then data = "" end
+    if string.len(data) > 25000000 then return nil, "file too big (25 MB max)" end
+    create fname = string.gsub(basename(path), "\"", "_")
+    create payload = { "attachments": [{ "id": 0, "filename": fname }] }
+    if text != nil then payload.content = text end
+    create bd = "----luc" .. tostring(os.time()) .. "7f3a9c"
+    create body = "--" .. bd .. "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n"
+    body = body .. json.encode(payload)
+    body = body .. "\r\n--" .. bd .. "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"" .. fname .. "\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    body = body .. data
+    body = body .. "\r\n--" .. bd .. "--\r\n"
+    create ctype = "multipart/form-data; boundary=" .. bd
+    create r, code = nil, 0
+    if ch == nil and B.cur != nil and B.cur.kind == "int" then
+        create cur = B.cur
+        create app = cur.app or B.app
+        if not cur.replied and not cur.deferred then bot.slash.defer() end
+        if cur.replied then
+            r, code = rest_raw("POST", "/webhooks/" .. tostring(app) .. "/" .. cur.itoken, body, ctype)
+        else
+            r, code = rest_raw("PATCH", "/webhooks/" .. tostring(app) .. "/" .. cur.itoken .. "/messages/@original", body, ctype)
+            cur.replied = true
+        end
+    else
+        if ch == nil and B.cur != nil then ch = B.cur.channel end
+        ch = resolve_channel(ch)
+        if ch == nil then return nil, "no channel in context" end
+        r, code = rest_raw("POST", "/channels/" .. ch .. "/messages", body, ctype)
+    end
+    if r == nil then return nil, code end
+    if code == 200 or code == 201 then return true end
+    return nil, B.err or r
+end
+
+-- =====================================================================
+-- presence: status("with luc") / status("movies", "watching") / status("x", "listening", "idle")
+-- kinds: playing streaming listening watching competing   states: online idle dnd invisible
+-- works before or after bot.run, survives reconnects
+-- =====================================================================
+bot.status = function(a, b, c, d)
+    if a == bot then a, b, c = b, c, d end
+    create types = { "playing": 0, "streaming": 1, "listening": 2, "watching": 3, "competing": 5 }
+    create st = c or "online"
+    if a == nil then
+        B.presence = { "since": 0, "activities": [], "status": st, "afk": false }
+    else
+        create tcode = 0
+        if b != nil and types[string.lower(b)] != nil then tcode = types[string.lower(b)] end
+        B.presence = { "since": 0, "activities": [{ "name": a, "type": tcode }],
+                       "status": st, "afk": false }
+    end
+    if B.ws != nil and B.session != nil then
+        gw_send({ "op": 3, "d": B.presence })
+    end
+    return true
+end
+
+-- =====================================================================
+-- modals (popup forms). Inside a slash command or button handler:
+--   bot.modal.show("feedback", "Send feedback", [
+--       { "id": "title", "label": "Title" },
+--       { "id": "body", "label": "Details", "style": "paragraph", "required": false } ])
+--   create vals = bot.modal.wait("feedback")   -- vals.title, vals.body
+-- show() must be the first answer to that interaction (no defer before it).
+-- After wait() you can bot.slash.reply(...) to the submit.
+-- =====================================================================
+bot.modal = {}
+bot.modal.show = function(a, b, c, d)
+    if a == bot.modal then a, b, c = b, c, d end
+    create id, title, fields = a, b, c
+    create cur = B.cur
+    if cur == nil or cur.kind != "int" then return nil, "no interaction" end
+    if cur.replied or cur.deferred then return nil, "modal must be the first answer" end
+    if id == nil or fields == nil then return nil, "need an id and fields" end
+    create rows = []
+    repeat f, i in fields do
+        if rows:len() >= 5 then break end
+        create comp = { "type": 4, "custom_id": f.id, "label": f.label or f.id, "style": 1 }
+        if f.style == "paragraph" or f.style == 2 then comp.style = 2 end
+        if f.required == false then comp.required = false end
+        if f.placeholder != nil then comp.placeholder = f.placeholder end
+        if f.value != nil then comp.value = f.value end
+        if f.min != nil then comp.min_length = f.min end
+        if f.max != nil then comp.max_length = f.max end
+        rows:append({ "type": 1, "components": [comp] })
+    end
+    create r, code = rest("POST", "/interactions/" .. cur.iid .. "/" .. cur.itoken .. "/callback",
+        { "type": 9, "data": { "custom_id": id, "title": title or id, "components": rows } })
+    if r == nil then return nil, code end
+    if code == 204 or code == 200 then
+        cur.replied = true
+        return true
+    end
+    return nil, B.err or r
+end
+-- blocks until the form with this id is submitted: returns { field id: text }, who
+bot.modal.wait = function(a, b)
+    if a == bot.modal then a = b end
+    create id = a
+    if id == nil then return nil, "need a modal id" end
+    while true do
+        create ev = wait_ev(B.intq)
+        if ev.kind == "modal" and ev.cid == id then
+            B.cur = make_cur(ev)
+            return ev.fields, ev.author
+        end
+        B.intq:append(ev)
+        task.wait(0.01)
+    end
+end
+-- one field of the form that is being handled
+bot.modal.get = function(a, b, c)
+    if a == bot.modal then a, b = b, c end
+    if B.cur == nil or B.cur.fields == nil then return b end
+    create v = B.cur.fields[a]
+    if v == nil then return b end
+    return v
+end
+
+-- bot.who() -> id, name of whoever triggered the current command (slash, prefix or button).
+-- Handy as a store key:  bot.store.add("coins:" .. bot.who(), 5)
+bot.who = function(a)
+    if B.cur == nil then return nil end
+    return B.cur.uid, B.cur.author
+end
+
+-- ================= bot.store: a small persistent key-value file =================
+-- A bot forgets everything when it stops. The store keeps levels, coins and
+-- per-server settings in one JSON file next to the script.
+--   bot.store.set("coins:123", 50)      bot.store.get("coins:123", 0)
+--   bot.store.add("coins:123", 5)       bot.store.del("coins:123")
+--   bot.store.has("k")                  bot.store.keys("coins:")  (sorted list)
+--   bot.store.file("mybot.json")        (default: discord_store.json)
+-- Every change is written at once (temp file, then swapped in), so a crash
+-- never leaves a half-written file. Values: numbers, strings, booleans, tables.
+bot.store = {}
+create ST = { "path": "discord_store.json", "data": nil }
+
+-- (key, x) from either bot.store.f(key, x) or bot.store:f(key, x)
+create function sarg(a, b, c)
+    if a == bot.store then return b, c end
+    return a, b
+end
+
+create function st_read_file(p)
+    create f = io.open(p, "rb")
+    if f == nil then return nil end
+    create txt = f:read("a")
+    io.close(f)
+    return txt
+end
+
+create function st_load()
+    if ST.data != nil then return end
+    ST.data = {}
+    create txt = st_read_file(ST.path)
+    if txt == nil then txt = st_read_file(ST.path .. ".tmp") end   -- a swap that was cut short
+    if txt == nil or string.trim(txt) == "" then return end
+    create ok, t = pcall(function() return json.decode(txt) end)
+    if ok and type(t) == "table" then
+        ST.data = t
+    else
+        -- unreadable: keep the file as .bad and start empty instead of overwriting it
+        os.remove(ST.path .. ".bad")
+        os.rename(ST.path, ST.path .. ".bad")
+    end
+end
+
+create function st_save()
+    create tmp = ST.path .. ".tmp"
+    create f = io.open(tmp, "wb")
+    if f == nil then return nil, "cannot write " .. ST.path end
+    f:write(json.encode(ST.data))
+    io.close(f)
+    os.remove(ST.path)   -- Windows will not rename over an existing file
+    if not os.rename(tmp, ST.path) then return nil, "cannot replace " .. ST.path end
+    return true
+end
+
+bot.store.file = function(a, b)
+    create p = sarg(a, b)
+    if type(p) != "string" or p == "" then return nil, "need a file name" end
+    ST.path = p
+    ST.data = nil
+    return true
+end
+
+bot.store.get = function(a, b, c)
+    create k, d = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    create v = ST.data[tostring(k)]
+    if v == nil then return d end
+    return v
+end
+
+bot.store.set = function(a, b, c)
+    create k, v = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    ST.data[tostring(k)] = v
+    return st_save()
+end
+
+-- add(key, n = 1): number += n (missing counts as 0). Returns the new value.
+bot.store.add = function(a, b, c)
+    create k, n = sarg(a, b, c)
+    if k == nil then return nil, "need a key" end
+    if n == nil then n = 1 end
+    if type(n) != "number" then return nil, "add needs a number" end
+    st_load()
+    create cur = ST.data[tostring(k)]
+    if cur == nil then cur = 0 end
+    if type(cur) != "number" then return nil, tostring(k) .. " is not a number" end
+    create nv = cur + n
+    ST.data[tostring(k)] = nv
+    create ok, err = st_save()
+    if not ok then return nil, err end
+    return nv
+end
+
+bot.store.del = function(a, b)
+    create k = sarg(a, b)
+    if k == nil then return nil, "need a key" end
+    st_load()
+    ST.data[tostring(k)] = nil
+    return st_save()
+end
+
+bot.store.has = function(a, b)
+    create k = sarg(a, b)
+    if k == nil then return false end
+    st_load()
+    return ST.data[tostring(k)] != nil
+end
+
+-- keys(prefix?) -> sorted list of the keys (only those starting with prefix)
+bot.store.keys = function(a, b)
+    create p = sarg(a, b)
+    st_load()
+    create out = []
+    repeat k, v in ST.data do   -- dict tables iterate (key, value)
+        if p == nil or string.startswith(k, p) then out:append(k) end
+    end
+    out:sort()
+    return out
+end
+
+-- ================= bot.paginate: pages with Prev / Next buttons =================
+-- bot.paginate(pages, opts?) shows one page at a time in the place the command
+-- ran (or opts.channel). pages: list of embeds, strings or {title=, description=}.
+-- opts: timeout = seconds without a click before the buttons turn off (60),
+--       anyone = true lets everybody flip (default: only the person who asked),
+--       start = first page, 0-based (0), channel = where to post.
+-- Blocks until it times out; returns true. Footer shows "Page x/n".
+create PG_N = 0
+
+create function pg_embed(p)
+    if type(p) == "table" and p._fields != nil then return p end
+    if type(p) == "table" then return bot.embed.create(p) end
+    return bot.embed.create({ "description": tostring(p) })
+end
+
+bot.paginate = function(a, b)
+    if a == bot then a, b = b, nil end
+    if type(a) != "list" or a:len() == 0 then return nil, "need a list of pages" end
+    create opts = b
+    if opts == nil then opts = {} end
+    create es = []
+    create foot = []
+    repeat p, i in a do
+        create e = pg_embed(p)
+        es:append(e)
+        foot:append(e._footer)
+    end
+    create n = es:len()
+    PG_N = PG_N + 1
+    create pid = "pg" .. tostring(PG_N) .. "_"
+    create timeout = opts.timeout or 60
+    create i = opts.start or 0
+    if i < 0 or i >= n then i = 0 end
+    create origin = B.cur
+
+    create render = function(idx, off)
+        create e = es[idx]
+        if n == 1 then return embed_payload(e, nil) end   -- one page: plain embed, no buttons
+        create tag = "Page " .. tostring(idx + 1) .. "/" .. tostring(n)
+        if foot[idx] != nil then e._footer = foot[idx] .. "  -  " .. tag else e._footer = tag end
+        create btns = [
+            { "label": "<", "id": pid .. "p", "style": 2, "disabled": off or idx == 0 },
+            { "label": tostring(idx + 1) .. "/" .. tostring(n), "id": pid .. "i", "style": 2, "disabled": true },
+            { "label": ">", "id": pid .. "x", "style": 2, "disabled": off or idx == n - 1 }
+        ]
+        return { "embeds": [embed_json(e)], "components": embed_rows(btns, nil) }
+    end
+    create restore = function()
+        repeat e, k in es do e._footer = foot[k] end
+    end
+
+    create via_int = origin != nil and origin.kind == "int" and opts.channel == nil
+    create owner = nil
+    create cid = nil
+    create mid = nil
+    create tok = nil
+    create app = nil
+    if via_int then
+        owner = origin.uid
+        cid = origin.channel
+        tok = origin.itoken
+        app = origin.app or B.app
+        create ok, err = interaction_send(render(i, false))
+        if not ok then restore() return nil, err end
+    else
+        if origin != nil then owner = origin.uid end
+        create target = opts.channel
+        if target == nil and origin != nil then target = origin.channel end
+        cid = resolve_channel(target)
+        if cid == nil then restore() return nil, "no channel in context" end
+        create r, code = rest("POST", "/channels/" .. cid .. "/messages", render(i, false))
+        if r == nil then restore() return nil, code end
+        if code != 200 and code != 201 then restore() return nil, B.err or r end
+        mid = json.decode(r).id
+    end
+
+    if n == 1 then
+        restore()
+        B.cur = origin
+        return true
+    end
+    create last = nil
+    create deadline = wall() + timeout
+    while wall() < deadline do
+        create ev = qtake(B.intq)
+        if ev == nil then
+            task.wait(0.05)
+        elseif ev.kind == "comp" and ev.ctype == 2 and ev.cid != nil and string.startswith(ev.cid, pid) then
+            B.cur = make_cur(ev)
+            if owner != nil and opts.anyone != true and tostring(ev.uid) != tostring(owner) then
+                -- answer strangers privately so Discord does not show "interaction failed"
+                interaction_send({ "content": "Only the person who asked can flip these pages.", "flags": 64 })
+            else
+                if ev.cid == pid .. "p" and i > 0 then i = i - 1 end
+                if ev.cid == pid .. "x" and i < n - 1 then i = i + 1 end
+                interaction_send(render(i, false), 7)
+                last = B.cur
+                deadline = wall() + timeout
+            end
+        else
+            B.intq:append(ev)
+            task.wait(0.01)
+        end
+    end
+
+    -- time is up: grey the buttons out (edit the message in place)
+    create dead = render(i, true)
+    if last != nil then
+        rest("PATCH", "/webhooks/" .. tostring(last.app or B.app) .. "/" .. last.itoken .. "/messages/@original", dead)
+    elseif via_int then
+        rest("PATCH", "/webhooks/" .. tostring(app) .. "/" .. tostring(tok) .. "/messages/@original", dead)
+    else
+        rest("PATCH", "/channels/" .. cid .. "/messages/" .. mid, dead)
+    end
+    restore()
+    B.cur = origin
+    return true
+end
+
+-- ================= timers: bot.every / bot.after =================
+-- bot.after("10m", fn)  runs fn once later;  bot.every("1h", fn)  runs it forever.
+-- Time: seconds (1.5) or text like "45s", "10m", "1h30m", "2d", "1w".
+-- Both return a handle: h:cancel(), h.alive, h.runs. fn(h) runs in the
+-- background without a command context, so give bot.send a channel:
+--   bot.every("1h", function() bot.send("general", "hourly ping") end)
+-- bot.stop() pauses timers too (they resume with bot.on(true)); a missed tick
+-- is skipped, never replayed. An error inside fn is kept in
+-- bot.debug.timer_error and the timer keeps running.
+create function dur_secs(x)
+    if type(x) == "number" then return x end
+    if type(x) != "string" then return nil end
+    create total = 0
+    create num = ""
+    create any = false
+    create i = 1
+    while i <= string.len(x) do
+        create b = string.byte(x, i)
+        create ch = string.sub(x, i, i)
+        if (b >= 48 and b <= 57) or b == 46 then
+            num = num .. ch
+        elseif ch != " " then
+            create v = tonumber(num)
+            if v == nil then return nil end
+            if ch == "s" then total = total + v
+            elseif ch == "m" then total = total + v * 60
+            elseif ch == "h" then total = total + v * 3600
+            elseif ch == "d" then total = total + v * 86400
+            elseif ch == "w" then total = total + v * 604800
+            else return nil end
+            num = ""
+            any = true
+        end
+        i = i + 1
+    end
+    if num != "" then
+        if any then return nil end       -- "1h30": a number without a unit
+        return tonumber(num)             -- plain "90" = seconds
+    end
+    if not any then return nil end
+    return total
+end
+
+bot.duration = function(a, b)
+    if a == bot then a = b end
+    create s = dur_secs(a)
+    if s == nil then return nil, "bad duration (use seconds or text like \"10m\", \"1h30m\")" end
+    return s
+end
+
+create function timer_new(kind, d, fn)
+    create secs = dur_secs(d)
+    if secs == nil or secs <= 0 then
+        return nil, "bad duration (use seconds or text like \"10m\", \"1h30m\")"
+    end
+    if type(fn) != "function" then return nil, "need a function" end
+    create h = { "alive": true, "kind": kind, "secs": secs, "runs": 0 }
+    h.cancel = function(self)
+        h.alive = false
+        return true
+    end
+    task.spawn(function()
+        create due = wall() + secs
+        while h.alive do
+            if wall() >= due then
+                if not B.paused then
+                    h.runs = h.runs + 1
+                    create ok, err = pcall(function() fn(h) end)
+                    if not ok then bot.debug.timer_error = tostring(err) end
+                end
+                if kind == "after" then
+                    h.alive = false
+                    return
+                end
+                due = due + secs
+                if due < wall() then due = wall() + secs end
+            end
+            task.wait(0.1)
+        end
+    end)
+    return h
+end
+
+bot.after = function(a, b, c)
+    if a == bot then a, b = b, c end
+    return timer_new("after", a, b)
+end
+
+bot.every = function(a, b, c)
+    if a == bot then a, b = b, c end
+    return timer_new("every", a, b)
+end
+
 
 return bot

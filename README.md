@@ -120,6 +120,7 @@ Load with `import`:
 | `import window("w")` | SDL2 graphics, input, sound (needs `window` component) |
 | `import ai` | tokenizer, MLP and text-model training (needs `ai` component) |
 | `import discord("bot")` | Discord bots (needs `discord` component) |
+| `bot.store`, `bot.paginate`, `bot.every` / `bot.after` | Discord extras: saved key-value data, Prev/Next pages, timers (rate limits are handled for you) |
 
 Third-party `.luc` files load with `create m = require("name")`. Extra search folders go in `LUC_PATH`.
 
@@ -169,6 +170,7 @@ More in `demos/` (libs, net, window, ai, discord).
 | HTTPS / WSS | yes | no (plain HTTP and TCP only) |
 | `window` (SDL2) | yes | no |
 | LCode editor | full | basic terminal editing |
+| GPU training (`lucTL`, CUDA via `lucffi`) | no | yes (`bash cuda/build_kaggle.sh`) |
 
 ## Documentation
 

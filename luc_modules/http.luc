@@ -1,0 +1,727 @@
+-- HTTP server (create http = require("http")): routes, JSON, static files. Express-style, one task per connection.
+--
+--   create http = require("http")
+--   http.get("/", function(req, res) res:send("hello") end)
+--   http.get("/user/:id", function(req, res) res:json({ "id": req.params.id, "q": req.query.q }) end)
+--   http.post("/api", function(req, res) res:status(201):json({ "got": req.json }) end)
+--   http.static("./public")              -- serves files after routes fail to match ("/" -> index.html)
+--   http.listen(8080)                    -- blocks; http.listen(8080, true) returns at once, the server keeps running
+--
+-- req: method path query params headers cookies body json form (+ req:header("name"))
+--      req.query.x   ?x=1        req.params.id   /user/:id        req.params["*"]  /files/*
+--      req.json      decoded JSON body (content-type json; req.jsonerr if invalid)
+--      req.form      decoded form body (application/x-www-form-urlencoded)
+-- res: status(code) header(k, v) send(text) json(table) html(text) text(text) file(path)
+--      redirect(url) cookie(name, value, { "maxage": 3600, "httponly": true }); all but the
+--      last few return res, so res:status(404):send("nope") chains. Returning a string or a
+--      table from the handler sends it too.
+-- Extras: http.use(fn(req, res))  middleware, runs first, stop it by answering
+--         http.cors("*")          CORS headers + automatic OPTIONS answers
+--         http.notfound(fn)  http.onerror(fn(req, res, err))  http.logging(false)  http.stop()
+--         http.timeout (30 s per request)  http.maxbody (1 MB)  http.any(path, fn)
+--         http.urlencode(s)  http.urldecode(s)
+-- Notes: Connection: close always. Requests are handled concurrently, but a handler that blocks
+--        (dn.get, big loops) holds up the others - use task.wait in long handlers. The socket
+--        listens on ALL network interfaces (net.serve has no bind address). No HTTPS, no chunked
+--        request bodies. pcall catches handler errors only until the handler's first task.wait.
+import net("dn")
+create json = require("json")
+
+create http = {}
+http.timeout = 30
+http.maxbody = 1048576
+http.maxhead = 16384
+
+create S = {
+    "routes": [], "mw": [], "statics": [], "server": nil, "running": false,
+    "log": true, "cors": nil, "notfound": nil, "onerror": nil, "conns": {}, "nconn": 0,
+}
+
+create REASONS = {
+    "100": "Continue", "200": "OK", "201": "Created", "202": "Accepted", "204": "No Content",
+    "206": "Partial Content", "301": "Moved Permanently", "302": "Found", "303": "See Other",
+    "304": "Not Modified", "307": "Temporary Redirect", "308": "Permanent Redirect",
+    "400": "Bad Request", "401": "Unauthorized", "403": "Forbidden", "404": "Not Found",
+    "405": "Method Not Allowed", "408": "Request Timeout", "409": "Conflict", "411": "Length Required",
+    "413": "Payload Too Large", "415": "Unsupported Media Type", "422": "Unprocessable Entity",
+    "429": "Too Many Requests", "431": "Request Header Fields Too Large",
+    "500": "Internal Server Error", "501": "Not Implemented", "502": "Bad Gateway",
+    "503": "Service Unavailable",
+}
+
+create MIMES = {
+    "html": "text/html; charset=utf-8", "htm": "text/html; charset=utf-8",
+    "css": "text/css; charset=utf-8", "js": "text/javascript; charset=utf-8",
+    "mjs": "text/javascript; charset=utf-8", "json": "application/json; charset=utf-8",
+    "txt": "text/plain; charset=utf-8", "md": "text/plain; charset=utf-8",
+    "csv": "text/csv; charset=utf-8", "xml": "application/xml; charset=utf-8",
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif",
+    "svg": "image/svg+xml", "ico": "image/x-icon", "webp": "image/webp",
+    "woff": "font/woff", "woff2": "font/woff2", "ttf": "font/ttf", "otf": "font/otf",
+    "pdf": "application/pdf", "zip": "application/zip", "wasm": "application/wasm",
+    "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+    "mp4": "video/mp4", "webm": "video/webm",
+}
+
+create function reason(code)
+    create r = REASONS[tostring(code)]
+    if r == nil then return "Status" end
+    return r
+end
+
+create function mime(path)
+    create ext = path:match("%.(%w+)$")
+    if ext == nil then return "application/octet-stream" end
+    create lext = ext:lower()
+    create m = MIMES[lext]
+    if m == nil then return "application/octet-stream" end
+    return m
+end
+
+-- ---------- url helpers ----------
+create function urldecode(s, plus)
+    if plus then s = s:gsub("%+", " ") end
+    s = s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+    return s
+end
+
+create function urlencode(s)
+    s = tostring(s)
+    s = s:gsub("[^%w%-_%.~]", function(ch) return string.format("%%%02X", ch:byte(1)) end)
+    return s
+end
+
+http.urldecode = function(s) return urldecode(tostring(s), true) end
+http.urlencode = urlencode
+http.mime = mime
+
+create function parse_query(qs)
+    create out = {}
+    if qs == nil or qs == "" then return out end
+    create parts = qs:split("&")
+    repeat p, i in parts do
+        if p != "" then
+            create eq = p:find("=", 1, true)
+            create k = p
+            create v = ""
+            if eq != nil then
+                k = p:sub(1, eq - 1)
+                v = p:sub(eq + 1)
+            end
+            out[urldecode(k, true)] = urldecode(v, true)
+        end
+    end
+    return out
+end
+
+-- split "/a/b/c" into ["a","b","c"] (raw, undecoded)
+create function split_path(p)
+    create out = []
+    repeat seg, i in p:split("/") do
+        if seg != "" then out:append(seg) end
+    end
+    return out
+end
+
+-- ---------- request parsing ----------
+create function parse_head(head)
+    create lines = head:split("\r\n")
+    create m, target, ver = lines[0]:match("^(%u+) (%S+) HTTP/(%d%.%d)$")
+    if m == nil then return nil end
+    create headers = {}
+    create i = 1
+    while i < lines:len() do
+        create ln = lines[i]
+        create colon = ln:find(":", 1, true)
+        if colon != nil and colon > 1 then
+            create hk = ln:sub(1, colon - 1):lower()
+            headers[hk] = ln:sub(colon + 1):trim()
+        end
+        i = i + 1
+    end
+    return { "method": m, "target": target, "version": ver, "headers": headers }
+end
+
+create function make_req(h, body)
+    create target = h.target
+    create path = target
+    create qs = ""
+    create q = target:find("?", 1, true)
+    if q != nil then
+        path = target:sub(1, q - 1)
+        qs = target:sub(q + 1)
+    end
+    create req = {
+        "method": h.method, "rawpath": path, "path": urldecode(path, false),
+        "querystring": qs, "query": parse_query(qs), "headers": h.headers,
+        "body": body, "params": {}, "cookies": {},
+    }
+    req.header = function(self, name)
+        create lname = name:lower()
+        return self.headers[lname]
+    end
+
+    create ck = h.headers["cookie"]
+    if ck != nil then
+        repeat part, i in ck:split(";") do
+            create kv = part:trim()
+            create eq = kv:find("=", 1, true)
+            if eq != nil and eq > 1 then
+                create cname = kv:sub(1, eq - 1)
+                req.cookies[cname] = urldecode(kv:sub(eq + 1), false)
+            end
+        end
+    end
+
+    create ct = h.headers["content-type"]
+    if ct != nil and body != "" then
+        create lct = ct:lower()
+        if lct:find("json", 1, true) != nil then
+            create ok, v = pcall(function() return json.decode(body) end)
+            if ok then
+                req.json = v
+            else
+                create em = tostring(v)
+                req.jsonerr = em:gsub("^[^:]*:%d+: ", "")
+            end
+        elseif lct:find("x-www-form-urlencoded", 1, true) != nil then
+            req.form = parse_query(body)
+        end
+    end
+    return req
+end
+
+-- wait for bytes (own polling: lib recv timeouts use os.clock, which is CPU time on Linux)
+create function recv_some(ctx, max, limit)
+    while true do
+        if ctx.closed then return nil, "closed" end
+        create m, e = dn.raw_recv(ctx.sock, max)
+        if m != nil then return m end
+        if e != nil then return nil, "closed" end
+        if os.time() > limit then return nil, "timeout" end
+        task.wait(0.01)
+    end
+end
+
+-- returns req, or nil + status + message
+create function read_request(ctx)
+    create c = ctx.sock
+    create buf = ""
+    create limit = os.time() + http.timeout
+    create hs = nil
+    create he = nil
+    while true do
+        create a, b = buf:find("\r\n\r\n", 1, true)
+        if a != nil then
+            hs = a
+            he = b
+            break
+        end
+        if buf:len() > http.maxhead then return nil, 431, "request headers too large" end
+
+        create chunk, e = recv_some(ctx, 8192, limit)
+        if chunk != nil then
+            buf = buf .. chunk
+        elseif e == "timeout" then
+            return nil, 408, "request timeout"
+        else
+            return nil, 0, "closed"
+        end
+    end
+
+    create h = parse_head(buf:sub(1, hs - 1))
+    if h == nil then return nil, 400, "bad request" end
+    create body = buf:sub(he + 1)
+
+    create te = h.headers["transfer-encoding"]
+    if te != nil and te:lower():find("chunked", 1, true) != nil then
+        return nil, 501, "chunked request bodies are not supported"
+    end
+    create cl = 0
+    if h.headers["content-length"] != nil then
+        cl = tonumber(h.headers["content-length"])
+        if cl == nil or cl < 0 then return nil, 400, "bad content-length" end
+    end
+    if cl > http.maxbody then return nil, 413, "body too large" end
+
+    if cl > body:len() then
+        create ex = h.headers["expect"]
+        if ex != nil and ex:lower():find("100-continue", 1, true) != nil then
+            c:send("HTTP/1.1 100 Continue\r\n\r\n")
+        end
+    end
+    while body:len() < cl do
+
+        create chunk2, e2 = recv_some(ctx, 65536, limit)
+        if chunk2 != nil then
+            body = body .. chunk2
+        elseif e2 == "timeout" then
+            return nil, 408, "request timeout"
+        else
+            return nil, 0, "closed"
+        end
+    end
+    if body:len() > cl then body = body:sub(1, cl) end
+    return make_req(h, body)
+end
+
+-- ---------- responses ----------
+create function close_ctx(ctx)
+    if ctx.closed then return end
+    ctx.closed = true
+    S.conns[tostring(ctx.id)] = nil
+    pcall(function() ctx.sock:close() end)
+end
+
+create function write_response(res, body)
+    create ctx = res.ctx
+    res.sent = true
+    if ctx.closed then return end
+    create code = res.code
+    create out = "HTTP/1.1 " .. code .. " " .. reason(code) .. "\r\n"
+    repeat h, i in res.hlist do
+        out = out .. h[0] .. ": " .. h[1] .. "\r\n"
+    end
+    out = out .. "Content-Length: " .. body:len() .. "\r\nConnection: close\r\nServer: luc\r\n\r\n"
+    if ctx.method != "HEAD" then out = out .. body end
+    ctx.sock:send(out)
+    close_ctx(ctx)
+    if S.log then
+        create ms = math.floor((os.clock() - ctx.c0) * 1000)
+        create lp = ctx.path:gsub("%c", "?")
+        print("http: " .. ctx.method .. " " .. lp .. " " .. code .. " " .. ms .. "ms")
+    end
+end
+
+create function read_file(path)
+    create f = io.open(path, "rb")
+    if f == nil then return nil end
+    create d = f:read("a")
+    f:close()
+    return d
+end
+
+create function clean(s)
+    s = tostring(s)
+    s = s:gsub("[\r\n]", " ")
+    return s
+end
+
+create function make_res(ctx)
+    create res = { "code": 200, "hlist": [], "sent": false, "ctx": ctx }
+
+    res.status = function(self, code)
+        self.code = code
+        return self
+    end
+
+    res.header = function(self, k, v)
+        k = clean(k)
+        v = clean(v)
+        create lk = k:lower()
+        create hl = self.hlist
+        if lk != "set-cookie" then
+            create i = 0
+            while i < hl:len() do
+                if hl[i][0]:lower() == lk then
+                    hl[i] = [k, v]
+                    return self
+                end
+                i = i + 1
+            end
+        end
+        hl:append([k, v])
+        return self
+    end
+
+    res.hasheader = function(self, k)
+        create lk = k:lower()
+        create i = 0
+        while i < self.hlist:len() do
+            if self.hlist[i][0]:lower() == lk then return true end
+            i = i + 1
+        end
+        return false
+    end
+
+    res.send = function(self, body, ctype)
+        if self.sent then return self end
+        if body == nil then body = "" end
+        if type(body) != "string" then body = tostring(body) end
+        if ctype != nil then
+            self:header("Content-Type", ctype)
+        elseif not self:hasheader("content-type") then
+            if body:sub(1, 1) == "<" then
+                self:header("Content-Type", "text/html; charset=utf-8")
+            else
+                self:header("Content-Type", "text/plain; charset=utf-8")
+            end
+        end
+        write_response(self, body)
+        return self
+    end
+
+    res.text = function(self, body) return self:send(body, "text/plain; charset=utf-8") end
+    res.html = function(self, body) return self:send(body, "text/html; charset=utf-8") end
+
+    res.json = function(self, t, code)
+        if code != nil then self.code = code end
+        return self:send(json.encode(t), "application/json; charset=utf-8")
+    end
+
+    res.file = function(self, path, ctype)
+        create d = read_file(path)
+        if d == nil then
+            self.code = 404
+            return self:send("Not Found", "text/plain; charset=utf-8")
+        end
+        if ctype == nil then ctype = mime(path) end
+        return self:send(d, ctype)
+    end
+
+    res.redirect = function(self, url, code)
+        if code == nil then code = 302 end
+        self.code = code
+        self:header("Location", url)
+        return self:send("", "text/plain; charset=utf-8")
+    end
+
+    res.cookie = function(self, name, value, o)
+        create c = name .. "=" .. urlencode(value)
+        create path = "/"
+        if o != nil and o.path != nil then path = o.path end
+        c = c .. "; Path=" .. path
+        if o != nil then
+            if o.maxage != nil then c = c .. "; Max-Age=" .. o.maxage end
+            if o.httponly then c = c .. "; HttpOnly" end
+            if o.secure then c = c .. "; Secure" end
+            if o.samesite != nil then c = c .. "; SameSite=" .. o.samesite end
+        end
+        return self:header("Set-Cookie", c)
+    end
+
+    if S.cors != nil then
+        res:header("Access-Control-Allow-Origin", S.cors)
+    end
+    return res
+end
+
+create function answer(res, ret)
+    if res.sent or ret == nil then return end
+    create t = type(ret)
+    if t == "string" then
+        res:send(ret)
+    elseif t == "table" or t == "list" then
+        res:json(ret)
+    end
+end
+
+-- ---------- routing ----------
+create function add_route(method, pattern, fn)
+    S.routes:append({ "method": method, "pattern": pattern, "segs": split_path(pattern), "fn": fn })
+end
+
+create function reg_method(method)
+    return function(a, b, c)
+        if a == http then
+            a = b
+            b = c
+        end
+        add_route(method, a, b)
+    end
+end
+
+http.get = reg_method("GET")
+http.post = reg_method("POST")
+http.put = reg_method("PUT")
+http.patch = reg_method("PATCH")
+http.delete = reg_method("DELETE")
+http.any = reg_method("*")
+
+http.use = function(a, b)
+    create fn = a
+    if a == http then fn = b end
+    S.mw:append(fn)
+end
+
+http.notfound = function(a, b)
+    if a == http then S.notfound = b else S.notfound = a end
+end
+
+http.onerror = function(a, b)
+    if a == http then S.onerror = b else S.onerror = a end
+end
+
+http.logging = function(a, b)
+    if a == http then S.log = b else S.log = a end
+end
+
+http.cors = function(a, b)
+    create o = a
+    if a == http then o = b end
+    if o == nil then o = "*" end
+    if o == false then S.cors = nil else S.cors = o end
+end
+
+-- static(dir) serves "/" ; static("/assets", dir) serves under a prefix
+http.static = function(a, b, c)
+    if a == http then
+        a = b
+        b = c
+    end
+    create prefix = "/"
+    create dir = a
+    if b != nil then
+        prefix = a
+        dir = b
+    end
+    if dir:endswith("/") or dir:endswith("\\") then dir = dir:sub(1, dir:len() - 1) end
+    S.statics:append({ "segs": split_path(prefix), "dir": dir })
+end
+
+create function match_route(route, segs)
+    create rs = route.segs
+    create n = rs:len()
+    create params = {}
+    create i = 0
+    while i < n do
+        create seg = rs[i]
+        if seg == "*" then
+            create rest = ""
+            create j = i
+            while j < segs:len() do
+                if rest != "" then rest = rest .. "/" end
+                rest = rest .. urldecode(segs[j], false)
+                j = j + 1
+            end
+            params["*"] = rest
+            return params
+        end
+        if i >= segs:len() then return nil end
+        if seg:sub(1, 1) == ":" then
+            create pname = seg:sub(2)
+            params[pname] = urldecode(segs[i], false)
+        elseif seg != segs[i] then
+            return nil
+        end
+        i = i + 1
+    end
+    if segs:len() != n then return nil end
+    return params
+end
+
+create function safe_segment(s)
+    if s == "" or s == ".." or s:sub(1, 1) == "." then return false end
+    if s:find("/", 1, true) != nil or s:find("\\", 1, true) != nil then return false end
+    if s:find(":", 1, true) != nil then return false end
+    if s:find(string.char(0), 1, true) != nil then return false end
+    return true
+end
+
+create function try_static(req, res, segs)
+    repeat st, si in S.statics do
+        create ps = st.segs
+        create okp = true
+        create j = 0
+        while j < ps:len() do
+            if j >= segs:len() or segs[j] != ps[j] then
+                okp = false
+                break
+            end
+            j = j + 1
+        end
+        if okp then
+            create rest = []
+            create good = true
+            create k = ps:len()
+            while k < segs:len() do
+                create seg = urldecode(segs[k], false)
+                if not safe_segment(seg) then
+                    good = false
+                    break
+                end
+                rest:append(seg)
+                k = k + 1
+            end
+            if good then
+                create rel = ""
+                repeat seg, i in rest do
+                    if rel != "" then rel = rel .. "/" end
+                    rel = rel .. seg
+                end
+                create wantdir = rel == "" or req.rawpath:endswith("/")
+                if wantdir then
+                    if rel != "" then rel = rel .. "/" end
+                    rel = rel .. "index.html"
+                end
+                create path = st.dir .. "/" .. rel
+                create d = read_file(path)
+                -- an empty read of an extension-less name is probably a directory
+                if d != nil and d == "" and not wantdir and path:match("%.%w+$") == nil then
+                    d = read_file(path .. "/index.html")
+                    if d != nil then path = path .. "/index.html" end
+                end
+                if d != nil and (d != "" or path:match("%.%w+$") != nil) then
+                    res:send(d, mime(path))
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+create function not_found(req, res)
+    if S.notfound != nil then
+        create ret = S.notfound(req, res)
+        answer(res, ret)
+        if res.sent then return end
+    end
+    res:status(404):send("Not Found: " .. req.path)
+end
+
+create function dispatch(req, res)
+    if S.cors != nil and req.method == "OPTIONS" then
+        res:header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+        create want = req.headers["access-control-request-headers"]
+        if want == nil then want = "Content-Type, Authorization" end
+        res:header("Access-Control-Allow-Headers", want)
+        res:header("Access-Control-Max-Age", "86400")
+        res:status(204):send("")
+        return
+    end
+
+    repeat fn, i in S.mw do
+        answer(res, fn(req, res))
+        if res.sent then return end
+    end
+
+    create segs = split_path(req.rawpath)
+    create method = req.method
+    if method == "HEAD" then method = "GET" end
+    create allowed = ""
+    repeat r, i in S.routes do
+        create params = match_route(r, segs)
+        if params != nil then
+            if r.method == method or r.method == "*" then
+                req.params = params
+                answer(res, r.fn(req, res))
+                return
+            end
+            if allowed != "" then allowed = allowed .. ", " end
+            allowed = allowed .. r.method
+        end
+    end
+
+    if method == "GET" and try_static(req, res, segs) then return end
+    if allowed != "" then
+        res:header("Allow", allowed)
+        res:status(405):send("Method Not Allowed")
+        return
+    end
+    not_found(req, res)
+end
+
+create function fail(ctx, code, msg)
+    create res = make_res(ctx)
+    res:status(code):send(msg)
+end
+
+create function handle(c)
+    S.nconn = S.nconn + 1
+    create ctx = {
+        "sock": c, "id": S.nconn, "closed": false, "t0": os.time(), "c0": os.clock(),
+        "method": "GET", "path": "/",
+    }
+    S.conns[tostring(ctx.id)] = ctx
+
+    create req, code, msg = read_request(ctx)
+    if req == nil then
+        if code == 0 then
+            close_ctx(ctx)
+        else
+            fail(ctx, code, msg)
+        end
+        return
+    end
+    ctx.method = req.method
+    ctx.path = req.path
+
+    create res = make_res(ctx)
+    -- pcall's first result is unreliable once the handler has yielded, so a flag says "finished"
+    create state = { "done": false }
+    create ok, err = pcall(function()
+        dispatch(req, res)
+        state.done = true
+    end)
+    if not state.done then
+        print("http: error in " .. req.method .. " " .. req.path .. ": " .. tostring(err))
+        if S.onerror != nil and not res.sent then
+            pcall(function() answer(res, S.onerror(req, res, err)) end)
+        end
+        if not res.sent then
+            res:status(500):send("Internal Server Error")
+        end
+    elseif not res.sent then
+        print("http: handler for " .. req.method .. " " .. req.path .. " sent no response")
+        res:status(500):send("handler did not send a response")
+    end
+end
+
+-- close connections still open 2 s after http.timeout (stuck or crashed handlers)
+create function sweep(now)
+    create stale = []
+    repeat k, ctx in S.conns do
+        if not ctx.closed and now - ctx.t0 > http.timeout + 2 then stale:append(ctx) end
+    end
+    repeat ctx, i in stale do close_ctx(ctx) end
+end
+
+http.listen = function(a, b, c)
+    create port = a
+    create bg = b
+    if a == http then
+        port = b
+        bg = c
+    end
+    if port == nil then port = 8000 end
+    create s, e = dn.serve(port)
+    if s == nil then error("http.listen: " .. tostring(e)) end
+    S.server = s
+    S.running = true
+    if S.log then print("http: listening on http://localhost:" .. port) end
+
+    create function loop()
+        create last = os.time()
+        while S.running do
+            create conn = dn.raw_accept(s)
+            if conn != nil then
+                task.spawn(handle, conn)
+            else
+                task.wait(0.01)
+            end
+            create now = os.time()
+            if now != last then
+                last = now
+                sweep(now)
+            end
+        end
+    end
+
+    if bg then
+        task.spawn(loop)
+        return true
+    end
+    loop()
+    return true
+end
+
+http.stop = function()
+    S.running = false
+    if S.server != nil then
+        pcall(function() S.server:close() end)
+        S.server = nil
+    end
+end
+
+return http

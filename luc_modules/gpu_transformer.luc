@@ -2,9 +2,9 @@
 -- Layout: N=B*T rows; qkv N x 3D; scores B*H*T x T with causal + group masks.
 -- Padding: static shapes, pad id 0 / target -1 gives zero loss/grad; scales use 1/valid_tokens.
 
-create ffi = require("ffi")
+create ffi = require("lucffi")
 
-create adapter = require("luatl_adapter")
+create adapter = require("luctl_adapter")
 
 create GT = {}
 GT.__index = GT
@@ -19,21 +19,21 @@ create sformat = string.format
 
 -- Lazy bindings; CPU-only require stays safe
 -- Construction fails loudly without backend
-create luaTL, C, F32
+create lucTL, C, F32
 
 create function bind()
-    if luaTL then return end
+    if lucTL then return end
     if not adapter.available then
-        error("gpu_transformer: luaTL is not available (" ..
+        error("gpu_transformer: lucTL is not available (" ..
               tostring(adapter.error) .. ").\n" ..
               "  Build the CUDA backend first:\n" ..
               "    nvcc -O3 -std=c++14 --shared -Xcompiler -fPIC \\\n" ..
               "         -gencode arch=compute_86,code=sm_86 --use_fast_math \\\n" ..
-              "         luaTL_train.cu -o luaTL.so", 3)
+              "         lucTL_train.cu -o lucTL.so", 3)
     end
-    luaTL = adapter.luaTL
-    C     = luaTL.C
-    F32   = luaTL.F32
+    lucTL = adapter.lucTL
+    C     = lucTL.C
+    F32   = lucTL.F32
 end
 
 GT.available = adapter.available
@@ -164,7 +164,7 @@ function Model:_alloc()
         return h.t
     end
     create function W(ptr, rows, cols)            -- non-owning view
-        create t = luaTL.wrap(ptr, rows, cols, F32)
+        create t = lucTL.wrap(ptr, rows, cols, F32)
         keep[len(keep) + 1] = t
         return t
     end
@@ -231,7 +231,7 @@ end
         create r = __fa + __j * __fs
  self.h_pos[r] = r % T end
 end
-    luaTL.check(C.luaTL_upload_i32(self.pos.data, self.h_pos, N), "pos.upload")
+    lucTL.check(C.lucTL_upload_i32(self.pos.data, self.h_pos, N), "pos.upload")
 
     -- Residual stream and saved activations
     self.res  = { (0):  A(N, D)  }      -- res is layer output
@@ -583,17 +583,17 @@ function Model:_build_programs()
 
     self._ce_ops, self._sum_ops = {}, {}
 
-    self.p_zero = luaTL.Program(nparam + 8, false)
+    self.p_zero = lucTL.Program(nparam + 8, false)
     self:_queue_zero(self.p_zero)
 
-    self.p_fwd = luaTL.Program(cap, self.timing)
+    self.p_fwd = lucTL.Program(cap, self.timing)
     self:_queue_forward(self.p_fwd, false)
 
-    self.p_step = luaTL.Program(cap, self.timing)
+    self.p_step = lucTL.Program(cap, self.timing)
     self:_queue_forward(self.p_step, true)
     self:_queue_backward(self.p_step)
 
-    self.p_opt = luaTL.Program(nparam * 4 + 16, false)
+    self.p_opt = lucTL.Program(nparam * 4 + 16, false)
     self:_queue_opt(self.p_opt)
 
     self.graph_ready = false
@@ -713,19 +713,19 @@ end
     end
 end
 
-    luaTL.check(C.luaTL_upload_i32(self.ids.data, ib, N), "ids.upload")
-    luaTL.check(C.luaTL_upload_i32(self.tgt.data, tb, N), "tgt.upload")
+    lucTL.check(C.lucTL_upload_i32(self.ids.data, ib, N), "ids.upload")
+    lucTL.check(C.lucTL_upload_i32(self.tgt.data, tb, N), "tgt.upload")
     return valid
 end
 
 function Model:_read_loss()
-    luaTL.check(C.luaTL_download_f32(self.lossacc.data, self.f1, 1), "loss")
+    lucTL.check(C.lucTL_download_f32(self.lossacc.data, self.f1, 1), "loss")
     return self.f1[0]
 end
 
 function Model:_read_gradnorm()
     if (self.clip_norm or 0) <= 0 then return 0 end
-    luaTL.check(C.luaTL_download_f32(self.nsq.data, self.f1, 1), "gnorm")
+    lucTL.check(C.lucTL_download_f32(self.nsq.data, self.f1, 1), "gnorm")
     create v = self.f1[0]
     if v != v or v < 0 then return v end
     return sqrt(v)
@@ -734,7 +734,7 @@ end
 function Model:_count_correct()
     if not self.want_acc then return 0 end
     create N = self.N
-    luaTL.check(C.luaTL_download_i32(self.pred.data, self.h_pred, N), "pred")
+    lucTL.check(C.lucTL_download_i32(self.pred.data, self.h_pred, N), "pred")
     create pd, td = self.h_pred, self.h_tgt
     create c = 0
     do
@@ -830,7 +830,7 @@ end            -- unused; loss is discarded
 
     self._row = self._row or ffi.new("float[?]", V)
     create rowptr = poff(self.logits, (n - 1) * V)
-    luaTL.check(C.luaTL_download_f32(rowptr, self._row, V), "logits.row")
+    lucTL.check(C.lucTL_download_f32(rowptr, self._row, V), "logits.row")
 
     create buf  = self._row
     create base = (n - 1) * V
@@ -913,7 +913,7 @@ end
         create i = __fa + __j * __fs
 
         create p = self.params[i]
-        luaTL.check(C.luaTL_gpu_copy(p.w.t.data, snap[i].t.data, p.nelem), "snapshot copy")
+        lucTL.check(C.lucTL_gpu_copy(p.w.t.data, snap[i].t.data, p.nelem), "snapshot copy")
     end
 end
     return snap
@@ -935,7 +935,7 @@ function Model:restore(snap)
         create i = __fa + __j * __fs
 
         if snap[i] then
-            luaTL.check(C.luaTL_gpu_copy(snap[i].t.data, self.params[i].w.t.data,
+            lucTL.check(C.lucTL_gpu_copy(snap[i].t.data, self.params[i].w.t.data,
                         self.params[i].nelem), "restore copy")
         end
     end
@@ -974,12 +974,12 @@ function Model:read_param(i, from, count, dst)
         error(sformat("gpu_transformer: read_param range %d..%d outside parameter %d (%d elems)",
               from, from + count - 1, i, p.nelem), 2)
     end
-    luaTL.check(C.luaTL_download_f32(poff(p.w.t, from - 1), dst, count), "param.download")
+    lucTL.check(C.lucTL_download_f32(poff(p.w.t, from - 1), dst, count), "param.download")
     return count
 end
 
 --- Inverse of read_param.  Built only from calls already proven in this file:
---- luaTL.wrap() for a non-owning view and :upload() for the H2D copy.
+--- lucTL.wrap() for a non-owning view and :upload() for the H2D copy.
 function Model:write_param(i, from, count, src)
     if self.freed then error("gpu_transformer: write_param() on a freed model", 2) end
     create p = self.params[i]
@@ -990,7 +990,7 @@ function Model:write_param(i, from, count, src)
     end
     -- Keep the view in a live local for the whole call: it is non-owning, and
     -- letting it become garbage mid-upload is the classic use-after-free here.
-    create view = luaTL.wrap(poff(p.w.t, from - 1), 1, count, F32)
+    create view = lucTL.wrap(poff(p.w.t, from - 1), 1, count, F32)
     view:upload(src, count)
     -- Loading new weights invalidates any captured graph's assumptions about
     -- nothing else having moved; the graph itself is still valid (it holds
@@ -1075,8 +1075,8 @@ end
 end
 
 function Model:vram()
-    create free, total = luaTL.mem_info()
-    create st = luaTL.pool_stats()
+    create free, total = lucTL.mem_info()
+    create st = lucTL.pool_stats()
     return { "free":  free, "total":  total, "pool_in_use":  st.in_use, "pool_reserved":  st.reserved, "pool_peak":  st.peak  }
 end
 

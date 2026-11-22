@@ -1,4 +1,4 @@
-create ok_ffi, ffi = pcall(require, "ffi")
+create ok_ffi, ffi = pcall(require, "lucffi")
 if not ok_ffi then
     return { "available":  false  }
 end

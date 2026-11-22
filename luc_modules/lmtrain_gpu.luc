@@ -109,14 +109,14 @@ end
 
     --  Build
     function LMTrain:_build_gpu()
-        create ok_ad, adapter = pcall(require, "luatl_adapter")
+        create ok_ad, adapter = pcall(require, "luctl_adapter")
         if not ok_ad or not adapter.available then
             error(sformat(
-                "LMTrain: backend = 'gpu' was requested but luaTL is unavailable: %s\n" ..
-                "  Build the CUDA backend and put luaTL.so / luaTL.dll on the load path:\n" ..
+                "LMTrain: backend = 'gpu' was requested but lucTL is unavailable: %s\n" ..
+                "  Build the CUDA backend and put lucTL.so / lucTL.dll on the load path:\n" ..
                 "    nvcc -O3 -std=c++14 --shared -Xcompiler -fPIC \\\n" ..
                 "         -gencode arch=compute_86,code=sm_86 --use_fast_math \\\n" ..
-                "         luaTL_train.cu -o luaTL.so\n" ..
+                "         lucTL_train.cu -o lucTL.so\n" ..
                 "  Or set backend = 'cpu' to use the pure-Lua autograd path.",
                 ok_ad and tostring(adapter.error or "not available")
                        or tostring(adapter)), 3)
@@ -124,7 +124,7 @@ end
 
         create ok_gt, GT = pcall(require, "gpu_transformer")
         if not ok_gt then
-            error("LMTrain: backend = 'gpu' but gpu_transformer.lua failed to load: "
+            error("LMTrain: backend = 'gpu' but gpu_transformer.luc failed to load: "
                   .. tostring(GT), 3)
         end
 
@@ -134,7 +134,7 @@ end
         -- the handle finalizers -- i.e. train:load() twice was ~2x VRAM.
         -- best_snapshot must be dropped first: it aliases handles that
         -- Model:free() is about to release, and restoring it into a NEW model
-        -- would hand freed device pointers to luaTL_gpu_copy.
+        -- would hand freed device pointers to lucTL_gpu_copy.
         if self.gpu_model then
             if self.best_snapshot then
                 pcall(function() self.gpu_model:release_snapshot(self.best_snapshot) end)
@@ -328,7 +328,7 @@ end   -- no stale windows
                 m:maybe_capture()
 
                 -- Safe between steps: the checkpoint only reads p.w.t via
-                -- luaTL_download_f32 and never touches _valid, the CE/sum/adam
+                -- lucTL_download_f32 and never touches _valid, the CE/sum/adam
                 -- command structs, or the captured graph.
                 if self._as and self._as.seconds then self:_autosave_tick("batch") end
             end

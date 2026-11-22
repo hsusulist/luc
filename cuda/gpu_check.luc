@@ -1,0 +1,49 @@
+-- GPU check for lucTL: run from the repo root after building luc_modules/lucTL.so
+--   ./luc cuda/gpu_check.luc
+
+create adapter = require("luctl_adapter")
+if not adapter.available then
+    print("lucTL: NOT available")
+    print("  reason: " .. tostring(adapter.error))
+    print("  build it first:  bash cuda/build_kaggle.sh")
+    os.exit(1)
+end
+
+create T = adapter.lucTL
+create hw = T.hardware()
+print(string.format("lucTL ok  | %s  %s  %d CUDA cores  %.1f GB VRAM",
+    hw.name, hw.sm, hw.cuda_cores, hw.total_vram / 1073741824))
+print("versions  | " .. tostring(T.core_version) .. " / " .. tostring(T.train_version))
+
+-- 1. correctness: GPU matmul vs the same product on the CPU
+create M, K, N = 64, 48, 32
+create a, b = {}, {}
+repeat 1, M * K as i do a[i + 1] = math.random() - 0.5 end
+repeat 1, K * N as i do b[i + 1] = math.random() - 0.5 end
+create g = adapter.matmul(a, M, K, b, N)
+create worst = 0
+repeat 1, M as i do
+    repeat 1, N as j do
+        create s = 0
+        repeat 1, K as k do s = s + a[i * K + k + 1] * b[k * N + j + 1] end
+        create d = math.abs(s - g[i * N + j + 1])
+        if d > worst then worst = d end
+    end
+end
+print(string.format("matmul    | %dx%d @ %dx%d  max |gpu - cpu| = %.2e  %s", M, K, K, N, worst,
+    worst < 1e-3 and "OK" or "MISMATCH"))
+
+-- 2. speed: one big GEMM
+create r = T.benchmark_gemm(2048, 2048, 2048, "f32", 10)
+print(string.format("gemm      | 2048^3 f32  %.2f ms  %.2f TFLOP/s", r.seconds * 1000, r.tflops))
+
+-- 3. a short GPU-resident training run
+import ai
+create text = "the quick brown fox jumps over the lazy dog. "
+create data = ""
+repeat 1, 40 as i do data = data .. text end
+create model = ai.LMTrain({ "data": data, "backend": "gpu", "dim": 64, "layers": 2, "heads": 4,
+                            "ffn": 128, "max_seq": 64, "batch_size": 8, "epochs": 60 })
+model:run()
+print("sample    | " .. tostring(model:generate("the quick", 30)))
+print("done: lanternl is running on the GPU through lucTL")

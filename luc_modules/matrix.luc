@@ -15,6 +15,12 @@ end
 create ok_tclear, tclear = pcall(require, "table.clear")
 if not ok_tclear or type(tclear) != "function" then tclear = nil end
 
+-- Native kernels (built into luc.exe as require("aikern")). Same results bit-for-bit as the
+-- Lua loops below, ~50x faster. Older luc builds don't have it: the Lua loops are used.
+create ok_kern, kern = pcall(require, "aikern")
+if not ok_kern or type(kern) != "table" or type(kern.mm) != "function" then kern = nil end
+matrix.native = kern != nil
+
 matrix.strict = false
 matrix.accel = { "enabled":  true, "threshold":  4096, "max_errors":  3, "force":  nil  }
 matrix.last_backend = "lua"
@@ -22,7 +28,7 @@ matrix.last_backend = "lua"
 create mt = { "__index":  matrix  }
 matrix.mt = mt
 
-create BACKEND_NAMES = { 1:  "luatl_adapter", 2:  "gpu", 3:  "blas"  }
+create BACKEND_NAMES = { 1:  "luctl_adapter", 2:  "gpu", 3:  "blas"  }
 create backends = {}
 
 create function probe(name)
@@ -68,7 +74,7 @@ function matrix.adapter()
     repeat 1, __fn as __j do
         create i = __fa + __j * __fs
 
-        if backends[i].name == "luatl_adapter" then return backends[i].module end
+        if backends[i].name == "luctl_adapter" then return backends[i].module end
     end
 end
     return nil
@@ -311,6 +317,31 @@ end
     return m
 end
 
+-- rows x cols of uniform values in [-scale, scale) (scale defaults to 1)
+-- LUC lists are 0-based ([1, 2, 3]); this library uses 1-based Lua-style tables. Convert
+-- (nested) lists so users can pass either: matrix.from([[1, 2], [3, 4]]) works.
+function matrix.to_table(v)
+    if type(v) != "list" then return v end
+    create t = {}
+    repeat x, i in v do t[i + 1] = matrix.to_table(x) end
+    return t
+end
+
+function matrix.random(rows, cols, scale)
+    scale = scale or 1
+    if type(scale) != "number" then
+        error("matrix.random: scale must be a number, got " .. type(scale), 2)
+    end
+    create m = matrix.new(rows, cols)
+    create d = m.data
+    create i = 1
+    while i <= rows * cols do
+        d[i] = (math.random() * 2 - 1) * scale
+        i = i + 1
+    end
+    return m
+end
+
 function matrix.identity(n)
     create m = matrix.new(n, n)
     do
@@ -326,6 +357,7 @@ end
 end
 
 function matrix.from(t, rows, cols)
+    t = matrix.to_table(t)
     if type(t) != "table" then
         error("matrix.from: expected a table, got " .. type(t), 2)
     end
@@ -751,6 +783,7 @@ end
 end
 
 create function mm(ad, bd, rd, m, k, n, acc)
+    if kern then return kern.mm(ad, bd, rd, m, k, n, acc) end
     do
     create __fa = (1)
     create __fb = (m )
@@ -903,6 +936,10 @@ function matrix.matmul_nt(a, b, out, acc)
     end
     if m == 0 or n == 0 then return result end
     create ad, bd, rd = a.data, b.data, result.data
+    if kern then
+        kern.mm_nt(ad, bd, rd, m, k, n, acc)
+        return result
+    end
     do
     create __fa = (1)
     create __fb = (m )
@@ -969,6 +1006,10 @@ end
     end
     if m == 0 or k == 0 or n == 0 then return result end
     create ad, bd = a.data, b.data
+    if kern then
+        kern.mm_tn(ad, bd, rd, m, k, n, true)   -- rd was zeroed above unless acc
+        return result
+    end
     do
     create __fa = (1)
     create __fb = (m )

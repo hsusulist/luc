@@ -135,14 +135,15 @@ LFN(f_rawequal){ UNUSED_SELF; RET(0,mkbool(val_rawequal(AR(0),AR(1)))); return 1
 LFN(f_collectgarbage){ UNUSED_SELF; gc_collect(); RET(0,mknum((double)V.nalloc)); return 1; }
 
 static Value lucL_aikern_module(void);   /* lanternl kernels, below */
+static Value lucL_ffi_module(void);      /* lucffi: luc_ffi.c */
 /* require loads third-party modules; system libs use import. */
 LFN(f_require){ UNUSED_SELF;
     Str *name=checkstr(L,base,nargs,0,"require");
     Value key=mkobj(LT_STR,name);
     Value cached=tab_get(V.loaded,key);
     if(cached.t!=LT_NIL){ RET(0,cached); return 1; }
-    if(strcmp(name->s,"json")==0||strcmp(name->s,"aikern")==0){
-        Value m= name->s[0]=='j'? lucL_json_module() : lucL_aikern_module();
+    if(strcmp(name->s,"json")==0||strcmp(name->s,"aikern")==0||strcmp(name->s,"lucffi")==0){
+        Value m= name->s[0]=='j'? lucL_json_module() : name->s[0]=='a'? lucL_aikern_module() : lucL_ffi_module();
         tab_set(V.loaded,key,m);
         RET(0,m); return 1;
     }
@@ -1162,8 +1163,10 @@ void lucL_open_io(void){
    the Lua loops it replaces so results are bit-for-bit identical. */
 static double *aik_read(Table *t,int n,const char *fn,const char *what){
     double *v;
+    size_t cnt;
     if(n<0) luc_error("aikern.%s: bad size",fn);
-    v=(double*)malloc(sizeof(double)*(size_t)(n?n:1));
+    cnt= n>0? (size_t)n : 1;              /* n<0 never gets here; keeps gcc's size check quiet */
+    v=(double*)malloc(sizeof(double)*cnt);
     if(!v) luc_error("aikern.%s: out of memory",fn);
     for(int i=0;i<n;i++){
         Value x= i<t->alen? t->arr[i] : tab_get(t,mknum((double)(i+1)));
@@ -2564,6 +2567,19 @@ void lucL_open_math(void){
 #endif
 LFN(f_os_clock){ UNUSED_SELF; (void)base;(void)nargs;
     RET(0,mknum((double)clock()/(double)CLOCKS_PER_SEC)); return 1; }
+/* os.now(): wall-clock seconds from a monotonic clock. os.clock() is CPU time on Linux/macOS
+   (it stands still while a script sleeps) but wall time on Windows; use os.now() to measure
+   waiting, timeouts and timers the same way everywhere. */
+LFN(f_os_now){ UNUSED_SELF; (void)base;(void)nargs;
+#if defined(_WIN32)
+    LARGE_INTEGER fq,cn;
+    QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&cn);
+    RET(0,mknum((double)cn.QuadPart/(double)fq.QuadPart));
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    RET(0,mknum((double)ts.tv_sec+(double)ts.tv_nsec/1e9));
+#endif
+    return 1; }
 LFN(f_os_time){ UNUSED_SELF; (void)base;(void)nargs;
     RET(0,mknum((double)time(NULL))); return 1; }
 LFN(f_os_difftime){ UNUSED_SELF;
@@ -2628,7 +2644,7 @@ LFN(f_os_termwidth){ UNUSED_SELF; (void)base;(void)nargs;
 }
 void lucL_open_os(void){
     Table *o=newlib("os");
-    reg(o,"clock",f_os_clock); reg(o,"time",f_os_time);  reg(o,"date",f_os_date);
+    reg(o,"clock",f_os_clock); reg(o,"now",f_os_now); reg(o,"time",f_os_time);  reg(o,"date",f_os_date);
     reg(o,"difftime",f_os_difftime);
     reg(o,"termwidth",f_os_termwidth);
     reg(o,"exit",f_os_exit);   reg(o,"getenv",f_os_getenv);
@@ -5073,9 +5089,32 @@ static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
                 ISC_REQ_CONFIDENTIALITY|ISC_REQ_ALLOCATE_MEMORY|ISC_REQ_STREAM;
     SecBufferDesc inb, outb;
     SecBuffer inbuf[2], outbuf[1];
-    int first=1, done=0, nread=0;
-    char rbuf[16384];
+    int first=1, done=0, need_read=0, guard=0;
+    /* Bytes received from the server but not consumed yet. A TLS record (the certificate
+       chain, mostly) often arrives in several TCP segments: on SEC_E_INCOMPLETE_MESSAGE we
+       must keep what we have and read more, never start over with a fresh buffer. */
+    char *hb=NULL; size_t hlen=0, hcap=0;
     while(!done){
+        if(++guard>400){
+            snprintf(err,errcap,"tls: handshake did not finish");
+            free(hb); tls_free_session(s); return -1;
+        }
+        if(!first && (need_read || hlen==0)){
+            if(hcap-hlen<16384){
+                size_t nc=hcap?hcap*2:32768;
+                while(nc-hlen<16384) nc*=2;
+                char *np=(char*)realloc(hb,nc);
+                if(!np){ snprintf(err,errcap,"out of memory"); free(hb); tls_free_session(s); return -1; }
+                hb=np; hcap=nc;
+            }
+            int n=recv(fd,hb+hlen,(int)(hcap-hlen),0);
+            if(n<=0){
+                snprintf(err,errcap,"tls: handshake cut off");
+                free(hb); tls_free_session(s); return -1;
+            }
+            hlen+=(size_t)n;
+            need_read=0;
+        }
         outbuf[0].pvBuffer=NULL; outbuf[0].cbBuffer=0;
         outbuf[0].BufferType=SECBUFFER_TOKEN;
         outb.ulVersion=SECBUFFER_VERSION; outb.cBuffers=1; outb.pBuffers=outbuf;
@@ -5083,7 +5122,7 @@ static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
         if(first){
             inb.cBuffers=0; inb.pBuffers=NULL;
         } else {
-            inbuf[0].pvBuffer=rbuf; inbuf[0].cbBuffer=(unsigned long)nread;
+            inbuf[0].pvBuffer=hb; inbuf[0].cbBuffer=(unsigned long)hlen;
             inbuf[0].BufferType=SECBUFFER_TOKEN;
             inbuf[1].pvBuffer=NULL; inbuf[1].cbBuffer=0;
             inbuf[1].BufferType=SECBUFFER_EMPTY;
@@ -5094,26 +5133,45 @@ static int tls_connect_fd(sock_t fd,const char *hostname,TLSSession **out,
         st=InitializeSecurityContextA(&s->cred,first?NULL:&s->ctx,
             (SEC_CHAR*)hostname,flags,0,0,first?NULL:&inb,0,&s->ctx,&outb,&outf,NULL);
         s->ctx_ok=1;
-        if(outbuf[0].cbBuffer>0){
+        if(outbuf[0].cbBuffer>0 && outbuf[0].pvBuffer){
             if(!tls_send_all(fd,(const char*)outbuf[0].pvBuffer,outbuf[0].cbBuffer)){
                 snprintf(err,errcap,"tls: handshake send failed");
                 FreeContextBuffer(outbuf[0].pvBuffer);
-                tls_free_session(s); return -1;
+                free(hb); tls_free_session(s); return -1;
             }
             FreeContextBuffer(outbuf[0].pvBuffer);
         }
-        if(st==SEC_E_OK){ done=1; break; }
-        if(st!=SEC_I_CONTINUE_NEEDED){
-            snprintf(err,errcap,"tls: handshake failed (%ld)",(long)st);
-            tls_free_session(s); return -1;
+        if(st==SEC_E_INCOMPLETE_MESSAGE){ need_read=1; continue; }   /* keep hb, read more */
+        if(!first){
+            /* input consumed, except a SECBUFFER_EXTRA tail that belongs to the next step */
+            size_t extra=0;
+            if(inbuf[1].BufferType==SECBUFFER_EXTRA) extra=inbuf[1].cbBuffer;
+            if(extra>hlen) extra=hlen;
+            if(extra>0 && extra<hlen) memmove(hb,hb+hlen-extra,extra);
+            hlen=extra;
         }
         first=0;
-        nread=recv(fd,rbuf,sizeof rbuf,0);
-        if(nread<=0){
-            snprintf(err,errcap,"tls: handshake cut off");
-            tls_free_session(s); return -1;
+        if(st==SEC_E_OK){ done=1; break; }
+        if(st==SEC_I_CONTINUE_NEEDED){
+            if(hlen==0) need_read=1;
+            continue;
         }
+        if(st==SEC_I_INCOMPLETE_CREDENTIALS){
+            snprintf(err,errcap,"tls: server asks for a client certificate");
+            free(hb); tls_free_session(s); return -1;
+        }
+        snprintf(err,errcap,"tls: handshake failed (0x%08lX)",(unsigned long)st);
+        free(hb); tls_free_session(s); return -1;
     }
+    /* anything after the server's Finished is already application data: hand it to tls_recv */
+    if(hlen>0){
+        s->enc=(char*)malloc(hlen>32768?hlen:32768);
+        if(!s->enc){ snprintf(err,errcap,"out of memory"); free(hb); tls_free_session(s); return -1; }
+        s->enccap=hlen>32768?hlen:32768;
+        memcpy(s->enc,hb,hlen);
+        s->enclen=hlen;
+    }
+    free(hb);
     if(QueryContextAttributesA(&s->ctx,SECPKG_ATTR_STREAM_SIZES,&s->sizes)!=SEC_E_OK){
         snprintf(err,errcap,"tls: cannot query stream sizes");
         tls_free_session(s); return -1;
@@ -5158,20 +5216,24 @@ static int tls_recv(TLSSession *s,sock_t fd,char *out,size_t max){
         return (int)k;
     }
     char rbuf[16384];
+    int have_enc=(s->enclen>0);   /* bytes left over from the handshake: decrypt before reading */
     for(;;){
-        size_t off=s->enclen;
-        if(off+sizeof rbuf>s->enccap){
-            size_t nc=s->enccap?s->enccap*2:32768;
-            while(nc<off+sizeof rbuf) nc*=2;
-            char *np=(char*)realloc(s->enc,nc);
-            if(!np) return -1;
-            s->enc=np; s->enccap=nc;
+        if(!have_enc){
+            size_t off=s->enclen;
+            if(off+sizeof rbuf>s->enccap){
+                size_t nc=s->enccap?s->enccap*2:32768;
+                while(nc<off+sizeof rbuf) nc*=2;
+                char *np=(char*)realloc(s->enc,nc);
+                if(!np) return -1;
+                s->enc=np; s->enccap=nc;
+            }
+            int n=recv(fd,rbuf,sizeof rbuf,0);
+            if(n==0) return 0;
+            if(n<0) return sock_wouldblock()?-2:-1;
+            memcpy(s->enc+off,rbuf,(size_t)n);
+            s->enclen=off+(size_t)n;
         }
-        int n=recv(fd,rbuf,sizeof rbuf,0);
-        if(n==0) return 0;
-        if(n<0) return sock_wouldblock()?-2:-1;
-        memcpy(s->enc+off,rbuf,(size_t)n);
-        s->enclen=off+(size_t)n;
+        have_enc=0;
         for(;;){
             SecBuffer bufs[4];
             bufs[0].pvBuffer=s->enc; bufs[0].cbBuffer=(unsigned long)s->enclen;
@@ -6007,3 +6069,4 @@ void lucL_open_net(void){
 }
 
 #include "luc_nums.c"
+#include "luc_ffi.c"

@@ -372,7 +372,7 @@ end
             create hit = false
             do
     create __fa = (1)
-    create __fb = (len - 1 )
+    create __fb = (tlen - 1 )
     create __fs = 1
     create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
     repeat 1, __fn as __j do
@@ -384,7 +384,7 @@ end
             if hit then
                 do
     create __fa = (1)
-    create __fb = (len - 1 )
+    create __fb = (tlen - 1 )
     create __fs = 1
     create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
     repeat 1, __fn as __j do

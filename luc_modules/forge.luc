@@ -217,8 +217,9 @@ forge.Embedding = function(vocab_size, dim)
 end
 
 function Embedding:forward(ids)
+    ids = matrix.to_table(ids)   -- [1, 2, 3] works as well as { 1: 1, 2: 2, 3: 3 }
     if type(ids) != "table" then
-        error("Embedding:forward expects a Lua table of token ids, got " .. type(ids), 2)
+        error("Embedding:forward expects a list or table of token ids, got " .. type(ids), 2)
     end
     return Tensor.embed(self.weight, ids)
 end
@@ -275,7 +276,12 @@ create Sequential = Module.subclass("Sequential")
 --- Sequential(modules) or Sequential({list})
 forge.Sequential = function(...)
     create self = newmodule(Sequential)
-    create items = { 1:  ...  }
+    -- all varargs as a 1-based table (Lua {...}; "{ 1: ... }" kept only the first)
+    create items = {}
+    do
+        create __n, __i = select("#", ...), 1
+        while __i <= __n do items[__i] = (select(__i, ...)) __i = __i + 1 end
+    end
     if len(items) == 1 and type(items[1]) == "table" and items[1].forward == nil then
         items = items[1]
     end
@@ -371,7 +377,14 @@ end
 create BACKWARD = Tensor.ops   -- live link to tensor2 backward table
 
 create function target_data(t, rows, cols, who)
-    if Tensor.is(t) then return t.data.data end
+    if Tensor.is(t) then
+        if t.data.rows != rows or t.data.cols != cols then
+            error(sformat("%s: target is %dx%d but the prediction is %dx%d", who,
+                t.data.rows, t.data.cols, rows, cols), 3)
+        end
+        return t.data.data
+    end
+    t = matrix.to_table(t)   -- a flat LUC list works too
     if type(t) == "table" then
         if len(t) != rows * cols then
             error(sformat("%s: expected %d target values, got %d", who, rows * cols, len(t)), 3)
