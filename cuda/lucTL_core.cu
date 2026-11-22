@@ -519,8 +519,13 @@ static void lucTL_fill_devinfo(int device, const cudaDeviceProp* p,
     d->regs_per_mp           = p->regsPerBlock;
     d->shared_mem_per_mp     = (uint64_t)p->sharedMemPerBlock;
 #endif
-    d->clock_khz             = p->clockRate;
-    d->memory_clock_khz      = p->memoryClockRate;
+    /* CUDA 13 removed clockRate/memoryClockRate from cudaDeviceProp;
+       cudaDeviceGetAttribute works on every CUDA version. */
+    int clk_khz = 0, memclk_khz = 0;
+    cudaDeviceGetAttribute(&clk_khz, cudaDevAttrClockRate, device);
+    cudaDeviceGetAttribute(&memclk_khz, cudaDevAttrMemoryClockRate, device);
+    d->clock_khz             = clk_khz;
+    d->memory_clock_khz      = memclk_khz;
     d->memory_bus_width      = p->memoryBusWidth;
     d->l2_cache_size         = p->l2CacheSize;
     d->concurrent_kernels    = p->concurrentKernels;
@@ -538,10 +543,10 @@ static void lucTL_fill_devinfo(int device, const cudaDeviceProp* p,
     d->max_blocks_per_mp     = (p->maxThreadsPerMultiProcessor > 0)
                              ? (p->maxThreadsPerMultiProcessor / 64) : 16;
 
-    const double mem_ghz = (double)p->memoryClockRate * 1e-6;   /* kHz->GHz */
+    const double mem_ghz = (double)memclk_khz * 1e-6;   /* kHz->GHz */
     d->peak_mem_bandwidth_gbs = mem_ghz * ((double)p->memoryBusWidth / 8.0) * 2.0;
 
-    const double core_ghz = (double)p->clockRate * 1e-6;
+    const double core_ghz = (double)clk_khz * 1e-6;
     d->peak_fp32_gflops = 2.0 * (double)d->cores_per_mp *
                           (double)p->multiProcessorCount * core_ghz;
     d->peak_fp16_gflops = d->has_tensor_cores
