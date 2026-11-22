@@ -536,6 +536,44 @@ static int lucTL_blas_layout(int R, int C, long long rs, long long cs, int* ld)
     return 0;
 }
 
+/* How one strided GEMM maps onto column-major cuBLAS.
+ * cuBLAS computes Cc = op(X) op(Y).  For a row-major C we compute C^T = B^T A^T,
+ * so X = B and Y = A (swap = 1); for a column-major C, X = A and Y = B. */
+typedef struct {
+    cublasOperation_t ox, oy;
+    int m, n, ldx, ldy, ldc, swap;
+} lucTL_blas_plan_t;
+
+static int lucTL_blas_plan(int M, int N, int K,
+                           long long a_rs, long long a_cs,
+                           long long b_rs, long long b_cs,
+                           long long c_rs, long long c_cs,
+                           lucTL_blas_plan_t* P)
+{
+    int lda, ldb, ldc;
+    const int la = lucTL_blas_layout(M, K, a_rs, a_cs, &lda);
+    const int lb = lucTL_blas_layout(K, N, b_rs, b_cs, &ldb);
+    const int lc = lucTL_blas_layout(M, N, c_rs, c_cs, &ldc);
+    if (!la || !lb || !lc) return 0;
+    P->ldc = ldc;
+    if (lc == 1) {
+        P->swap = 1; P->m = N; P->n = M;
+        P->ldx = ldb; P->ox = (lb == 1) ? CUBLAS_OP_N : CUBLAS_OP_T;
+        P->ldy = lda; P->oy = (la == 1) ? CUBLAS_OP_N : CUBLAS_OP_T;
+    } else {
+        P->swap = 0; P->m = M; P->n = N;
+        P->ldx = lda; P->ox = (la == 2) ? CUBLAS_OP_N : CUBLAS_OP_T;
+        P->ldy = ldb; P->oy = (lb == 2) ? CUBLAS_OP_N : CUBLAS_OP_T;
+    }
+    return 1;
+}
+
+static int lucTL_blas_ready(void)
+{
+    if (g_blas_off || g_tile_override >= 0) return 0;
+    return g_blas ? 1 : lucTL_blas_init();
+}
+
 /* C = alpha * A @ B + beta * C with explicit strides (see lucTL_gemm_ex).
  * Returns 1 when cuBLAS did the work, 0 to fall back to the own kernels. */
 static int lucTL_blas_sgemm(const float* A, const float* B, float* C,
@@ -546,34 +584,21 @@ static int lucTL_blas_sgemm(const float* A, const float* B, float* C,
                             long long a_bs, long long b_bs, long long c_bs,
                             int batch, float alpha, float beta, cudaStream_t s)
 {
-    if (g_blas_off || g_tile_override >= 0) return 0;
-    if (!g_blas && !lucTL_blas_init()) return 0;
-    int lda, ldb, ldc;
-    const int la = lucTL_blas_layout(M, K, a_rs, a_cs, &lda);
-    const int lb = lucTL_blas_layout(K, N, b_rs, b_cs, &ldb);
-    const int lc = lucTL_blas_layout(M, N, c_rs, c_cs, &ldc);
-    if (!la || !lb || !lc) return 0;
+    if (!lucTL_blas_ready()) return 0;
+    lucTL_blas_plan_t P;
+    if (!lucTL_blas_plan(M, N, K, a_rs, a_cs, b_rs, b_cs, c_rs, c_cs, &P)) return 0;
     if (batch > 1 && c_bs == 0) return 0;                 /* would race */
-
-    /* cuBLAS is column-major.  For a row-major C compute C^T = B^T A^T. */
-    const float *X, *Y; cublasOperation_t ox, oy; int ldx, ldy, m, n;
-    long long sx, sy;
-    if (lc == 1) {
-        m = N; n = M;
-        X = B; ldx = ldb; ox = (lb == 1) ? CUBLAS_OP_N : CUBLAS_OP_T; sx = b_bs;
-        Y = A; ldy = lda; oy = (la == 1) ? CUBLAS_OP_N : CUBLAS_OP_T; sy = a_bs;
-    } else {
-        m = M; n = N;
-        X = A; ldx = lda; ox = (la == 2) ? CUBLAS_OP_N : CUBLAS_OP_T; sx = a_bs;
-        Y = B; ldy = ldb; oy = (lb == 2) ? CUBLAS_OP_N : CUBLAS_OP_T; sy = b_bs;
-    }
+    const float* X = P.swap ? B : A;  const long long sx = P.swap ? b_bs : a_bs;
+    const float* Y = P.swap ? A : B;  const long long sy = P.swap ? a_bs : b_bs;
     if (cublasSetStream(g_blas, s) != CUBLAS_STATUS_SUCCESS) return 0;
     cublasStatus_t st;
     if (batch <= 1)
-        st = cublasSgemm(g_blas, ox, oy, m, n, K, &alpha, X, ldx, Y, ldy, &beta, C, ldc);
+        st = cublasSgemm(g_blas, P.ox, P.oy, P.m, P.n, K, &alpha,
+                         X, P.ldx, Y, P.ldy, &beta, C, P.ldc);
     else
-        st = cublasSgemmStridedBatched(g_blas, ox, oy, m, n, K, &alpha,
-                                       X, ldx, sx, Y, ldy, sy, &beta, C, ldc, c_bs, batch);
+        st = cublasSgemmStridedBatched(g_blas, P.ox, P.oy, P.m, P.n, K, &alpha,
+                                       X, P.ldx, sx, Y, P.ldy, sy, &beta,
+                                       C, P.ldc, c_bs, batch);
     return st == CUBLAS_STATUS_SUCCESS;
 }
 

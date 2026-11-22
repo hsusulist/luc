@@ -372,6 +372,17 @@ function Prog:gemm(A, B, Cc, o)
     c.pre   = o.pre or 0
     c.i0, c.i1, c.i2 = a.rows, b.cols, a.cols
     c.i3 = o.batch or 1
+    -- outer batch (lucTL-train >= 2.3): o.outer = count, o.outer_strides = { "a": , "b": , "c": }
+    -- in elements.  C[o] = A[o] @ B[o] for o = 0 .. outer-1, each one inner-batched.
+    if o.outer and o.outer > 1 then
+        create ost = o.outer_strides
+        if type(ost) != "table" then error("Prog:gemm: 'outer' needs outer_strides = { \"a\": .., \"b\": .., \"c\": .. }", 2) end
+        create function ok32(v) return type(v) == "number" and v >= 0 and v <= 2147483647 end
+        if not (ok32(ost.a) and ok32(ost.b) and ok32(ost.c)) then
+            error("Prog:gemm: outer_strides must be 3 int32 element counts", 2)
+        end
+        c.i4, c.i5, c.i6, c.i7 = o.outer, ost.a, ost.b, ost.c
+    end
     c.f0 = o.alpha or 1.0
     c.f1 = o.beta  or 0.0
     c.f2 = o.eps   or 1e-5

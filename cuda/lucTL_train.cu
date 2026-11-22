@@ -24,7 +24,7 @@
 
 #include <float.h>
 
-#define LUCTL_TRAIN_VERSION_STRING "lucTL-train 2.2.0"
+#define LUCTL_TRAIN_VERSION_STRING "lucTL-train 2.3.0"
 
 /*  shutdown-safety epoch
  *  lucTL_shutdown() frees every pool block and the pool struct itself,
@@ -488,6 +488,113 @@ static int lucTL_gemm_ex_launch(
     ( (dt) == LUCTL_F16  ? FN<__half>(__VA_ARGS__)                         \
     : (dt) == LUCTL_BF16 ? FN<luctl_bf16>(__VA_ARGS__)                     \
                          : FN<float>(__VA_ARGS__) )
+
+/*  Two-level batched GEMM:  for o in [0,outer), h in [0,inner)
+ *      C[o][h] = alpha * A[o][h] @ B[o][h] + beta * C[o][h]
+ *  with  X[o][h] = X + o*x_os + h*x_bs  (element offsets).
+ *  Attention needs this: the inner batch walks the heads (stride hd inside a
+ *  row of qkv) and the outer batch walks the sequences (stride T*3D).  Neither
+ *  stride is a multiple of the other, so one strided batch cannot cover both.
+ *  fp32 plain GEMMs: one pointer-table kernel + ONE cublasSgemmBatched call
+ *  (was one launch per sequence).  Everything else loops over `outer`. */
+static float** g_ptab     = NULL;
+static int     g_ptab_cap = 0;     /* entries per operand */
+
+static float** lucTL_ptab_scratch(int n)
+{
+    if (n <= g_ptab_cap && g_ptab) return g_ptab;
+    /* The old table is deliberately NOT freed: a CUDA graph captured earlier
+     * may still point at it.  Growth happens a handful of times at most. */
+    int cap = g_ptab_cap > 0 ? g_ptab_cap : 64;
+    while (cap < n) cap *= 2;
+    float** t = NULL;
+    if (cudaMalloc((void**)&t, (size_t)cap * 3 * sizeof(float*)) != cudaSuccess) {
+        cudaGetLastError();
+        return NULL;
+    }
+    g_ptab = t; g_ptab_cap = cap;
+    return g_ptab;
+}
+
+__global__ void lucTL_ptab_kernel(const float* A, const float* B, float* C,
+                                  float** tab, int inner, int outer, int cap,
+                                  long long a_bs, long long b_bs, long long c_bs,
+                                  long long a_os, long long b_os, long long c_os)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= inner * outer) return;
+    const int o = i / inner, h = i - o * inner;
+    tab[i]           = (float*)(A + (long long)o * a_os + (long long)h * a_bs);
+    tab[cap + i]     = (float*)(B + (long long)o * b_os + (long long)h * b_bs);
+    tab[2 * cap + i] =          C + (long long)o * c_os + (long long)h * c_bs;
+}
+
+static int lucTL_blas_sgemm2(const float* A, const float* B, float* C,
+                             int M, int N, int K,
+                             long long a_rs, long long a_cs,
+                             long long b_rs, long long b_cs,
+                             long long c_rs, long long c_cs,
+                             long long a_bs, long long b_bs, long long c_bs, int inner,
+                             long long a_os, long long b_os, long long c_os, int outer,
+                             float alpha, float beta, cudaStream_t s)
+{
+    if (!lucTL_blas_ready()) return 0;
+    lucTL_blas_plan_t P;
+    if (!lucTL_blas_plan(M, N, K, a_rs, a_cs, b_rs, b_cs, c_rs, c_cs, &P)) return 0;
+    if (inner < 1) inner = 1;
+    const int n = inner * outer;
+    float** tab = lucTL_ptab_scratch(n);
+    if (!tab) return 0;
+    const int cap = g_ptab_cap;
+    lucTL_ptab_kernel<<<(unsigned)((n + 127) / 128), 128, 0, s>>>(
+        A, B, C, tab, inner, outer, cap, a_bs, b_bs, c_bs, a_os, b_os, c_os);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    float** tA = tab; float** tB = tab + cap; float** tC = tab + 2 * cap;
+    if (cublasSetStream(g_blas, s) != CUBLAS_STATUS_SUCCESS) return 0;
+    const cublasStatus_t st = cublasSgemmBatched(g_blas, P.ox, P.oy, P.m, P.n, K, &alpha,
+        (const float* const*)(P.swap ? tB : tA), P.ldx,
+        (const float* const*)(P.swap ? tA : tB), P.ldy,
+        &beta, tC, P.ldc, n);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
+
+template <typename T>
+static int lucTL_gemm_ex2_launch(
+        const void* A_, const void* B_, void* C_,
+        const void* bias_, const void* gamma_, const float* rowscale,
+        int M, int N, int K,
+        long long a_rs, long long a_cs, long long b_rs, long long b_cs,
+        long long c_rs, long long c_cs,
+        long long a_bs, long long b_bs, long long c_bs,
+        int batch, float alpha, float beta, float eps,
+        int pre_op, int post_op,
+        int outer, long long a_os, long long b_os, long long c_os, cudaStream_t s)
+{
+    if (batch < 1) batch = 1;
+    if (TAcc<T>::dtype() == LUCTL_F32 && pre_op == LUCTL_PRE_NONE &&
+        post_op == LUCTL_ACT_NONE && bias_ == NULL && rowscale == NULL &&
+        !(batch > 1 && c_bs == 0) && !(c_os == 0) &&
+        lucTL_blas_sgemm2((const float*)A_, (const float*)B_, (float*)C_, M, N, K,
+                          a_rs, a_cs, b_rs, b_cs, c_rs, c_cs,
+                          a_bs, b_bs, c_bs, batch, a_os, b_os, c_os, outer,
+                          alpha, beta, s))
+        return lucTL_launch_async("gemm_ex2(cublas)");
+
+    /* fallback: one ordinary (inner-batched) GEMM per outer index */
+    const char* A = (const char*)A_; const char* B = (const char*)B_; char* C = (char*)C_;
+    const size_t es = sizeof(T);
+    for (int o = 0; o < outer; ++o) {
+        const int rc = lucTL_gemm_ex_launch<T>(
+            A + (size_t)((long long)o * a_os) * es,
+            B + (size_t)((long long)o * b_os) * es,
+            C + (size_t)((long long)o * c_os) * es,
+            bias_, gamma_, rowscale, M, N, K,
+            a_rs, a_cs, b_rs, b_cs, c_rs, c_cs, a_bs, b_bs, c_bs,
+            batch, alpha, beta, eps, pre_op, post_op, s);
+        if (rc != LUCTL_OK) return rc;
+    }
+    return LUCTL_OK;
+}
 
 /*   RMSNorm backward
  *   y_i = g_i * x_i * s ,  s = rsqrt(mean(x^2) + eps)
@@ -1360,6 +1467,13 @@ static int lucTL_exec_op(const lucTL_op_t* c, cudaStream_t s)
 
     case LTL_P_GEMM:
         if (c->i0 <= 0 || c->i1 <= 0 || c->i2 <= 0) return LUCTL_ERR_SHAPE;
+        if (c->i4 > 1)   /* outer batch: i4 = count, i5/i6/i7 = A/B/C outer strides */
+            return LTL_DISPATCH(c->dtype, lucTL_gemm_ex2_launch,
+                c->p0, c->p1, c->p2, c->p3, c->p4, (const float*)c->p5,
+                c->i0, c->i1, c->i2,
+                c->s0, c->s1, c->s2, c->s3, c->s4, c->s5, c->s6, c->s7, c->s8,
+                (c->i3 > 0 ? c->i3 : 1), c->f0, c->f1, c->f2, c->pre, c->act,
+                c->i4, (long long)c->i5, (long long)c->i6, (long long)c->i7, s);
         return LTL_DISPATCH(c->dtype, lucTL_gemm_ex_launch,
             c->p0, c->p1, c->p2, c->p3, c->p4, (const float*)c->p5,
             c->i0, c->i1, c->i2,

@@ -36,4 +36,6 @@ Notes
   - Plain fp32 GEMMs run on cuBLAS (link with -lcublas, build_kaggle.sh does it).
     Fused GEMMs (RMSNorm / activation / bias inside the GEMM) and fp16 keep lucTL's own
     kernels. LUCTL_NO_CUBLAS=1 forces lucTL's own kernels everywhere (for comparisons).
+  - Attention GEMMs use a two-level batch (heads inside, sequences outside): one
+    cublasSgemmBatched call per GEMM instead of one launch per sequence (lucTL-train 2.3).
   - GPU arch: build_kaggle.sh reads it from nvidia-smi; force it with LUCTL_ARCH=75 etc.

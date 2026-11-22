@@ -51,6 +51,24 @@ create function sv(ptr, rows, cols, rs, cs, bs)
     return { "data":  ptr, "rows":  rows, "cols":  cols, "rs":  rs, "cs":  cs, "bs":  bs or 0, "dtype":  F32  }
 end
 
+--- Attention GEMM for every sequence at once: inner batch = heads (view bs),
+--- outer batch = the B sequences, so = outer strides in elements { "a", "b", "c" }.
+--- lucTL-train >= 2.3 does it in one cuBLAS call; older builds get one op per sequence.
+create function bgemm(self, p, a, b, c, so)
+    if self.outer_gemm then
+        p:gemm(a, b, c, { "batch":  self.heads, "outer":  self.B, "outer_strides":  so })
+        return
+    end
+    create s = 0
+    while s < self.B do
+        p:gemm(sv(poff(a, s * so.a), a.rows, a.cols, a.rs, a.cs, a.bs),
+               sv(poff(b, s * so.b), b.rows, b.cols, b.rs, b.cs, b.bs),
+               sv(poff(c, s * so.c), c.rows, c.cols, c.rs, c.cs, c.bs),
+               { "batch":  self.heads  })
+        s = s + 1
+    end
+end
+
 --- Last queued op for scalar patching
 --- Patch grad_scale, lr, step in place
 create function last_op(p)
@@ -139,6 +157,11 @@ function GT.new(cfg)
 
     self.N          = self.B * self.T
     self.attn_scale = 1.0 / sqrt(self.hd)
+    -- lucTL-train >= 2.3: attention GEMMs over all sequences in one call
+    create tv_maj, tv_min = string.match(tostring(lucTL.train_version or ""), "(%d+)%.(%d+)")
+    tv_maj, tv_min = tonumber(tv_maj or 0), tonumber(tv_min or 0)
+    self.outer_gemm = (tv_maj > 2) or (tv_maj == 2 and tv_min >= 3)
+    if cfg.outer_gemm == false then self.outer_gemm = false end
 
     self.params = {}
     self._keep  = {}
@@ -327,47 +350,26 @@ function Model:_queue_forward(p, grad)
         p:gemm(self.h1[l], ly.wqkv.w.t, qkv)
 
         if self.use_rope then
-            create ro = { "heads":  H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base  }
+            -- Q and K in one launch: the K heads follow the Q heads in each row
+            create ro = { "heads":  2 * H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base  }
             p:rope(self.qv[l], ro)
-            p:rope(self.kv[l], ro)
         end
 
         -- Scores QKt batched per head
-        do
-    create __fa = (0)
-    create __fb = (B - 1 )
-    create __fs = 1
-    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
-    repeat 1, __fn as __j do
-        create b = __fa + __j * __fs
-
-            create qb = b * T * D3
-            p:gemm(sv(poff(qkv, qb),         T, hd, D3, 1,  hd),   -- Q  [T,hd]
-                   sv(poff(qkv, qb + D),     hd, T,  1, D3, hd),   -- Kt [hd,T]
-                   sv(poff(sc,  b * HTT),    T,  T,  T, 1,  TT),   -- S  [T,T]
-                   { "batch":  H  })
-        end
-end
+        -- one launch for every sequence and head
+        bgemm(self, p, sv(poff(qkv, 0), T, hd, D3, 1,  hd),       -- Q  [T,hd]
+                       sv(poff(qkv, D), hd, T,  1, D3, hd),       -- Kt [hd,T]
+                       sv(poff(sc,  0), T,  T,  T, 1,  TT),       -- S  [T,T]
+                       { "a": T * D3, "b": T * D3, "c": HTT })
 
         -- One launch masks all head rows
         p:softmax(sc, sc, { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
         -- Context P times V
-        do
-    create __fa = (0)
-    create __fb = (B - 1 )
-    create __fs = 1
-    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
-    repeat 1, __fn as __j do
-        create b = __fa + __j * __fs
-
-            create qb = b * T * D3
-            p:gemm(sv(poff(sc,  b * HTT),    T, T,  T,  1, TT),
-                   sv(poff(qkv, qb + 2 * D), T, hd, D3, 1, hd),
-                   sv(poff(at,  b * T * D),  T, hd, D,  1, hd),
-                   { "batch":  H  })
-        end
-end
+        bgemm(self, p, sv(poff(sc,  0),     T, T,  T,  1, TT),
+                       sv(poff(qkv, 2 * D), T, hd, D3, 1, hd),
+                       sv(poff(at,  0),     T, hd, D,  1, hd),
+                       { "a": HTT, "b": T * D3, "c": T * D })
 
         -- Residual add with fused epilogue
         p:copy(xin, mid)
@@ -454,60 +456,37 @@ function Model:_queue_backward(p)
         p:dx(self.dres, ly.wo.w.t, self.dattn)
         p:dw(at, self.dres, ly.wo.g.t)
 
-        do
-    create __fa = (0)
-    create __fb = (B - 1 )
-    create __fs = 1
-    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
-    repeat 1, __fn as __j do
-        create b = __fa + __j * __fs
-
-            create qb = b * T * D3
-            create dA = sv(poff(self.dattn, b * T * D), T, hd, D, 1, hd)
-            -- dP from dctx and V
-            p:gemm(dA,
-                   sv(poff(qkv, qb + 2 * D), hd, T, 1, D3, hd),
-                   sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),
-                   { "batch":  H  })
-            -- dV = P^T @ dctx
-            p:gemm(sv(poff(sc, b * HTT), T, T, 1, T, TT),
-                   dA,
-                   sv(poff(self.dqkv, qb + 2 * D), T, hd, D3, 1, hd),
-                   { "batch":  H  })
-        end
-end
+        create dA = sv(poff(self.dattn, 0), T, hd, D, 1, hd)
+        -- dP from dctx and V
+        bgemm(self, p, dA,
+                       sv(poff(qkv, 2 * D), hd, T, 1, D3, hd),
+                       sv(poff(self.dsc, 0), T, T, T, 1, TT),
+                       { "a": T * D, "b": T * D3, "c": HTT })
+        -- dV = P^T @ dctx
+        bgemm(self, p, sv(poff(sc, 0), T, T, 1, T, TT),
+                       dA,
+                       sv(poff(self.dqkv, 2 * D), T, hd, D3, 1, hd),
+                       { "a": HTT, "b": T * D, "c": T * D3 })
 
         -- dS = softmax'(P) . dP   (aliases dP; safe, the row reduction
         -- completes behind a __syncthreads before any store)
         p:softmax_bwd(sc, self.dsc, self.dsc,
                       { "causal":  self.causal, "group":  T, "scale":  self.attn_scale  })
 
-        do
-    create __fa = (0)
-    create __fb = (B - 1 )
-    create __fs = 1
-    create __fn = math.floor(((__fb) - (__fa)) / __fs) + 1
-    repeat 1, __fn as __j do
-        create b = __fa + __j * __fs
-
-            create qb = b * T * D3
-            -- dQ = dS @ K
-            p:gemm(sv(poff(self.dsc, b * HTT), T, T, T, 1, TT),
-                   sv(poff(qkv, qb + D), T, hd, D3, 1, hd),
-                   sv(poff(self.dqkv, qb), T, hd, D3, 1, hd),
-                   { "batch":  H  })
-            -- dK = dS^T @ Q
-            p:gemm(sv(poff(self.dsc, b * HTT), T, T, 1, T, TT),
-                   sv(poff(qkv, qb), T, hd, D3, 1, hd),
-                   sv(poff(self.dqkv, qb + D), T, hd, D3, 1, hd),
-                   { "batch":  H  })
-        end
-end
+        -- dQ = dS @ K
+        bgemm(self, p, sv(poff(self.dsc, 0), T, T, T, 1, TT),
+                       sv(poff(qkv, D), T, hd, D3, 1, hd),
+                       sv(poff(self.dqkv, 0), T, hd, D3, 1, hd),
+                       { "a": HTT, "b": T * D3, "c": T * D3 })
+        -- dK = dS^T @ Q
+        bgemm(self, p, sv(poff(self.dsc, 0), T, T, 1, T, TT),
+                       sv(poff(qkv, 0), T, hd, D3, 1, hd),
+                       sv(poff(self.dqkv, D), T, hd, D3, 1, hd),
+                       { "a": HTT, "b": T * D3, "c": T * D3 })
 
         if self.use_rope then
-            create ro = { "heads":  H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base, "inverse":  true  }
+            create ro = { "heads":  2 * H, "head_dim":  hd, "row_stride":  D3, "pos_ids":  self.pos, "theta":  self.rope_base, "inverse":  true  }
             p:rope(self.dqv, ro)
-            p:rope(self.dkv, ro)
         end
 
         p:dw(self.h1[l], self.dqkv, ly.wqkv.g.t)
