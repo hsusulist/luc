@@ -17,7 +17,7 @@ LUCTL_ARCH=${LUCTL_ARCH:-75}
 echo "   GPU arch: sm_${LUCTL_ARCH}"
 nvcc -O3 -std=c++14 --shared -Xcompiler -fPIC --use_fast_math -lineinfo \
      -gencode arch=compute_${LUCTL_ARCH},code=sm_${LUCTL_ARCH} \
-     -o luc_modules/lucTL.so cuda/lucTL_train.cu
+     -o luc_modules/lucTL.so cuda/lucTL_train.cu -lcublas
 
 echo "== 3/3  GPU check"
 ./luc cuda/gpu_check.luc

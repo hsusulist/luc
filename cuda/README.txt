@@ -26,11 +26,14 @@ Kaggle
         !bash cuda/build_kaggle.sh
   3. Your own script, from the repo root:
         !./luc my_train.luc
-     with backend = "gpu" in ai.LMTrain.
+     with ai.use("gpu") before ai.LMTrain (or "gpu": true in one LMTrain).
 
 Notes
   - Linux x64 only for the GPU path (lucffi calls follow the x86-64 SysV ABI there).
     Windows builds of luc include lucffi too, but lucTL.dll is not built or tested.
   - LUC has no garbage-collector finalizers: GPU tensors are freed with t:free()
     (gpu_transformer frees its own buffers in Model:free()).
+  - Plain fp32 GEMMs run on cuBLAS (link with -lcublas, build_kaggle.sh does it).
+    Fused GEMMs (RMSNorm / activation / bias inside the GEMM) and fp16 keep lucTL's own
+    kernels. LUCTL_NO_CUBLAS=1 forces lucTL's own kernels everywhere (for comparisons).
   - GPU arch: build_kaggle.sh reads it from nvidia-smi; force it with LUCTL_ARCH=75 etc.

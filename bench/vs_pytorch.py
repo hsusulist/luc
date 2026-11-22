@@ -6,9 +6,14 @@
 import math, random, sys, time, torch, torch.nn as nn, torch.nn.functional as F
 
 COMPILE = "--compile" in sys.argv   # torch.compile(mode="reduce-overhead") = CUDA Graphs
-NAME = "pytorch+compile" if COMPILE else "pytorch"
 
-DIM, LAYERS, HEADS, FFN, SEQ, BATCH, EPOCHS, LR, VAL = 128, 4, 4, 256, 128, 32, 2, 3e-3, 0.1
+
+import os
+SMALL = os.environ.get("SMALL") == "1"   # tiny model: dim 64, 2 layers, batch 8 x 64
+if SMALL: DIM, LAYERS, HEADS, FFN, SEQ, BATCH = 64, 2, 4, 128, 64, 8
+else:     DIM, LAYERS, HEADS, FFN, SEQ, BATCH = 128, 4, 4, 256, 128, 32
+EPOCHS, LR, VAL = 2, 3e-3, 0.1
+NAME = ("pytorch+compile" if COMPILE else "pytorch") + (" (S)" if SMALL else "")
 dev = "cuda"
 torch.manual_seed(1); random.seed(1)
 

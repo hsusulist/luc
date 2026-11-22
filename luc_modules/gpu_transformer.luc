@@ -29,7 +29,7 @@ create function bind()
               "  Build the CUDA backend first:\n" ..
               "    nvcc -O3 -std=c++14 --shared -Xcompiler -fPIC \\\n" ..
               "         -gencode arch=compute_86,code=sm_86 --use_fast_math \\\n" ..
-              "         lucTL_train.cu -o lucTL.so", 3)
+              "         lucTL_train.cu -lcublas -o lucTL.so", 3)
     end
     lucTL = adapter.lucTL
     C     = lucTL.C

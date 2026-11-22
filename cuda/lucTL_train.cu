@@ -24,7 +24,7 @@
 
 #include <float.h>
 
-#define LUCTL_TRAIN_VERSION_STRING "lucTL-train 2.1.0"
+#define LUCTL_TRAIN_VERSION_STRING "lucTL-train 2.2.0"
 
 /*  shutdown-safety epoch
  *  lucTL_shutdown() frees every pool block and the pool struct itself,
@@ -404,6 +404,14 @@ static int lucTL_gemm_ex_launch(
     const T*     bs = (const T*)bias_;
     const T*     gm = (const T*)gamma_;
     if (batch < 1) batch = 1;
+
+    /* --- cuBLAS: every plain fp32 GEMM (no fused pre-op / activation / bias) --- */
+    if (TAcc<T>::dtype() == LUCTL_F32 && pre_op == LUCTL_PRE_NONE &&
+        post_op == LUCTL_ACT_NONE && bias_ == NULL &&
+        lucTL_blas_sgemm((const float*)A_, (const float*)B_, (float*)C_, M, N, K,
+                         a_rs, a_cs, b_rs, b_cs, c_rs, c_cs, a_bs, b_bs, c_bs,
+                         batch, alpha, beta, s))
+        return lucTL_launch_async("gemm_ex(cublas)");
 
     /* --- Tensor Core fast path: fp16, canonical layout, single batch --- */
     if (TAcc<T>::dtype() == LUCTL_F16 && batch == 1 &&

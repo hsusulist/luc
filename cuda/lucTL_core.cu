@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <cublas_v2.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,7 +29,7 @@
   #define LUCTL_API __attribute__((visibility("default")))
 #endif
 
-#define LUCTL_VERSION_STRING "lucTL-core 2.0.0"
+#define LUCTL_VERSION_STRING "lucTL-core 2.1.0"
 
 /*  Compile time configuration*/
 #define LUCTL_BLOCK_1D          256    /* element-wise block size*/
@@ -484,6 +485,97 @@ static int              g_device        = 0;
 static cudaDeviceProp   g_prop;
 static lucTL_devinfo_t  g_devinfo;
 static int              g_tile_override = -1;   /* -1 = automatic */
+
+
+/* cuBLAS fast path for plain fp32 GEMMs.
+ * Every fp32 GEMM without a fused pre-op / activation / bias goes to cuBLAS
+ * (the same library PyTorch uses).  Fused or fp16/bf16 GEMMs keep the
+ * hand-written kernels.  Set LUCTL_NO_CUBLAS=1 to force the old kernels. */
+static cublasHandle_t g_blas     = NULL;
+static void*          g_blas_ws  = NULL;
+static int            g_blas_off = 0;
+
+static int lucTL_blas_init(void)
+{
+    if (g_blas) return 1;
+    if (g_blas_off) return 0;
+    const char* env = getenv("LUCTL_NO_CUBLAS");
+    if (env && env[0] == '1') { g_blas_off = 1; return 0; }
+    if (cublasCreate(&g_blas) != CUBLAS_STATUS_SUCCESS) {
+        g_blas = NULL; g_blas_off = 1; cudaGetLastError(); return 0;
+    }
+    cublasSetMathMode(g_blas, CUBLAS_DEFAULT_MATH);      /* exact fp32, no TF32 */
+    cublasSetPointerMode(g_blas, CUBLAS_POINTER_MODE_HOST);
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11600
+    /* fixed workspace so cuBLAS never allocates inside a captured CUDA graph */
+    const size_t ws = (size_t)8 << 20;
+    if (cudaMalloc(&g_blas_ws, ws) == cudaSuccess) cublasSetWorkspace(g_blas, g_blas_ws, ws);
+    else { cudaGetLastError(); g_blas_ws = NULL; }
+#endif
+    return 1;
+}
+
+static void lucTL_blas_shutdown(void)
+{
+    if (g_blas)    { cublasDestroy(g_blas); g_blas = NULL; }
+    if (g_blas_ws) { cudaFree(g_blas_ws);  g_blas_ws = NULL; }
+    cudaGetLastError();
+}
+
+/* Layout of an R x C matrix whose (r,c) element sits at r*rs + c*cs.
+ * Returns 1 = row-major, 2 = column-major, 0 = not expressible; *ld gets the leading dim. */
+static int lucTL_blas_layout(int R, int C, long long rs, long long cs, int* ld)
+{
+    if (R == 1 && C == 1) { *ld = 1; return 1; }
+    if (R == 1) { if (cs == 1) { *ld = C; return 1; }
+                  if (cs >= 1 && cs < 0x7fffffffLL) { *ld = (int)cs; return 2; } return 0; }
+    if (C == 1) { if (rs == 1) { *ld = R; return 2; }
+                  if (rs >= 1 && rs < 0x7fffffffLL) { *ld = (int)rs; return 1; } return 0; }
+    if (cs == 1 && rs >= C && rs < 0x7fffffffLL) { *ld = (int)rs; return 1; }
+    if (rs == 1 && cs >= R && cs < 0x7fffffffLL) { *ld = (int)cs; return 2; }
+    return 0;
+}
+
+/* C = alpha * A @ B + beta * C with explicit strides (see lucTL_gemm_ex).
+ * Returns 1 when cuBLAS did the work, 0 to fall back to the own kernels. */
+static int lucTL_blas_sgemm(const float* A, const float* B, float* C,
+                            int M, int N, int K,
+                            long long a_rs, long long a_cs,
+                            long long b_rs, long long b_cs,
+                            long long c_rs, long long c_cs,
+                            long long a_bs, long long b_bs, long long c_bs,
+                            int batch, float alpha, float beta, cudaStream_t s)
+{
+    if (g_blas_off || g_tile_override >= 0) return 0;
+    if (!g_blas && !lucTL_blas_init()) return 0;
+    int lda, ldb, ldc;
+    const int la = lucTL_blas_layout(M, K, a_rs, a_cs, &lda);
+    const int lb = lucTL_blas_layout(K, N, b_rs, b_cs, &ldb);
+    const int lc = lucTL_blas_layout(M, N, c_rs, c_cs, &ldc);
+    if (!la || !lb || !lc) return 0;
+    if (batch > 1 && c_bs == 0) return 0;                 /* would race */
+
+    /* cuBLAS is column-major.  For a row-major C compute C^T = B^T A^T. */
+    const float *X, *Y; cublasOperation_t ox, oy; int ldx, ldy, m, n;
+    long long sx, sy;
+    if (lc == 1) {
+        m = N; n = M;
+        X = B; ldx = ldb; ox = (lb == 1) ? CUBLAS_OP_N : CUBLAS_OP_T; sx = b_bs;
+        Y = A; ldy = lda; oy = (la == 1) ? CUBLAS_OP_N : CUBLAS_OP_T; sy = a_bs;
+    } else {
+        m = M; n = N;
+        X = A; ldx = lda; ox = (la == 2) ? CUBLAS_OP_N : CUBLAS_OP_T; sx = a_bs;
+        Y = B; ldy = ldb; oy = (lb == 2) ? CUBLAS_OP_N : CUBLAS_OP_T; sy = b_bs;
+    }
+    if (cublasSetStream(g_blas, s) != CUBLAS_STATUS_SUCCESS) return 0;
+    cublasStatus_t st;
+    if (batch <= 1)
+        st = cublasSgemm(g_blas, ox, oy, m, n, K, &alpha, X, ldx, Y, ldy, &beta, C, ldc);
+    else
+        st = cublasSgemmStridedBatched(g_blas, ox, oy, m, n, K, &alpha,
+                                       X, ldx, sx, Y, ldy, sy, &beta, C, ldc, c_bs, batch);
+    return st == CUBLAS_STATUS_SUCCESS;
+}
 
 static int lucTL_cores_per_mp(int major, int minor)
 {
@@ -1524,6 +1616,12 @@ static int lucTL_gemm_launch(const T* A, const T* B, T* C,
                              int pre_op, int post_op,
                              cudaStream_t stream)
 {
+    if (TAcc<T>::dtype() == LUCTL_F32 && pre_op == LUCTL_PRE_NONE &&
+        post_op == LUCTL_ACT_NONE && bias == NULL &&
+        lucTL_blas_sgemm((const float*)A, (const float*)B, (float*)C, M, N, K,
+                         K, 1, N, 1, N, 1, 0, 0, 0, 1, alpha, beta, stream))
+        return lucTL_launch_async("gemm(cublas)");
+
     lucTL_plan_t p;
     const int allow_wmma = (pre_op == LUCTL_PRE_NONE) &&
                            (TAcc<T>::dtype() == LUCTL_F16);
@@ -1713,6 +1811,7 @@ LUCTL_API int lucTL_init(int device)
     }
 
     memset(g_tune, 0, sizeof(g_tune));
+    lucTL_blas_init();                 /* create cuBLAS now, never inside a graph capture */
     g_initialized = 1;
     g_has_err     = 0;
     g_err[0]      = '\0';
@@ -1736,6 +1835,7 @@ LUCTL_API void lucTL_shutdown(void)
         g_pool = NULL;
     }
     if (g_stage) { free(g_stage); g_stage = NULL; g_stage_size = 0; }
+    lucTL_blas_shutdown();
     cudaGetLastError();
     g_initialized = 0;
 }

@@ -116,7 +116,7 @@ end
                 "  Build the CUDA backend and put lucTL.so / lucTL.dll on the load path:\n" ..
                 "    nvcc -O3 -std=c++14 --shared -Xcompiler -fPIC \\\n" ..
                 "         -gencode arch=compute_86,code=sm_86 --use_fast_math \\\n" ..
-                "         lucTL_train.cu -o lucTL.so\n" ..
+                "         lucTL_train.cu -lcublas -o lucTL.so\n" ..
                 "  Or set backend = 'cpu' to use the pure-Lua autograd path.",
                 ok_ad and tostring(adapter.error or "not available")
                        or tostring(adapter)), 3)
