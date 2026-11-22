@@ -1,0 +1,27 @@
+-- lanternl side of the lanternl vs PyTorch comparison.
+-- Run through bench/vs_pytorch.sh, which downloads the data and runs both sides.
+-- The model and training settings must match bench/vs_pytorch.py.
+
+import ai
+ai.use("gpu")
+
+create f = io.open("bench/data.txt", "rb")
+create text = f:read("*a")
+f:close()
+
+create EPOCHS = 2
+create VAL    = 0.1
+
+create m = ai.LMTrain({ "data": text, "dim": 128, "layers": 4, "heads": 4, "ffn": 256,
+                        "max_seq": 128, "batch_size": 32, "epochs": EPOCHS, "lr": 3e-3,
+                        "val_split": VAL, "seed": 1, "hints": false })
+
+create t0 = os.now()
+m:run()
+create secs = os.now() - t0
+
+create toks = len(text) * (1 - VAL) * EPOCHS
+print(string.format("RESULT lanternl | time %.1f s | %.0f tok/s | train loss %.4f | val loss %.4f",
+    secs, toks / secs, m.loss, m.val_loss))
+print("SAMPLE lanternl |")
+print(m:generate("ROMEO:", 200))
