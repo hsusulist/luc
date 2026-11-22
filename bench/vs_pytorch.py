@@ -3,7 +3,10 @@
 # fused QKV with RoPE, SwiGLU FFN, tied output head, no biases, GPT-2 style init.
 # Same training: AdamW (0.9, 0.95, wd 0.01 on weights only), clip 1.0,
 # 5% linear warmup then cosine to 0, non-overlapping windows, last 10% = validation.
-import math, random, time, torch, torch.nn as nn, torch.nn.functional as F
+import math, random, sys, time, torch, torch.nn as nn, torch.nn.functional as F
+
+COMPILE = "--compile" in sys.argv   # torch.compile(mode="reduce-overhead") = CUDA Graphs
+NAME = "pytorch+compile" if COMPILE else "pytorch"
 
 DIM, LAYERS, HEADS, FFN, SEQ, BATCH, EPOCHS, LR, VAL = 128, 4, 4, 256, 128, 32, 2, 3e-3, 0.1
 dev = "cuda"
@@ -22,9 +25,9 @@ while start < N - 1:
 nval = max(1, int(len(wins) * VAL))
 train_w, val_w = wins[:-nval], wins[-nval:]
 
-def make_batch(ws):
-    x = torch.zeros(len(ws), SEQ, dtype=torch.long)
-    y = torch.full((len(ws), SEQ), -1, dtype=torch.long)
+def make_batch(ws):  # always BATCH rows (padding = ignored targets), like lanternl's static shapes
+    x = torch.zeros(BATCH, SEQ, dtype=torch.long)
+    y = torch.full((BATCH, SEQ), -1, dtype=torch.long)
     for i, (a, b) in enumerate(ws):
         x[i, :b - a] = ids[a:b]; y[i, :b - a] = ids[a + 1:b + 1]
     return x.to(dev), y.to(dev)
@@ -69,6 +72,7 @@ class LM(nn.Module):
         return s.lnf(h) @ s.emb.weight.T
 
 model = LM().to(dev)
+net = torch.compile(model, mode="reduce-overhead") if COMPILE else model
 decay = [p for p in model.parameters() if p.dim() == 2]
 nodecay = [p for p in model.parameters() if p.dim() < 2]
 opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.01},
@@ -85,26 +89,27 @@ def evaluate(ws):
     model.eval(); tot = cnt = 0
     for i in range(0, len(ws), BATCH):
         x, y = make_batch(ws[i:i + BATCH])
-        l = F.cross_entropy(model(x).view(-1, 256), y.view(-1), ignore_index=-1, reduction="sum")
+        l = F.cross_entropy(net(x).view(-1, 256), y.view(-1), ignore_index=-1, reduction="sum")
         tot += l.item(); cnt += (y >= 0).sum().item()
     model.train(); return tot / cnt
 
-torch.cuda.synchronize(); t0 = time.time(); step = 0
+torch.cuda.synchronize(); t0 = time.time(); step = 0; ep_times = []
 for ep in range(EPOCHS):
-    order = train_w[:]; random.shuffle(order); sl = st = 0
+    order = train_w[:]; random.shuffle(order); sl = st = 0; te = time.time()
     for b in range(nb):
         x, y = make_batch(order[b * BATCH:(b + 1) * BATCH]); step += 1
         for g in opt.param_groups: g["lr"] = lr_at(step)
-        loss = F.cross_entropy(model(x).view(-1, 256), y.view(-1), ignore_index=-1)
+        loss = F.cross_entropy(net(x).view(-1, 256), y.view(-1), ignore_index=-1)
         opt.zero_grad(set_to_none=True); loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
         n = (y >= 0).sum().item(); sl += loss.item() * n; st += n
+    torch.cuda.synchronize(); ep_times.append(time.time() - te)   # train time only, like lanternl
     vl = evaluate(val_w)
     print(f"[pytorch] epoch {ep + 1}/{EPOCHS}  loss {sl / st:.4f}  val {vl:.4f}")
 torch.cuda.synchronize(); secs = time.time() - t0
 
-toks = len(text) * (1 - VAL) * EPOCHS
-print(f"RESULT pytorch  | time {secs:.1f} s | {toks / secs:.0f} tok/s | train loss {sl / st:.4f} | val loss {vl:.4f}")
+toks = len(text) * (1 - VAL); ep2 = ep_times[-1]
+print(f"RESULT {NAME:<15} | total {secs:5.1f} s | epoch 2 {ep2:5.1f} s = {toks / ep2:6.0f} tok/s | train {sl / st:.4f} | val {vl:.4f}")
 
 @torch.no_grad()
 def generate(prompt, n):
@@ -113,5 +118,5 @@ def generate(prompt, n):
         nxt = model(x[:, -SEQ:])[0, -1].argmax()
         x = torch.cat([x, nxt.view(1, 1)], 1)
     return bytes(x[0].tolist()).decode("utf-8", "replace")
-print("SAMPLE pytorch  |")
+print(f"SAMPLE {NAME} |")
 print(generate("ROMEO:", 200))

@@ -9,19 +9,23 @@ create f = io.open("bench/data.txt", "rb")
 create text = f:read("*a")
 f:close()
 
+create GRAPH  = os.getenv("GRAPH") == "1"
+create NAME   = GRAPH and "lanternl+graph" or "lanternl"
 create EPOCHS = 2
 create VAL    = 0.1
 
 create m = ai.LMTrain({ "data": text, "dim": 128, "layers": 4, "heads": 4, "ffn": 256,
                         "max_seq": 128, "batch_size": 32, "epochs": EPOCHS, "lr": 3e-3,
-                        "val_split": VAL, "seed": 1, "hints": false })
+                        "val_split": VAL, "seed": 1, "hints": false, "graph": GRAPH })
 
 create t0 = os.now()
 m:run()
 create secs = os.now() - t0
 
-create toks = len(text) * (1 - VAL) * EPOCHS
-print(string.format("RESULT lanternl | time %.1f s | %.0f tok/s | train loss %.4f | val loss %.4f",
-    secs, toks / secs, m.loss, m.val_loss))
-print("SAMPLE lanternl |")
+create toks = len(text) * (1 - VAL)
+create h = m.history
+create ep2 = h[len(h)].time - h[len(h) - 1].time
+print(string.format("RESULT %-15s | total %5.1f s | epoch 2 %5.1f s = %6.0f tok/s | train %.4f | val %.4f",
+    NAME, secs, ep2, toks / ep2, m.loss, m.val_loss))
+print("SAMPLE " .. NAME .. " |")
 print(m:generate("ROMEO:", 200))
